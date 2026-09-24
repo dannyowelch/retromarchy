@@ -1,0 +1,232 @@
+use crate::types::{ConsoleId, Game, GameId, Media, MediaKind, ProfileId, Source};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::path::PathBuf;
+
+pub fn db_path() -> Result<PathBuf> {
+    let xdg_dirs = xdg::BaseDirectories::with_prefix("retromarchy")?;
+    Ok(xdg_dirs.place_data_file("library.db")?)
+}
+
+pub fn init_db() -> Result<Connection> {
+    let path = db_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let conn = Connection::open(&path)
+        .with_context(|| format!("Failed to open database at {}", path.display()))?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS games (
+            id TEXT PRIMARY KEY,
+            console TEXT NOT NULL,
+            rom TEXT NOT NULL,
+            title TEXT NOT NULL,
+            crc32 INTEGER,
+            profile TEXT,
+            last_played TEXT
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS media (
+            game_id TEXT NOT NULL,
+            kind INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            source INTEGER NOT NULL,
+            FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_games_console ON games(console)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_media_game ON media(game_id)",
+        [],
+    )?;
+
+    Ok(conn)
+}
+
+pub fn upsert_game(conn: &Connection, game: &Game) -> Result<()> {
+    conn.execute(
+        "INSERT INTO games (id, console, rom, title, crc32, profile, last_played)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(id) DO UPDATE SET
+            console = excluded.console,
+            rom = excluded.rom,
+            title = excluded.title,
+            crc32 = COALESCE(games.crc32, excluded.crc32),
+            profile = COALESCE(games.profile, excluded.profile),
+            last_played = COALESCE(games.last_played, excluded.last_played)",
+        params![
+            game.id,
+            game.console,
+            game.rom.to_string_lossy().to_string(),
+            game.title,
+            game.crc32,
+            game.profile.as_ref(),
+            game.last_played.map(|dt| dt.to_rfc3339()),
+        ],
+    )?;
+
+    conn.execute(
+        "DELETE FROM media WHERE game_id = ?1 AND source = ?2",
+        params![game.id, source_to_i32(Source::Local)],
+    )?;
+
+    for media in &game.media {
+        if media.source == Source::Local {
+            conn.execute(
+                "INSERT INTO media (game_id, kind, path, source) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    game.id,
+                    media_kind_to_i32(media.kind),
+                    media.path.to_string_lossy().to_string(),
+                    source_to_i32(media.source),
+                ],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn remove_missing_games(conn: &Connection, existing_ids: &[GameId]) -> Result<usize> {
+    if existing_ids.is_empty() {
+        let count = conn.execute("DELETE FROM games", [])?;
+        return Ok(count);
+    }
+
+    let placeholders = existing_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let query = format!("DELETE FROM games WHERE id NOT IN ({})", placeholders);
+    let params: Vec<&dyn rusqlite::ToSql> = existing_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+    let count = conn.execute(&query, params.as_slice())?;
+    Ok(count)
+}
+
+pub fn load_games(conn: &Connection, console: Option<&ConsoleId>) -> Result<Vec<Game>> {
+    let mut stmt = if let Some(_console_id) = console {
+        conn.prepare(
+            "SELECT id, console, rom, title, crc32, profile, last_played
+             FROM games WHERE console = ?1 ORDER BY title",
+        )?
+    } else {
+        conn.prepare(
+            "SELECT id, console, rom, title, crc32, profile, last_played
+             FROM games ORDER BY title",
+        )?
+    };
+
+    let game_mapper = |row: &rusqlite::Row| {
+        Ok(Game {
+            id: row.get(0)?,
+            console: row.get(1)?,
+            rom: PathBuf::from(row.get::<_, String>(2)?),
+            title: row.get(3)?,
+            crc32: row.get(4)?,
+            profile: row.get(5)?,
+            last_played: row
+                .get::<_, Option<String>>(6)?
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&Utc)),
+            media: Vec::new(),
+        })
+    };
+
+    let mut games = if let Some(console_id) = console {
+        stmt.query_map([console_id], game_mapper)?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map([], game_mapper)?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    for game in &mut games {
+        game.media = load_media(conn, &game.id)?;
+    }
+
+    Ok(games)
+}
+
+fn load_media(conn: &Connection, game_id: &GameId) -> Result<Vec<Media>> {
+    let mut stmt = conn.prepare(
+        "SELECT kind, path, source FROM media WHERE game_id = ?1",
+    )?;
+
+    let media = stmt
+        .query_map([game_id], |row| {
+            Ok(Media {
+                kind: i32_to_media_kind(row.get(0)?),
+                path: PathBuf::from(row.get::<_, String>(1)?),
+                source: i32_to_source(row.get(2)?),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(media)
+}
+
+pub fn update_last_played(conn: &Connection, game_id: &GameId) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE games SET last_played = ?1 WHERE id = ?2",
+        params![now, game_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_game_profile(conn: &Connection, game_id: &GameId) -> Result<Option<ProfileId>> {
+    conn.query_row(
+        "SELECT profile FROM games WHERE id = ?1",
+        [game_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn media_kind_to_i32(kind: MediaKind) -> i32 {
+    match kind {
+        MediaKind::BoxArt => 0,
+        MediaKind::Screenshot => 1,
+        MediaKind::Manual => 2,
+        MediaKind::Video => 3,
+    }
+}
+
+fn i32_to_media_kind(val: i32) -> MediaKind {
+    match val {
+        0 => MediaKind::BoxArt,
+        1 => MediaKind::Screenshot,
+        2 => MediaKind::Manual,
+        3 => MediaKind::Video,
+        _ => MediaKind::BoxArt,
+    }
+}
+
+fn source_to_i32(source: Source) -> i32 {
+    match source {
+        Source::ScreenScraper => 0,
+        Source::TheGamesDb => 1,
+        Source::Local => 2,
+    }
+}
+
+fn i32_to_source(val: i32) -> Source {
+    match val {
+        0 => Source::ScreenScraper,
+        1 => Source::TheGamesDb,
+        2 => Source::Local,
+        _ => Source::Local,
+    }
+}
