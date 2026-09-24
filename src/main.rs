@@ -8,6 +8,8 @@ mod ui;
 use anyhow::Result;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 fn main() -> Result<()> {
     let app = adw::Application::builder()
@@ -27,7 +29,7 @@ fn main() -> Result<()> {
 
 fn run_app(app: &adw::Application) -> Result<()> {
     let config = config::load_config()?;
-    let conn = database::init_db()?;
+    let conn = Rc::new(RefCell::new(database::init_db()?));
 
     let ui = ui::App::new(app, config, conn)?;
     ui.show();

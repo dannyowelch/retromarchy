@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 pub struct App {
     config: Config,
-    conn: Connection,
+    conn: Rc<RefCell<Connection>>,
     window: adw::ApplicationWindow,
     console_list: gtk4::ListBox,
     game_grid: gtk4::FlowBox,
@@ -29,7 +29,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(app: &adw::Application, config: Config, conn: Connection) -> Result<Self> {
+    pub fn new(app: &adw::Application, config: Config, conn: Rc<RefCell<Connection>>) -> Result<Self> {
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("Retromarchy")
@@ -144,7 +144,7 @@ impl App {
         let current_console = self.current_console.clone();
         let games = self.games.clone();
         let config = self.config.clone();
-        let conn_ptr = &self.conn as *const Connection as usize;
+        let conn = self.conn.clone();
         let game_grid = self.game_grid.clone();
 
         self.console_list.connect_row_selected(move |_, row| {
@@ -154,8 +154,7 @@ impl App {
                     let console = &config.consoles[idx];
                     *current_console.borrow_mut() = Some(console.id.clone());
 
-                    let conn = unsafe { &*(conn_ptr as *const Connection) };
-                    if let Ok(loaded_games) = database::load_games(conn, Some(&console.id)) {
+                    if let Ok(loaded_games) = database::load_games(&conn.borrow(), Some(&console.id)) {
                         *games.borrow_mut() = loaded_games;
                         Self::update_game_grid(&game_grid, &games.borrow());
                     }
@@ -245,7 +244,7 @@ impl App {
         let games = self.games.clone();
         let selected_game = self.selected_game.clone();
         let config = self.config.clone();
-        let conn_ptr = &self.conn as *const Connection as usize;
+        let conn = self.conn.clone();
         let current_console = self.current_console.clone();
 
         key_controller.connect_key_pressed(move |_, key, _, _| {
@@ -255,9 +254,8 @@ impl App {
                         let games = games.borrow();
                         if let Some(game) = games.get(idx) {
                             if let Some(profile) = Self::resolve_profile(&config, game) {
-                                let conn = unsafe { &*(conn_ptr as *const Connection) };
                                 if launcher::launch_game(&profile, &game.rom).is_ok() {
-                                    let _ = database::update_last_played(conn, &game.id);
+                                    let _ = database::update_last_played(&conn.borrow(), &game.id);
                                 }
                             }
                         }
@@ -267,15 +265,14 @@ impl App {
                 gdk::Key::r => {
                     if let Some(console_id) = current_console.borrow().clone() {
                         if let Some(console) = config.consoles.iter().find(|c| c.id == console_id) {
-                            let conn = unsafe { &*(conn_ptr as *const Connection) };
                             if let Ok(scanned) = scanner::scan_console(console) {
                                 let ids: Vec<_> = scanned.iter().map(|g| g.id.clone()).collect();
-                                for game in scanned {
-                                    let _ = database::upsert_game(conn, &game);
+                                for game in &scanned {
+                                    let _ = database::upsert_game(&conn.borrow(), game);
                                 }
-                                let _ = database::remove_missing_games(conn, &ids);
+                                let _ = database::remove_missing_games(&conn.borrow(), &ids);
 
-                                if let Ok(loaded) = database::load_games(conn, Some(&console_id)) {
+                                if let Ok(loaded) = database::load_games(&conn.borrow(), Some(&console_id)) {
                                     *games.borrow_mut() = loaded;
                                     Self::update_game_grid(&game_grid, &games.borrow());
                                 }
