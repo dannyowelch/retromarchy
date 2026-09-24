@@ -19,15 +19,12 @@ pub struct App {
     window: adw::ApplicationWindow,
     console_list: gtk4::ListBox,
     game_grid: gtk4::FlowBox,
-    detail_title: gtk4::Label,
-    detail_path: gtk4::Label,
-    detail_console: gtk4::Label,
-    detail_crc: gtk4::Label,
+    search_bar: gtk4::SearchBar,
+    search_entry: gtk4::SearchEntry,
     current_console: Rc<RefCell<Option<String>>>,
     games: Rc<RefCell<Vec<Game>>>,
     all_games: Rc<RefCell<Vec<Game>>>,
     selected_game: Rc<RefCell<Option<usize>>>,
-    filter_text: Rc<RefCell<String>>,
 }
 
 impl App {
@@ -65,6 +62,13 @@ impl App {
         let center_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         center_box.set_hexpand(true);
 
+        let search_bar = gtk4::SearchBar::new();
+        let search_entry = gtk4::SearchEntry::new();
+        search_entry.set_placeholder_text(Some("Filter games..."));
+        search_bar.set_child(Some(&search_entry));
+        search_bar.set_search_mode(false);
+        center_box.append(&search_bar);
+
         let scrolled = gtk4::ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vexpand(true)
@@ -85,39 +89,8 @@ impl App {
 
         center_box.append(&scrolled);
 
-        let detail_pane = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-        detail_pane.set_width_request(250);
-        detail_pane.set_margin_top(12);
-        detail_pane.set_margin_bottom(12);
-        detail_pane.set_margin_start(12);
-        detail_pane.set_margin_end(12);
-
-        let detail_title = gtk4::Label::new(Some("Select a game"));
-        detail_title.set_wrap(true);
-        detail_title.set_halign(gtk4::Align::Start);
-        detail_title.add_css_class("title-2");
-
-        let detail_console = gtk4::Label::new(None);
-        detail_console.set_halign(gtk4::Align::Start);
-        detail_console.add_css_class("dim-label");
-
-        let detail_path = gtk4::Label::new(None);
-        detail_path.set_wrap(true);
-        detail_path.set_halign(gtk4::Align::Start);
-        detail_path.add_css_class("caption");
-
-        let detail_crc = gtk4::Label::new(None);
-        detail_crc.set_halign(gtk4::Align::Start);
-        detail_crc.add_css_class("caption");
-
-        detail_pane.append(&detail_title);
-        detail_pane.append(&detail_console);
-        detail_pane.append(&detail_path);
-        detail_pane.append(&detail_crc);
-
         main_box.append(&sidebar);
         main_box.append(&center_box);
-        main_box.append(&detail_pane);
 
         window.set_content(Some(&main_box));
 
@@ -127,22 +100,42 @@ impl App {
             window: window.clone(),
             console_list: console_list.clone(),
             game_grid: game_grid.clone(),
-            detail_title: detail_title.clone(),
-            detail_path: detail_path.clone(),
-            detail_console: detail_console.clone(),
-            detail_crc: detail_crc.clone(),
+            search_bar: search_bar.clone(),
+            search_entry: search_entry.clone(),
             current_console: Rc::new(RefCell::new(None)),
             games: Rc::new(RefCell::new(Vec::new())),
             all_games: Rc::new(RefCell::new(Vec::new())),
             selected_game: Rc::new(RefCell::new(None)),
-            filter_text: Rc::new(RefCell::new(String::new())),
         };
 
         app_instance.setup_console_list();
+        app_instance.setup_search();
         app_instance.setup_keyboard_navigation();
         app_instance.setup_game_selection();
 
         Ok(app_instance)
+    }
+    
+    fn setup_search(&self) {
+        let search_entry = self.search_entry.clone();
+        let games = self.games.clone();
+        let all_games = self.all_games.clone();
+        let game_grid = self.game_grid.clone();
+        
+        search_entry.connect_search_changed(move |entry| {
+            let text = entry.text().to_string().to_lowercase();
+            let all = all_games.borrow();
+            let filtered: Vec<Game> = if text.is_empty() {
+                all.clone()
+            } else {
+                all.iter()
+                    .filter(|g| g.title.to_lowercase().contains(&text))
+                    .cloned()
+                    .collect()
+            };
+            *games.borrow_mut() = filtered;
+            Self::update_game_grid(&game_grid, &games.borrow());
+        });
     }
 
     fn setup_console_list(&self) {
@@ -225,84 +218,38 @@ impl App {
     }
 
     fn setup_game_selection(&self) {
-        let games = self.games.clone();
         let selected_game = self.selected_game.clone();
-        let detail_title = self.detail_title.clone();
-        let detail_path = self.detail_path.clone();
-        let detail_console = self.detail_console.clone();
-        let detail_crc = self.detail_crc.clone();
-        let config = self.config.clone();
-        let game_grid = self.game_grid.clone();
 
         self.game_grid.connect_child_activated(move |_, child| {
             let idx = child.index() as usize;
             *selected_game.borrow_mut() = Some(idx);
-            Self::update_details(&games, &config, idx, &detail_title, &detail_path, &detail_console, &detail_crc);
         });
 
-        let games2 = self.games.clone();
         let selected_game2 = self.selected_game.clone();
-        let config2 = self.config.clone();
-        let detail_title2 = self.detail_title.clone();
-        let detail_path2 = self.detail_path.clone();
-        let detail_console2 = self.detail_console.clone();
-        let detail_crc2 = self.detail_crc.clone();
+        let game_grid = self.game_grid.clone();
 
         game_grid.connect_selected_children_changed(move |grid| {
             if let Some(child) = grid.selected_children().first() {
                 let idx = child.index() as usize;
                 *selected_game2.borrow_mut() = Some(idx);
-                Self::update_details(&games2, &config2, idx, &detail_title2, &detail_path2, &detail_console2, &detail_crc2);
             }
         });
     }
 
-    fn update_details(
-        games: &Rc<RefCell<Vec<Game>>>,
-        config: &Config,
-        idx: usize,
-        detail_title: &gtk4::Label,
-        detail_path: &gtk4::Label,
-        detail_console: &gtk4::Label,
-        detail_crc: &gtk4::Label,
-    ) {
-        let games = games.borrow();
-        if let Some(game) = games.get(idx) {
-            detail_title.set_text(&game.title);
-            detail_path.set_text(&format!("ROM: {}", game.rom.display()));
-
-            if let Some(console) = config.consoles.iter().find(|c| c.id == game.console) {
-                detail_console.set_text(&format!("Console: {}", console.name));
-            }
-
-            if let Some(crc) = game.crc32 {
-                detail_crc.set_text(&format!("CRC32: {:08x}", crc));
-            } else {
-                detail_crc.set_text("");
-            }
-        }
-    }
 
     fn setup_keyboard_navigation(&self) {
         let key_controller = gtk4::EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
         let game_grid = self.game_grid.clone();
-        let console_list = self.console_list.clone();
+        let search_bar = self.search_bar.clone();
+        let search_entry = self.search_entry.clone();
         let games = self.games.clone();
         let all_games = self.all_games.clone();
         let selected_game = self.selected_game.clone();
         let config = self.config.clone();
-        let config2 = self.config.clone();
         let conn = self.conn.clone();
         let current_console = self.current_console.clone();
-        let filter_text = self.filter_text.clone();
-        let detail_title = self.detail_title.clone();
-        let detail_path = self.detail_path.clone();
-        let detail_console = self.detail_console.clone();
-        let detail_crc = self.detail_crc.clone();
-        let games2 = self.games.clone();
-        let selected_game2 = self.selected_game.clone();
 
         key_controller.connect_key_pressed(move |_, key, _, _| {
             match key {
@@ -346,10 +293,12 @@ impl App {
                         if idx > 0 {
                             if let Some(prev) = game_grid.child_at_index(idx - 1) {
                                 game_grid.select_child(&prev);
+                                *selected_game.borrow_mut() = Some((idx - 1) as usize);
                             }
                         }
                     } else if let Some(first) = game_grid.child_at_index(0) {
                         game_grid.select_child(&first);
+                        *selected_game.borrow_mut() = Some(0);
                     }
                     glib::Propagation::Stop
                 }
@@ -359,9 +308,11 @@ impl App {
                         let idx = selected.index();
                         if let Some(next) = game_grid.child_at_index(idx + 1) {
                             game_grid.select_child(&next);
+                            *selected_game.borrow_mut() = Some((idx + 1) as usize);
                         }
                     } else if let Some(first) = game_grid.child_at_index(0) {
                         game_grid.select_child(&first);
+                        *selected_game.borrow_mut() = Some(0);
                     }
                     glib::Propagation::Stop
                 }
@@ -372,10 +323,12 @@ impl App {
                         if idx >= 6 {
                             if let Some(prev) = game_grid.child_at_index(idx - 6) {
                                 game_grid.select_child(&prev);
+                                *selected_game.borrow_mut() = Some((idx - 6) as usize);
                             }
                         }
                     } else if let Some(first) = game_grid.child_at_index(0) {
                         game_grid.select_child(&first);
+                        *selected_game.borrow_mut() = Some(0);
                     }
                     glib::Propagation::Stop
                 }
@@ -385,9 +338,11 @@ impl App {
                         let idx = selected.index();
                         if let Some(next) = game_grid.child_at_index(idx + 6) {
                             game_grid.select_child(&next);
+                            *selected_game.borrow_mut() = Some((idx + 6) as usize);
                         }
                     } else if let Some(first) = game_grid.child_at_index(0) {
                         game_grid.select_child(&first);
+                        *selected_game.borrow_mut() = Some(0);
                     }
                     glib::Propagation::Stop
                 }
@@ -396,55 +351,16 @@ impl App {
                     if game_grid.selected_children().is_empty() {
                         if let Some(first) = game_grid.child_at_index(0) {
                             game_grid.select_child(&first);
-                            *selected_game2.borrow_mut() = Some(0);
-                            Self::update_details(&games2, &config2, 0, &detail_title, &detail_path, &detail_console, &detail_crc);
+                            *selected_game.borrow_mut() = Some(0);
                         }
                     }
                     glib::Propagation::Stop
                 }
                 gdk::Key::slash => {
-                    let mut filter = filter_text.borrow_mut();
-                    filter.clear();
-                    drop(filter);
-                    
-                    let dialog = gtk4::Entry::new();
-                    dialog.set_placeholder_text(Some("Filter games..."));
-                    
-                    let popover = gtk4::Popover::new();
-                    popover.set_child(Some(&dialog));
-                    popover.set_autohide(true);
-                    popover.set_parent(&game_grid);
-                    
-                    let games_clone = games.clone();
-                    let all_games_clone = all_games.clone();
-                    let grid_clone = game_grid.clone();
-                    let filter_clone = filter_text.clone();
-                    let popover_clone = popover.clone();
-                    
-                    dialog.connect_changed(move |entry| {
-                        let text = entry.text().to_string().to_lowercase();
-                        *filter_clone.borrow_mut() = text.clone();
-                        
-                        let all = all_games_clone.borrow();
-                        let filtered: Vec<Game> = if text.is_empty() {
-                            all.clone()
-                        } else {
-                            all.iter()
-                                .filter(|g| g.title.to_lowercase().contains(&text))
-                                .cloned()
-                                .collect()
-                        };
-                        *games_clone.borrow_mut() = filtered;
-                        Self::update_game_grid(&grid_clone, &games_clone.borrow());
-                    });
-                    
-                    dialog.connect_activate(move |_| {
-                        popover_clone.popdown();
-                    });
-                    
-                    popover.popup();
-                    dialog.grab_focus();
-                    
+                    search_bar.set_search_mode(!search_bar.is_search_mode());
+                    if search_bar.is_search_mode() {
+                        search_entry.grab_focus();
+                    }
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
