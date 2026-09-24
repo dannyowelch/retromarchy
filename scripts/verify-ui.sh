@@ -104,30 +104,19 @@ wait_ui 0.5
 screenshot "c-escape-console-mode"
 
 # (d) Test filter without collapsing pane
-# First make sure a game is selected so pane shows game details
-echo "5. Select game, then filter with 'd'"
-send_keys Tab Right
-wait_ui 0.5
-# Open search and type
+echo "5. Open filter and type 'dr' to filter to Dragon"
 send_keys slash
-wait_ui 0.3
-DISPLAY=$DISPLAY xdotool type "d"
+wait_ui 0.5
+DISPLAY=$DISPLAY xdotool type "dr"
 wait_ui 1
 screenshot "d-filter-d-pane-visible"
 
 # Close search
-send_keys Escape Escape  # First Escape closes search, might need second to clear
-wait_ui 0.8
-
-# (e) Collapse the pane - make sure it's visible first and grid has focus
-echo "6. Collapse details pane with 'd'"
-# Click in the grid area to ensure focus is NOT on search
-DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 300 100 click 1
-wait_ui 0.3
-# Select a game to ensure pane is visible
-send_keys Tab Right
+send_keys Escape
 wait_ui 0.5
-# Now collapse - press 'd' with grid focused
+
+# (e) Collapse the pane
+echo "6. Press 'd' to collapse details pane"
 send_keys d
 wait_ui 0.8
 echo "Config after collapse:"
@@ -150,27 +139,28 @@ screenshot "e2-pane-collapsed-after-restart"
 echo "Config after restart:"
 grep details_visible /tmp/retromarchy/config.toml
 
-# Re-open pane for next tests
+# Re-open pane for theme test
+echo "8. Press 'd' to re-open pane"
 send_keys d
 wait_ui 0.8
 
 # (g) Toggle to LaunchBox theme
-echo "8. Toggle to LaunchBox theme"
+echo "9. Toggle to LaunchBox theme"
 send_keys t
 wait_ui 1
 screenshot "f-launchbox-theme"
 
 # (h) Launch game and verify play tracking
-echo "9. Select and launch game for play tracking"
+echo "10. Select and launch game for play tracking"
 send_keys Tab Right
 wait_ui 0.5
-# Expand pane to see stats
-send_keys d
-wait_ui 0.5
-send_keys Return
+# Click on the grid area to ensure focus
+DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 300 200 click 1
+wait_ui 0.2
+DISPLAY=$DISPLAY xdotool key Return
 echo "  Waiting for stub emulator (3 seconds)..."
 sleep 5
-wait_ui 1
+wait_ui 2
 screenshot "g-play-count-incremented"
 
 echo ""

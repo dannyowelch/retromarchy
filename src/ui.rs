@@ -668,10 +668,13 @@ impl App {
         if game.play_time > 0 {
             let hours = game.play_time / 3600;
             let minutes = (game.play_time % 3600) / 60;
+            let seconds = game.play_time % 60;
             let time_str = if hours > 0 {
                 format!("Play time: {}h {}m", hours, minutes)
-            } else {
+            } else if minutes > 0 {
                 format!("Play time: {}m", minutes)
+            } else {
+                format!("Play time: {}s", seconds)
             };
             let time_label = gtk4::Label::new(Some(&time_str));
             time_label.set_halign(gtk4::Align::Start);
@@ -719,7 +722,7 @@ impl App {
 
     fn setup_keyboard_navigation(&self) {
         let key_controller = gtk4::EventControllerKey::new();
-        key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        key_controller.set_propagation_phase(gtk4::PropagationPhase::Bubble);
 
         let window = self.window.clone();
         let game_grid = self.game_grid.clone();
