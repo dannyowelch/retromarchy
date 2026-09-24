@@ -219,6 +219,62 @@ pub fn increment_play_stats(conn: &Connection, game_id: &GameId, play_time_secon
     Ok(())
 }
 
+pub struct LibraryStats {
+    pub total_games: u32,
+    pub last_played_date: Option<DateTime<Utc>>,
+    pub last_played_game: Option<String>,
+    pub total_play_count: u32,
+    pub total_play_time: u32,
+    pub most_played_game: Option<String>,
+    pub most_played_count: u32,
+}
+
+pub fn get_library_stats(conn: &Connection, console: &ConsoleId) -> Result<LibraryStats> {
+    let total_games: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM games WHERE console = ?1",
+        params![console],
+        |row| row.get(0),
+    )?;
+
+    let (last_played_date, last_played_game): (Option<String>, Option<String>) = conn.query_row(
+        "SELECT last_played, title FROM games WHERE console = ?1 AND last_played IS NOT NULL ORDER BY last_played DESC LIMIT 1",
+        params![console],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap_or((None, None));
+
+    let last_played_date = last_played_date
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    let total_play_count: u32 = conn.query_row(
+        "SELECT COALESCE(SUM(play_count), 0) FROM games WHERE console = ?1",
+        params![console],
+        |row| row.get(0),
+    )?;
+
+    let total_play_time: u32 = conn.query_row(
+        "SELECT COALESCE(SUM(play_time), 0) FROM games WHERE console = ?1",
+        params![console],
+        |row| row.get(0),
+    )?;
+
+    let (most_played_game, most_played_count): (Option<String>, u32) = conn.query_row(
+        "SELECT title, play_count FROM games WHERE console = ?1 AND play_count > 0 ORDER BY play_count DESC LIMIT 1",
+        params![console],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap_or((None, 0));
+
+    Ok(LibraryStats {
+        total_games,
+        last_played_date,
+        last_played_game,
+        total_play_count,
+        total_play_time,
+        most_played_game,
+        most_played_count,
+    })
+}
+
 fn media_kind_to_i32(kind: MediaKind) -> i32 {
     match kind {
         MediaKind::BoxArt => 0,

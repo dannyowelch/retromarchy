@@ -5,11 +5,31 @@ use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsoleMetadata {
+    pub id: String,
+    pub manufacturer: String,
+    pub year: u32,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub consoles: Vec<Console>,
     #[serde(default)]
     pub profiles: Vec<EmulatorProfile>,
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    #[serde(default = "default_true")]
+    pub details_visible: bool,
+}
+
+fn default_theme() -> String {
+    "system".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -17,8 +37,21 @@ impl Default for Config {
         Self {
             consoles: Vec::new(),
             profiles: Vec::new(),
+            theme: default_theme(),
+            details_visible: default_true(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleMetadataFile {
+    console: Vec<ConsoleMetadata>,
+}
+
+pub fn load_console_metadata() -> Result<Vec<ConsoleMetadata>> {
+    let metadata_content = include_str!("../console_metadata.toml");
+    let file: ConsoleMetadataFile = toml::from_str(metadata_content)?;
+    Ok(file.console)
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -36,5 +69,13 @@ pub fn load_config() -> Result<Config> {
     let config: Config = toml::from_str(&content)
         .with_context(|| format!("Failed to parse config from {}", path.display()))?;
     Ok(config)
+}
+
+pub fn save_config(config: &Config) -> Result<()> {
+    let path = config_path()?;
+    let content = toml::to_string_pretty(config)?;
+    fs::write(&path, content)
+        .with_context(|| format!("Failed to write config to {}", path.display()))?;
+    Ok(())
 }
 
