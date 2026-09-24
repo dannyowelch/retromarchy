@@ -5,7 +5,7 @@
 set -e
 
 DISPLAY="${DISPLAY:-:99}"
-SCREENSHOT_DIR="${1:-/tmp/retro-verify}"
+SCREENSHOT_DIR="${1:-/opt/cursor/artifacts/retro-verify-$(date +%Y%m%d-%H%M%S)}"
 APP_LOG="/tmp/retro-verify.log"
 
 echo "=== Retromarchy UI Verification ==="
@@ -15,6 +15,11 @@ echo "Screenshot dir: $SCREENSHOT_DIR"
 # Setup
 mkdir -p "$SCREENSHOT_DIR"
 rm -f "$APP_LOG"
+
+# Helper to wait for UI to settle
+wait_ui() {
+    sleep "${1:-1}"
+}
 
 # Ensure window manager is running
 if ! pgrep -x xfwm4 > /dev/null; then
@@ -47,9 +52,9 @@ echo "Found window: $WINDOW"
 # Helper function to send keys with focus
 send_keys() {
     DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 640 360 click 1
-    sleep 0.2
+    sleep 0.3
     DISPLAY=$DISPLAY xdotool key $@
-    sleep 0.5
+    wait_ui 0.8
 }
 
 # Helper function to take screenshot
@@ -69,7 +74,7 @@ screenshot "01-initial"
 # 2. Click sidebar to select console and load games
 echo "2. Select console (click sidebar)"
 DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 100 100 click 1
-sleep 1
+wait_ui 1.5
 screenshot "02-console-selected"
 
 # 3. Tab to game grid
@@ -110,9 +115,9 @@ screenshot "10-filter-open"
 # 10. Type in filter
 echo "11. Type in filter"
 DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 640 360 click 1
-sleep 0.2
+sleep 0.3
 DISPLAY=$DISPLAY xdotool type "5"
-sleep 0.5
+wait_ui 0.8
 screenshot "11-filter-text"
 
 # 11. Close filter with Escape
