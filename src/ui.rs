@@ -21,6 +21,8 @@ pub struct App {
     game_grid: gtk4::FlowBox,
     search_bar: gtk4::SearchBar,
     search_entry: gtk4::SearchEntry,
+    detail_image: gtk4::Picture,
+    detail_title: gtk4::Label,
     current_console: Rc<RefCell<Option<String>>>,
     games: Rc<RefCell<Vec<Game>>>,
     all_games: Rc<RefCell<Vec<Game>>>,
@@ -89,8 +91,28 @@ impl App {
 
         center_box.append(&scrolled);
 
+        let detail_pane = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        detail_pane.set_width_request(250);
+        detail_pane.set_margin_top(12);
+        detail_pane.set_margin_bottom(12);
+        detail_pane.set_margin_start(12);
+        detail_pane.set_margin_end(12);
+
+        let detail_image = gtk4::Picture::new();
+        detail_image.set_can_shrink(true);
+        detail_image.set_height_request(300);
+
+        let detail_title = gtk4::Label::new(Some("Select a game"));
+        detail_title.set_wrap(true);
+        detail_title.set_halign(gtk4::Align::Start);
+        detail_title.add_css_class("title-2");
+
+        detail_pane.append(&detail_image);
+        detail_pane.append(&detail_title);
+
         main_box.append(&sidebar);
         main_box.append(&center_box);
+        main_box.append(&detail_pane);
 
         window.set_content(Some(&main_box));
 
@@ -102,6 +124,8 @@ impl App {
             game_grid: game_grid.clone(),
             search_bar: search_bar.clone(),
             search_entry: search_entry.clone(),
+            detail_image: detail_image.clone(),
+            detail_title: detail_title.clone(),
             current_console: Rc::new(RefCell::new(None)),
             games: Rc::new(RefCell::new(Vec::new())),
             all_games: Rc::new(RefCell::new(Vec::new())),
@@ -250,8 +274,26 @@ impl App {
         let config = self.config.clone();
         let conn = self.conn.clone();
         let current_console = self.current_console.clone();
+        let detail_image = self.detail_image.clone();
+        let detail_title = self.detail_title.clone();
 
         key_controller.connect_key_pressed(move |_, key, _, _| {
+            let update_details = |idx: usize| {
+                let games = games.borrow();
+                if let Some(game) = games.get(idx) {
+                    detail_title.set_text(&game.title);
+                    if let Some(media) = game.media.iter().find(|m| m.kind == MediaKind::BoxArt) {
+                        if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&media.path, 250, 250, true) {
+                            detail_image.set_pixbuf(Some(&pixbuf));
+                        } else {
+                            detail_image.set_pixbuf(None);
+                        }
+                    } else {
+                        detail_image.set_pixbuf(None);
+                    }
+                }
+            };
+            
             match key {
                 gdk::Key::Return | gdk::Key::KP_Enter => {
                     if let Some(idx) = *selected_game.borrow() {
@@ -293,12 +335,15 @@ impl App {
                         if idx > 0 {
                             if let Some(prev) = game_grid.child_at_index(idx - 1) {
                                 game_grid.select_child(&prev);
-                                *selected_game.borrow_mut() = Some((idx - 1) as usize);
+                                let new_idx = (idx - 1) as usize;
+                                *selected_game.borrow_mut() = Some(new_idx);
+                                update_details(new_idx);
                             }
                         }
                     } else if let Some(first) = game_grid.child_at_index(0) {
                         game_grid.select_child(&first);
                         *selected_game.borrow_mut() = Some(0);
+                        update_details(0);
                     }
                     glib::Propagation::Stop
                 }
@@ -308,11 +353,14 @@ impl App {
                         let idx = selected.index();
                         if let Some(next) = game_grid.child_at_index(idx + 1) {
                             game_grid.select_child(&next);
-                            *selected_game.borrow_mut() = Some((idx + 1) as usize);
+                            let new_idx = (idx + 1) as usize;
+                            *selected_game.borrow_mut() = Some(new_idx);
+                            update_details(new_idx);
                         }
                     } else if let Some(first) = game_grid.child_at_index(0) {
                         game_grid.select_child(&first);
                         *selected_game.borrow_mut() = Some(0);
+                        update_details(0);
                     }
                     glib::Propagation::Stop
                 }
@@ -323,12 +371,15 @@ impl App {
                         if idx >= 6 {
                             if let Some(prev) = game_grid.child_at_index(idx - 6) {
                                 game_grid.select_child(&prev);
-                                *selected_game.borrow_mut() = Some((idx - 6) as usize);
+                                let new_idx = (idx - 6) as usize;
+                                *selected_game.borrow_mut() = Some(new_idx);
+                                update_details(new_idx);
                             }
                         }
                     } else if let Some(first) = game_grid.child_at_index(0) {
                         game_grid.select_child(&first);
                         *selected_game.borrow_mut() = Some(0);
+                        update_details(0);
                     }
                     glib::Propagation::Stop
                 }
@@ -338,11 +389,14 @@ impl App {
                         let idx = selected.index();
                         if let Some(next) = game_grid.child_at_index(idx + 6) {
                             game_grid.select_child(&next);
-                            *selected_game.borrow_mut() = Some((idx + 6) as usize);
+                            let new_idx = (idx + 6) as usize;
+                            *selected_game.borrow_mut() = Some(new_idx);
+                            update_details(new_idx);
                         }
                     } else if let Some(first) = game_grid.child_at_index(0) {
                         game_grid.select_child(&first);
                         *selected_game.borrow_mut() = Some(0);
+                        update_details(0);
                     }
                     glib::Propagation::Stop
                 }
@@ -352,6 +406,7 @@ impl App {
                         if let Some(first) = game_grid.child_at_index(0) {
                             game_grid.select_child(&first);
                             *selected_game.borrow_mut() = Some(0);
+                            update_details(0);
                         }
                     }
                     glib::Propagation::Stop
