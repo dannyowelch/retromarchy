@@ -38,13 +38,3 @@ pub fn load_config() -> Result<Config> {
     Ok(config)
 }
 
-pub fn save_config(config: &Config) -> Result<()> {
-    let path = config_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let content = toml::to_string_pretty(config)?;
-    fs::write(&path, content)
-        .with_context(|| format!("Failed to write config to {}", path.display()))?;
-    Ok(())
-}

@@ -1,7 +1,7 @@
-use crate::types::{ConsoleId, Game, GameId, Media, MediaKind, ProfileId, Source};
+use crate::types::{ConsoleId, Game, GameId, Media, MediaKind, Source};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use std::path::PathBuf;
 
 pub fn db_path() -> Result<PathBuf> {
@@ -185,15 +185,6 @@ pub fn update_last_played(conn: &Connection, game_id: &GameId) -> Result<()> {
     Ok(())
 }
 
-pub fn get_game_profile(conn: &Connection, game_id: &GameId) -> Result<Option<ProfileId>> {
-    conn.query_row(
-        "SELECT profile FROM games WHERE id = ?1",
-        [game_id],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
-}
 
 fn media_kind_to_i32(kind: MediaKind) -> i32 {
     match kind {

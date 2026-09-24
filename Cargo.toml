@@ -7,7 +7,7 @@ edition = "2021"
 gtk4 = "0.9"
 libadwaita = "0.7"
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.7"
+toml = "0.5.11"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 crc32fast = "1.4"
