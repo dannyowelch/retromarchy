@@ -21,19 +21,31 @@ pub struct App {
     game_grid: gtk4::FlowBox,
     search_bar: gtk4::SearchBar,
     search_entry: gtk4::SearchEntry,
+    detail_pane: gtk4::Box,
     detail_image: gtk4::Picture,
     detail_title: gtk4::Label,
+    detail_console: gtk4::Label,
+    detail_rom: gtk4::Label,
+    detail_crc: gtk4::Label,
+    detail_last_played: gtk4::Label,
+    detail_play_count: gtk4::Label,
+    detail_play_time: gtk4::Label,
     current_console: Rc<RefCell<Option<String>>>,
     games: Rc<RefCell<Vec<Game>>>,
     all_games: Rc<RefCell<Vec<Game>>>,
     selected_game: Rc<RefCell<Option<usize>>>,
+    details_visible: Rc<RefCell<bool>>,
 }
 
 impl App {
     pub fn new(app: &adw::Application, config: Config, conn: Rc<RefCell<Connection>>) -> Result<Self> {
         let css_provider = gtk4::CssProvider::new();
         css_provider.load_from_data(
-            "flowboxchild:selected { background: alpha(@accent_bg_color, 0.3); border-radius: 6px; }
+            "flowboxchild:selected { 
+                background: alpha(@accent_bg_color, 0.3); 
+                border-radius: 6px; 
+                border: 2px solid @accent_color;
+             }
              .navigation-sidebar row:selected { background: @accent_bg_color; }
              flowboxchild:focus { outline: 2px solid @accent_color; outline-offset: 2px; }"
         );
@@ -91,8 +103,8 @@ impl App {
 
         center_box.append(&scrolled);
 
-        let detail_pane = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-        detail_pane.set_width_request(250);
+        let detail_pane = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        detail_pane.set_width_request(280);
         detail_pane.set_margin_top(12);
         detail_pane.set_margin_bottom(12);
         detail_pane.set_margin_start(12);
@@ -100,15 +112,46 @@ impl App {
 
         let detail_image = gtk4::Picture::new();
         detail_image.set_can_shrink(true);
-        detail_image.set_height_request(300);
+        detail_image.set_height_request(250);
 
         let detail_title = gtk4::Label::new(Some("Select a game"));
         detail_title.set_wrap(true);
         detail_title.set_halign(gtk4::Align::Start);
         detail_title.add_css_class("title-2");
 
+        let detail_console = gtk4::Label::new(None);
+        detail_console.set_halign(gtk4::Align::Start);
+        detail_console.add_css_class("dim-label");
+
+        let detail_rom = gtk4::Label::new(None);
+        detail_rom.set_wrap(true);
+        detail_rom.set_halign(gtk4::Align::Start);
+        detail_rom.add_css_class("caption");
+
+        let detail_crc = gtk4::Label::new(None);
+        detail_crc.set_halign(gtk4::Align::Start);
+        detail_crc.add_css_class("caption");
+
+        let detail_last_played = gtk4::Label::new(None);
+        detail_last_played.set_halign(gtk4::Align::Start);
+        detail_last_played.add_css_class("caption");
+
+        let detail_play_count = gtk4::Label::new(None);
+        detail_play_count.set_halign(gtk4::Align::Start);
+        detail_play_count.add_css_class("caption");
+
+        let detail_play_time = gtk4::Label::new(None);
+        detail_play_time.set_halign(gtk4::Align::Start);
+        detail_play_time.add_css_class("caption");
+
         detail_pane.append(&detail_image);
         detail_pane.append(&detail_title);
+        detail_pane.append(&detail_console);
+        detail_pane.append(&detail_rom);
+        detail_pane.append(&detail_crc);
+        detail_pane.append(&detail_last_played);
+        detail_pane.append(&detail_play_count);
+        detail_pane.append(&detail_play_time);
 
         main_box.append(&sidebar);
         main_box.append(&center_box);
@@ -124,12 +167,20 @@ impl App {
             game_grid: game_grid.clone(),
             search_bar: search_bar.clone(),
             search_entry: search_entry.clone(),
+            detail_pane: detail_pane.clone(),
             detail_image: detail_image.clone(),
             detail_title: detail_title.clone(),
+            detail_console: detail_console.clone(),
+            detail_rom: detail_rom.clone(),
+            detail_crc: detail_crc.clone(),
+            detail_last_played: detail_last_played.clone(),
+            detail_play_count: detail_play_count.clone(),
+            detail_play_time: detail_play_time.clone(),
             current_console: Rc::new(RefCell::new(None)),
             games: Rc::new(RefCell::new(Vec::new())),
             all_games: Rc::new(RefCell::new(Vec::new())),
             selected_game: Rc::new(RefCell::new(None)),
+            details_visible: Rc::new(RefCell::new(true)),
         };
 
         app_instance.setup_console_list();
@@ -234,8 +285,19 @@ impl App {
             title.set_lines(2);
             title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
+            let rom_name = game.rom.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let rom_label = gtk4::Label::new(Some(rom_name));
+            rom_label.set_wrap(false);
+            rom_label.set_max_width_chars(20);
+            rom_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+            rom_label.add_css_class("caption");
+            rom_label.add_css_class("dim-label");
+
             game_box.append(&frame);
             game_box.append(&title);
+            game_box.append(&rom_label);
 
             grid.insert(&game_box, -1);
         }
@@ -274,14 +336,23 @@ impl App {
         let config = self.config.clone();
         let conn = self.conn.clone();
         let current_console = self.current_console.clone();
+        let detail_pane = self.detail_pane.clone();
+        let details_visible = self.details_visible.clone();
         let detail_image = self.detail_image.clone();
         let detail_title = self.detail_title.clone();
+        let detail_console = self.detail_console.clone();
+        let detail_rom = self.detail_rom.clone();
+        let detail_crc = self.detail_crc.clone();
+        let detail_last_played = self.detail_last_played.clone();
+        let detail_play_count = self.detail_play_count.clone();
+        let detail_play_time = self.detail_play_time.clone();
 
         key_controller.connect_key_pressed(move |_, key, _, _| {
             let update_details = |idx: usize| {
                 let games = games.borrow();
                 if let Some(game) = games.get(idx) {
                     detail_title.set_text(&game.title);
+                    
                     if let Some(media) = game.media.iter().find(|m| m.kind == MediaKind::BoxArt) {
                         if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&media.path, 250, 250, true) {
                             detail_image.set_pixbuf(Some(&pixbuf));
@@ -290,6 +361,51 @@ impl App {
                         }
                     } else {
                         detail_image.set_pixbuf(None);
+                    }
+                    
+                    if let Some(console) = config.consoles.iter().find(|c| c.id == game.console) {
+                        detail_console.set_text(&format!("Console: {}", console.name));
+                        detail_console.set_visible(true);
+                    } else {
+                        detail_console.set_visible(false);
+                    }
+                    
+                    detail_rom.set_text(&format!("ROM: {}", game.rom.display()));
+                    detail_rom.set_visible(true);
+                    
+                    if let Some(crc) = game.crc32 {
+                        detail_crc.set_text(&format!("CRC32: {:08x}", crc));
+                        detail_crc.set_visible(true);
+                    } else {
+                        detail_crc.set_visible(false);
+                    }
+                    
+                    if let Some(dt) = game.last_played {
+                        let formatted = dt.format("%Y-%m-%d %H:%M").to_string();
+                        detail_last_played.set_text(&format!("Last played: {}", formatted));
+                        detail_last_played.set_visible(true);
+                    } else {
+                        detail_last_played.set_visible(false);
+                    }
+                    
+                    if game.play_count > 0 {
+                        detail_play_count.set_text(&format!("Play count: {}", game.play_count));
+                        detail_play_count.set_visible(true);
+                    } else {
+                        detail_play_count.set_visible(false);
+                    }
+                    
+                    if game.play_time > 0 {
+                        let hours = game.play_time / 3600;
+                        let minutes = (game.play_time % 3600) / 60;
+                        if hours > 0 {
+                            detail_play_time.set_text(&format!("Play time: {}h {}m", hours, minutes));
+                        } else {
+                            detail_play_time.set_text(&format!("Play time: {}m", minutes));
+                        }
+                        detail_play_time.set_visible(true);
+                    } else {
+                        detail_play_time.set_visible(false);
                     }
                 }
             };
@@ -416,6 +532,22 @@ impl App {
                     if search_bar.is_search_mode() {
                         search_entry.grab_focus();
                     }
+                    glib::Propagation::Stop
+                }
+                gdk::Key::d => {
+                    let visible = *details_visible.borrow();
+                    detail_pane.set_visible(!visible);
+                    *details_visible.borrow_mut() = !visible;
+                    glib::Propagation::Stop
+                }
+                gdk::Key::t => {
+                    let style_manager = adw::StyleManager::default();
+                    let is_dark = style_manager.is_dark();
+                    style_manager.set_color_scheme(if is_dark {
+                        adw::ColorScheme::ForceLight
+                    } else {
+                        adw::ColorScheme::ForceDark
+                    });
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
