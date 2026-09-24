@@ -27,16 +27,7 @@ pub fn build_launch_command(profile: &EmulatorProfile, rom: &Path) -> Result<(St
     }
 }
 
-pub fn launch_game(profile: &EmulatorProfile, rom: &Path) -> Result<()> {
-    let (program, args) = build_launch_command(profile, rom)?;
-    Command::new(&program)
-        .args(&args)
-        .spawn()
-        .map_err(|e| anyhow!("Failed to launch {}: {}", program, e))?;
-    Ok(())
-}
 
-#[allow(dead_code)]
 pub fn launch_game_tracked(profile: &EmulatorProfile, rom: &Path) -> Result<Child> {
     let (program, args) = build_launch_command(profile, rom)?;
     Command::new(&program)

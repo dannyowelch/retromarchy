@@ -1,24 +1,35 @@
 #!/bin/bash
-# UI Verification Script for Retromarchy
-# Tests keyboard navigation, filter, and launch functionality under Xvfb
+# UI Verification Script for Retromarchy PR #2
+# Tests details pane modes, play tracking, collapsible pane, theme, and keyboard shortcuts
 
 set -e
 
 DISPLAY="${DISPLAY:-:99}"
-SCREENSHOT_DIR="${1:-/opt/cursor/artifacts/retro-verify-$(date +%Y%m%d-%H%M%S)}"
+SCREENSHOT_DIR="/opt/cursor/artifacts"
 APP_LOG="/tmp/retro-verify.log"
+CONFIG_DIR="/tmp/retro-config"
+DB_FILE="$CONFIG_DIR/library.db"
 
-echo "=== Retromarchy UI Verification ==="
+echo "=== Retromarchy PR #2 Verification ==="
 echo "Display: $DISPLAY"
 echo "Screenshot dir: $SCREENSHOT_DIR"
 
 # Setup
 mkdir -p "$SCREENSHOT_DIR"
+mkdir -p "$CONFIG_DIR"
 rm -f "$APP_LOG"
+rm -f "$DB_FILE"
+
+# Copy test config
+cp /tmp/retro-test/config.toml "$CONFIG_DIR/config.toml"
+
+# Set config path
+export XDG_CONFIG_HOME="$(dirname $CONFIG_DIR)"
+export XDG_DATA_HOME="$(dirname $CONFIG_DIR)"
 
 # Helper to wait for UI to settle
 wait_ui() {
-    sleep "${1:-1}"
+    sleep "${1:-1.5}"
 }
 
 # Ensure window manager is running
@@ -33,15 +44,15 @@ pkill -9 retromarchy || true
 sleep 1
 
 # Start the app
-echo "Starting retromarchy..."
+echo "Starting retromarchy with old schema (no play columns)..."
 cd /workspace
 DISPLAY=$DISPLAY cargo run > "$APP_LOG" 2>&1 &
 APP_PID=$!
-sleep 3
+sleep 4
 
 # Wait for window to appear
 echo "Waiting for window..."
-WINDOW=$(DISPLAY=$DISPLAY xdotool search --sync --onlyvisible --name "Retromarchy" | head -1)
+WINDOW=$(DISPLAY=$DISPLAY xdotool search --sync --onlyvisible --name "Retromarchy" 2>/dev/null | head -1)
 if [ -z "$WINDOW" ]; then
     echo "ERROR: Window not found"
     cat "$APP_LOG"
@@ -52,7 +63,7 @@ echo "Found window: $WINDOW"
 # Helper function to send keys with focus
 send_keys() {
     DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 640 360 click 1
-    sleep 0.3
+    sleep 0.2
     DISPLAY=$DISPLAY xdotool key $@
     wait_ui 0.8
 }
@@ -67,104 +78,92 @@ screenshot() {
 echo ""
 echo "=== Test Sequence ==="
 
-# 1. Initial state
-echo "1. Initial state"
-screenshot "01-initial"
+# 1. Click sidebar to select console and trigger scan
+echo "1. Select SNES console (click sidebar)"
+DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 100 100 click 1
+wait_ui 2
 
-# 2. Click sidebar to select console and load games
-echo "2. Select console (click sidebar)"
+# Run initial scan to populate database
+echo "2. Scan console with 'r' key"
+send_keys r
+wait_ui 2
+
+# (a) Console mode with stats
+echo "3. Console mode showing stats"
+screenshot "a-console-mode-stats"
+
+# (b) Select a game
+echo "4. Tab to grid and select a game"
+send_keys Tab Right Right
+screenshot "b-game-selected"
+
+# (c) Escape back to console mode
+echo "5. Press Escape to return to console mode"
+send_keys Escape
+screenshot "c-escape-console-mode"
+
+# (d) Type 'd' in filter (should not collapse pane, just filter)
+echo "6. Open filter with / and type 'd'"
+send_keys slash
+wait_ui 0.5
+DISPLAY=$DISPLAY xdotool type "d"
+wait_ui 1
+screenshot "d-filter-d-pane-visible"
+
+# Close filter
+send_keys Escape
+
+# (e) Collapse pane with 'd' key
+echo "7. Press 'd' to collapse details pane"
+send_keys d
+wait_ui 0.8
+screenshot "e-pane-collapsed"
+
+# Restart to verify pane stays collapsed
+echo "8. Restart app to verify collapsed state persists"
+kill $APP_PID
+wait_ui 2
+DISPLAY=$DISPLAY cargo run > "$APP_LOG" 2>&1 &
+APP_PID=$!
+sleep 4
+WINDOW=$(DISPLAY=$DISPLAY xdotool search --sync --onlyvisible --name "Retromarchy" 2>/dev/null | head -1)
 DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 100 100 click 1
 wait_ui 1.5
-screenshot "02-console-selected"
+screenshot "e2-pane-collapsed-after-restart"
 
-# 3. Tab to game grid
-echo "3. Tab to game grid"
-send_keys Tab
-screenshot "03-tab-to-grid"
-
-# 4. Navigate with hjkl
-echo "4. Navigate with h (left)"
-send_keys h h
-screenshot "04-hjkl-left"
-
-echo "5. Navigate with l (right)"
-send_keys l l l
-screenshot "05-hjkl-right"
-
-echo "6. Navigate with k (up)"
-send_keys k
-screenshot "06-hjkl-up"
-
-echo "7. Navigate with j (down)"
-send_keys j
-screenshot "07-hjkl-down"
-
-# 8. Navigate with arrow keys
-echo "8. Navigate with arrow keys"
-send_keys Right Right
-screenshot "08-arrow-right"
-
-send_keys Up
-screenshot "09-arrow-up"
-
-# 9. Open filter with /
-echo "10. Open filter with /"
-send_keys slash
-screenshot "10-filter-open"
-
-# 10. Type in filter
-echo "11. Type in filter"
-DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 640 360 click 1
-sleep 0.3
-DISPLAY=$DISPLAY xdotool type "5"
+# Re-open pane
+send_keys d
 wait_ui 0.8
-screenshot "11-filter-text"
 
-# 11. Close filter with Escape
-echo "12. Close filter with Escape"
-send_keys Escape
-screenshot "12-filter-closed"
+# (f) Toggle to LaunchBox theme
+echo "9. Press 't' to toggle to LaunchBox theme"
+send_keys t
+wait_ui 1
+screenshot "f-launchbox-theme"
 
-# 12. Press Tab to refocus grid and navigate
-echo "13. Tab back to grid"
-send_keys Tab Left Left
-screenshot "13-positioned-for-launch"
-
-# 13. Press Enter to launch (check logs for launch command)
-echo "14. Press Enter to launch game"
-rm -f /tmp/retro-launch-test.txt
+# (g) Launch game and wait for play tracking
+echo "10. Select game and launch with Enter"
+send_keys Tab Right
+wait_ui 0.5
 send_keys Return
-sleep 2
-screenshot "14-after-launch"
-
-# Check if launch was successful by looking for the output file
-if [ -f /tmp/retro-launch-test.txt ]; then
-    echo "  ✓ Launch succeeded!"
-    echo "  Launch output: $(cat /tmp/retro-launch-test.txt)"
-else
-    echo "  ✗ WARNING: Launch failed - no output file created"
-    echo "  Check app log for errors"
-fi
-
-# 14. Test rescan with 'r' key
-echo "15. Rescan console with 'r'"
-send_keys r
-sleep 2
-screenshot "15-after-rescan"
+echo "  Waiting for stub emulator to complete (3 seconds)..."
+sleep 4
+wait_ui 1
+screenshot "g-play-count-incremented"
 
 echo ""
 echo "=== Verification Complete ==="
 echo "Screenshots saved to: $SCREENSHOT_DIR"
 echo "App log: $APP_LOG"
 echo ""
-echo "To view screenshots:"
-echo "  ls -lh $SCREENSHOT_DIR/"
-echo ""
-echo "To check app output:"
-echo "  cat $APP_LOG"
+echo "Generated screenshots:"
+ls -1 $SCREENSHOT_DIR/*.png | tail -8
 
-# Keep app running for manual inspection
+# Keep app running briefly for inspection
 echo ""
-echo "App is still running (PID $APP_PID). Press Ctrl+C to stop, or kill with:"
-echo "  kill $APP_PID"
-wait $APP_PID
+echo "App is running (PID $APP_PID)."
+sleep 2
+kill $APP_PID 2>/dev/null || true
+
+echo ""
+echo "Verification script completed successfully!"
