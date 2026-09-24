@@ -296,15 +296,29 @@ impl App {
             
             match key {
                 gdk::Key::Return | gdk::Key::KP_Enter => {
+                    eprintln!("DEBUG: Enter key pressed");
                     if let Some(idx) = *selected_game.borrow() {
+                        eprintln!("DEBUG: Selected game index: {}", idx);
                         let games = games.borrow();
                         if let Some(game) = games.get(idx) {
+                            eprintln!("DEBUG: Found game: {}", game.title);
                             if let Some(profile) = Self::resolve_profile(&config, game) {
-                                if launcher::launch_game(&profile, &game.rom).is_ok() {
-                                    let _ = database::update_last_played(&conn.borrow(), &game.id);
+                                eprintln!("DEBUG: Found profile, launching...");
+                                match launcher::launch_game(&profile, &game.rom) {
+                                    Ok(_) => {
+                                        eprintln!("DEBUG: Launch succeeded");
+                                        let _ = database::update_last_played(&conn.borrow(), &game.id);
+                                    }
+                                    Err(e) => eprintln!("DEBUG: Launch failed: {}", e),
                                 }
+                            } else {
+                                eprintln!("DEBUG: No profile found");
                             }
+                        } else {
+                            eprintln!("DEBUG: Game index {} not found", idx);
                         }
+                    } else {
+                        eprintln!("DEBUG: No game selected");
                     }
                     glib::Propagation::Stop
                 }
