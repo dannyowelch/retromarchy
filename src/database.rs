@@ -51,20 +51,42 @@ pub fn init_db() -> Result<Connection> {
         [],
     )?;
 
+    run_migrations(&conn)?;
+
     Ok(conn)
+}
+
+fn run_migrations(conn: &Connection) -> Result<()> {
+    let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    
+    if version < 1 {
+        conn.execute(
+            "ALTER TABLE games ADD COLUMN play_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE games ADD COLUMN play_time INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute("PRAGMA user_version = 1", [])?;
+    }
+    
+    Ok(())
 }
 
 pub fn upsert_game(conn: &Connection, game: &Game) -> Result<()> {
     conn.execute(
-        "INSERT INTO games (id, console, rom, title, crc32, profile, last_played)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO games (id, console, rom, title, crc32, profile, last_played, play_count, play_time)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(id) DO UPDATE SET
             console = excluded.console,
             rom = excluded.rom,
             title = excluded.title,
             crc32 = COALESCE(games.crc32, excluded.crc32),
             profile = COALESCE(games.profile, excluded.profile),
-            last_played = COALESCE(games.last_played, excluded.last_played)",
+            last_played = COALESCE(games.last_played, excluded.last_played),
+            play_count = games.play_count,
+            play_time = games.play_time",
         params![
             game.id,
             game.console,
@@ -73,6 +95,8 @@ pub fn upsert_game(conn: &Connection, game: &Game) -> Result<()> {
             game.crc32,
             game.profile.as_ref(),
             game.last_played.map(|dt| dt.to_rfc3339()),
+            game.play_count,
+            game.play_time,
         ],
     )?;
 
@@ -117,12 +141,12 @@ pub fn remove_missing_games(conn: &Connection, existing_ids: &[GameId]) -> Resul
 pub fn load_games(conn: &Connection, console: Option<&ConsoleId>) -> Result<Vec<Game>> {
     let mut stmt = if let Some(_console_id) = console {
         conn.prepare(
-            "SELECT id, console, rom, title, crc32, profile, last_played
+            "SELECT id, console, rom, title, crc32, profile, last_played, play_count, play_time
              FROM games WHERE console = ?1 ORDER BY title",
         )?
     } else {
         conn.prepare(
-            "SELECT id, console, rom, title, crc32, profile, last_played
+            "SELECT id, console, rom, title, crc32, profile, last_played, play_count, play_time
              FROM games ORDER BY title",
         )?
     };
@@ -140,6 +164,8 @@ pub fn load_games(conn: &Connection, console: Option<&ConsoleId>) -> Result<Vec<
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                 .map(|dt| dt.with_timezone(&Utc)),
             media: Vec::new(),
+            play_count: row.get::<_, Option<u32>>(7)?.unwrap_or(0),
+            play_time: row.get::<_, Option<u32>>(8)?.unwrap_or(0),
         })
     };
 
@@ -185,6 +211,13 @@ pub fn update_last_played(conn: &Connection, game_id: &GameId) -> Result<()> {
     Ok(())
 }
 
+pub fn increment_play_stats(conn: &Connection, game_id: &GameId, play_time_seconds: u32) -> Result<()> {
+    conn.execute(
+        "UPDATE games SET play_count = play_count + 1, play_time = play_time + ?1 WHERE id = ?2",
+        params![play_time_seconds, game_id],
+    )?;
+    Ok(())
+}
 
 fn media_kind_to_i32(kind: MediaKind) -> i32 {
     match kind {
