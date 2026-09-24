@@ -285,6 +285,7 @@ impl App {
 
     fn setup_keyboard_navigation(&self) {
         let key_controller = gtk4::EventControllerKey::new();
+        key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
         let game_grid = self.game_grid.clone();
         let console_list = self.console_list.clone();
@@ -292,9 +293,16 @@ impl App {
         let all_games = self.all_games.clone();
         let selected_game = self.selected_game.clone();
         let config = self.config.clone();
+        let config2 = self.config.clone();
         let conn = self.conn.clone();
         let current_console = self.current_console.clone();
         let filter_text = self.filter_text.clone();
+        let detail_title = self.detail_title.clone();
+        let detail_path = self.detail_path.clone();
+        let detail_console = self.detail_console.clone();
+        let detail_crc = self.detail_crc.clone();
+        let games2 = self.games.clone();
+        let selected_game2 = self.selected_game.clone();
 
         key_controller.connect_key_pressed(move |_, key, _, _| {
             match key {
@@ -384,14 +392,12 @@ impl App {
                     glib::Propagation::Stop
                 }
                 gdk::Key::Tab => {
-                    if game_grid.has_focus() {
-                        console_list.grab_focus();
-                    } else {
-                        game_grid.grab_focus();
-                        if game_grid.selected_children().is_empty() {
-                            if let Some(first) = game_grid.child_at_index(0) {
-                                game_grid.select_child(&first);
-                            }
+                    game_grid.grab_focus();
+                    if game_grid.selected_children().is_empty() {
+                        if let Some(first) = game_grid.child_at_index(0) {
+                            game_grid.select_child(&first);
+                            *selected_game2.borrow_mut() = Some(0);
+                            Self::update_details(&games2, &config2, 0, &detail_title, &detail_path, &detail_console, &detail_crc);
                         }
                     }
                     glib::Propagation::Stop
