@@ -721,6 +721,7 @@ impl App {
         let key_controller = gtk4::EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
+        let window = self.window.clone();
         let game_grid = self.game_grid.clone();
         let search_bar = self.search_bar.clone();
         let search_entry = self.search_entry.clone();
@@ -736,7 +737,11 @@ impl App {
         let theme_css_provider = self.theme_css_provider.clone();
 
         key_controller.connect_key_pressed(move |_, key, _, _| {
-            let search_has_focus = search_entry.has_focus();
+            let focused = gtk4::prelude::RootExt::focus(&window);
+            let search_has_focus = focused.as_ref().map_or(false, |w| {
+                w.upcast_ref::<gtk4::Widget>() == search_entry.upcast_ref::<gtk4::Widget>() ||
+                search_entry.is_ancestor(w)
+            });
             
             let update_details = |idx: usize| {
                 let games = games.borrow();

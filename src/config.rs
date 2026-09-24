@@ -15,14 +15,14 @@ pub struct ConsoleMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default)]
-    pub consoles: Vec<Console>,
-    #[serde(default)]
-    pub profiles: Vec<EmulatorProfile>,
     #[serde(default = "default_theme")]
     pub theme: String,
     #[serde(default = "default_true")]
     pub details_visible: bool,
+    #[serde(default)]
+    pub profiles: Vec<EmulatorProfile>,
+    #[serde(default)]
+    pub consoles: Vec<Console>,
 }
 
 fn default_theme() -> String {
@@ -36,10 +36,10 @@ fn default_true() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            consoles: Vec::new(),
-            profiles: Vec::new(),
             theme: default_theme(),
             details_visible: default_true(),
+            profiles: Vec::new(),
+            consoles: Vec::new(),
         }
     }
 }

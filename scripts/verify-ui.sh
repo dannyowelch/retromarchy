@@ -19,12 +19,15 @@ rm -f "$APP_LOG"
 # Set XDG paths and copy config
 export XDG_CONFIG_HOME="/tmp"
 export XDG_DATA_HOME="/tmp"
+export RETROMARCHY_DEBUG=1
 mkdir -p /tmp/retromarchy
 cp /tmp/retro-test/config.toml /tmp/retromarchy/config.toml
 rm -f /tmp/retromarchy/library.db
 
 echo "Config path: /tmp/retromarchy/config.toml"
 echo "Database path: /tmp/retromarchy/library.db"
+echo "Initial config:"
+grep details_visible /tmp/retromarchy/config.toml
 
 # Helper to wait for UI to settle
 wait_ui() {
@@ -116,20 +119,27 @@ screenshot "d-filter-d-pane-visible"
 send_keys Escape Escape  # First Escape closes search, might need second to clear
 wait_ui 0.8
 
-# (e) Collapse the pane - make sure it's visible first
+# (e) Collapse the pane - make sure it's visible first and grid has focus
 echo "6. Collapse details pane with 'd'"
-# Ensure pane is visible by selecting a game
+# Click in the grid area to ensure focus is NOT on search
+DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 300 100 click 1
+wait_ui 0.3
+# Select a game to ensure pane is visible
 send_keys Tab Right
 wait_ui 0.5
-# Now collapse
+# Now collapse - press 'd' with grid focused
 send_keys d
 wait_ui 0.8
+echo "Config after collapse:"
+grep details_visible /tmp/retromarchy/config.toml
 screenshot "e-pane-collapsed"
 
 # (f) Restart and verify pane stays collapsed
 echo "7. Restart to verify collapsed state persists"
 kill $APP_PID
 wait_ui 2
+echo "Config before restart:"
+grep details_visible /tmp/retromarchy/config.toml
 DISPLAY=$DISPLAY cargo run > "$APP_LOG" 2>&1 &
 APP_PID=$!
 sleep 4
@@ -137,6 +147,8 @@ WINDOW=$(DISPLAY=$DISPLAY xdotool search --sync --onlyvisible --name "Retromarch
 DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 55 52 click 1
 wait_ui 1.5
 screenshot "e2-pane-collapsed-after-restart"
+echo "Config after restart:"
+grep details_visible /tmp/retromarchy/config.toml
 
 # Re-open pane for next tests
 send_keys d
