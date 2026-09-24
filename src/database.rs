@@ -211,6 +211,7 @@ pub fn update_last_played(conn: &Connection, game_id: &GameId) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn increment_play_stats(conn: &Connection, game_id: &GameId, play_time_seconds: u32) -> Result<()> {
     conn.execute(
         "UPDATE games SET play_count = play_count + 1, play_time = play_time + ?1 WHERE id = ?2",
@@ -219,6 +220,7 @@ pub fn increment_play_stats(conn: &Connection, game_id: &GameId, play_time_secon
     Ok(())
 }
 
+#[allow(dead_code)]
 pub struct LibraryStats {
     pub total_games: u32,
     pub last_played_date: Option<DateTime<Utc>>,
@@ -229,6 +231,7 @@ pub struct LibraryStats {
     pub most_played_count: u32,
 }
 
+#[allow(dead_code)]
 pub fn get_library_stats(conn: &Connection, console: &ConsoleId) -> Result<LibraryStats> {
     let total_games: u32 = conn.query_row(
         "SELECT COUNT(*) FROM games WHERE console = ?1",

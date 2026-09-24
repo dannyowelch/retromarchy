@@ -36,6 +36,7 @@ pub fn launch_game(profile: &EmulatorProfile, rom: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn launch_game_tracked(profile: &EmulatorProfile, rom: &Path) -> Result<Child> {
     let (program, args) = build_launch_command(profile, rom)?;
     Command::new(&program)
