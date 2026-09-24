@@ -29,7 +29,16 @@ fn main() -> Result<()> {
 
 fn run_app(app: &adw::Application) -> Result<()> {
     let config = config::load_config()?;
+    let config_path = config::config_path()?;
+    eprintln!("Loaded config from: {}", config_path.display());
+    eprintln!("  Consoles: {}", config.consoles.len());
+    eprintln!("  Profiles: {}", config.profiles.len());
+    eprintln!("  Theme: {}", config.theme);
+    eprintln!("  Details visible: {}", config.details_visible);
+    
     let conn = Rc::new(RefCell::new(database::init_db()?));
+    let db_path = database::db_path()?;
+    eprintln!("Database: {}", db_path.display());
 
     let ui = ui::App::new(app, config, conn)?;
     ui.show();
