@@ -14,7 +14,11 @@ pub fn init_db() -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let conn = Connection::open(&path)
+    open_db(&path)
+}
+
+pub fn open_db(path: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open(path)
         .with_context(|| format!("Failed to open database at {}", path.display()))?;
 
     conn.execute(
@@ -70,14 +74,22 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
         conn.execute("PRAGMA user_version = 1", [])?;
     }
-    
+
+    if version < 2 {
+        conn.execute(
+            "ALTER TABLE games ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute("PRAGMA user_version = 2", [])?;
+    }
+
     Ok(())
 }
 
 pub fn upsert_game(conn: &Connection, game: &Game) -> Result<()> {
     conn.execute(
-        "INSERT INTO games (id, console, rom, title, crc32, profile, last_played, play_count, play_time)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO games (id, console, rom, title, crc32, profile, last_played, play_count, play_time, favorite)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
             console = excluded.console,
             rom = excluded.rom,
@@ -97,6 +109,7 @@ pub fn upsert_game(conn: &Connection, game: &Game) -> Result<()> {
             game.last_played.map(|dt| dt.to_rfc3339()),
             game.play_count,
             game.play_time,
+            game.favorite,
         ],
     )?;
 
@@ -148,12 +161,12 @@ pub fn remove_missing_games(conn: &Connection, console: &ConsoleId, existing_ids
 pub fn load_games(conn: &Connection, console: Option<&ConsoleId>) -> Result<Vec<Game>> {
     let mut stmt = if let Some(_console_id) = console {
         conn.prepare(
-            "SELECT id, console, rom, title, crc32, profile, last_played, play_count, play_time
+            "SELECT id, console, rom, title, crc32, profile, last_played, play_count, play_time, favorite
              FROM games WHERE console = ?1 ORDER BY title",
         )?
     } else {
         conn.prepare(
-            "SELECT id, console, rom, title, crc32, profile, last_played, play_count, play_time
+            "SELECT id, console, rom, title, crc32, profile, last_played, play_count, play_time, favorite
              FROM games ORDER BY title",
         )?
     };
@@ -173,6 +186,7 @@ pub fn load_games(conn: &Connection, console: Option<&ConsoleId>) -> Result<Vec<
             media: Vec::new(),
             play_count: row.get::<_, Option<u32>>(7)?.unwrap_or(0),
             play_time: row.get::<_, Option<u32>>(8)?.unwrap_or(0),
+            favorite: row.get::<_, i64>(9)? != 0,
         })
     };
 
@@ -232,6 +246,14 @@ pub fn update_last_played(conn: &Connection, game_id: &GameId) -> Result<()> {
     conn.execute(
         "UPDATE games SET last_played = ?1 WHERE id = ?2",
         params![now, game_id],
+    )?;
+    Ok(())
+}
+
+pub fn set_favorite(conn: &Connection, game_id: &GameId, favorite: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE games SET favorite = ?1 WHERE id = ?2",
+        params![favorite, game_id],
     )?;
     Ok(())
 }
@@ -335,5 +357,79 @@ fn i32_to_source(val: i32) -> Source {
         1 => Source::TheGamesDb,
         2 => Source::Local,
         _ => Source::Local,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn sample(id: &str, title: &str, favorite: bool) -> Game {
+        Game {
+            id: id.to_string(),
+            console: "snes".to_string(),
+            rom: PathBuf::from(format!("/tmp/{id}.sfc")),
+            title: title.to_string(),
+            crc32: None,
+            profile: None,
+            media: Vec::new(),
+            last_played: None,
+            play_count: 0,
+            play_time: 0,
+            favorite,
+        }
+    }
+
+    #[test]
+    fn favorite_survives_rescan_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(&dir.path().join("library.db")).unwrap();
+        upsert_game(&conn, &sample("a", "Alpha", false)).unwrap();
+        set_favorite(&conn, &"a".to_string(), true).unwrap();
+        upsert_game(&conn, &sample("a", "Alpha", false)).unwrap();
+        let games = load_games(&conn, None).unwrap();
+        assert!(games[0].favorite);
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn version_one_library_gains_favorite_default_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "CREATE TABLE games (
+                    id TEXT PRIMARY KEY,
+                    console TEXT NOT NULL,
+                    rom TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    crc32 INTEGER,
+                    profile TEXT,
+                    last_played TEXT,
+                    play_count INTEGER NOT NULL DEFAULT 0,
+                    play_time INTEGER NOT NULL DEFAULT 0
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute("PRAGMA user_version = 1", []).unwrap();
+            conn.execute(
+                "INSERT INTO games (id, console, rom, title) VALUES ('g', 'snes', '/r.sfc', 'Chrono')",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = open_db(&path).unwrap();
+        let games = load_games(&conn, Some(&"snes".to_string())).unwrap();
+        assert_eq!(games.len(), 1);
+        assert!(!games[0].favorite);
+        set_favorite(&conn, &games[0].id, true).unwrap();
+        assert!(load_games(&conn, None).unwrap()[0].favorite);
     }
 }

@@ -1,9 +1,10 @@
 use crate::config::Config;
 use crate::database;
+use crate::gamepad::{self, NavDir, PadAction};
 use crate::launcher;
 use crate::scanner;
 use crate::scraper::{self, pick_kind, present_kinds};
-use crate::types::{Game, GridArt, Media, MediaKind};
+use crate::types::{visible_games, Game, GridArt, GridFilter, Media, MediaKind};
 use anyhow::Result;
 use gtk4::gdk_pixbuf::Pixbuf;
 use gtk4::prelude::*;
@@ -14,6 +15,14 @@ use rusqlite::Connection;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
+
+const GRID_COLUMNS: i32 = 6;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusPane {
+    Systems,
+    Games,
+}
 
 pub struct App {
     config: Rc<RefCell<Config>>,
@@ -33,6 +42,9 @@ pub struct App {
     theme_css_provider: gtk4::CssProvider,
     center_stack: gtk4::Stack,
     grid_art_combo: gtk4::ComboBoxText,
+    grid_filter_combo: gtk4::ComboBoxText,
+    grid_filter: Rc<RefCell<GridFilter>>,
+    focus_pane: Rc<RefCell<FocusPane>>,
     status_label: gtk4::Label,
     scrape_running: Rc<RefCell<bool>>,
     updating_grid_art: Rc<RefCell<bool>>,
@@ -53,7 +65,14 @@ impl App {
              .rom-tile { background: #2c2c2c; border-radius: 8px; padding: 8px; }
              .rom-art { background: #444444; color: #f2f2f2; }
              .empty-state { background: transparent; }
-             .scrape-status { padding: 6px 12px; background: alpha(@accent_bg_color, 0.35); }"
+             .scrape-status { padding: 6px 12px; background: alpha(@accent_bg_color, 0.35); }
+             .favorite-badge {
+                color: #ffffff;
+                background-color: #c0392b;
+                border-radius: 999px;
+                padding: 1px 6px;
+                font-weight: 700;
+             }"
         );
         gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().expect("Could not get default display"),
@@ -94,6 +113,12 @@ impl App {
         grid_art_combo.set_active_id(Some(GridArt::BoxArt.as_str()));
         grid_art_combo.set_tooltip_text(Some("Grid artwork for this system (1 box, 2 screenshot)"));
 
+        let grid_filter_combo = gtk4::ComboBoxText::new();
+        grid_filter_combo.append(Some(GridFilter::All.as_str()), GridFilter::All.label());
+        grid_filter_combo.append(Some(GridFilter::Favorites.as_str()), GridFilter::Favorites.label());
+        grid_filter_combo.set_active_id(Some(GridFilter::All.as_str()));
+        grid_filter_combo.set_tooltip_text(Some("Show all games or favorites"));
+
         let details_toggle = gtk4::ToggleButton::builder()
             .icon_name("sidebar-show-right-symbolic")
             .tooltip_text("Toggle Details Panel")
@@ -106,6 +131,7 @@ impl App {
             .tooltip_text("Toggle Theme")
             .build();
         header_bar.pack_end(&theme_toggle);
+        header_bar.pack_end(&grid_filter_combo);
         header_bar.pack_end(&grid_art_combo);
 
         let window = adw::ApplicationWindow::builder()
@@ -244,6 +270,9 @@ impl App {
             theme_css_provider: theme_css_provider.clone(),
             center_stack: center_stack.clone(),
             grid_art_combo: grid_art_combo.clone(),
+            grid_filter_combo: grid_filter_combo.clone(),
+            grid_filter: Rc::new(RefCell::new(GridFilter::All)),
+            focus_pane: Rc::new(RefCell::new(FocusPane::Systems)),
             status_label: status_label.clone(),
             scrape_running: Rc::new(RefCell::new(false)),
             updating_grid_art: Rc::new(RefCell::new(false)),
@@ -259,6 +288,8 @@ impl App {
         app_instance.wire_library_actions(&import_button, &emulator_button, &empty_import, &empty_emulators);
         app_instance.wire_scrape_actions(&scraper_button, &scrape_button, &scrape_missing_button);
         app_instance.setup_grid_art();
+        app_instance.setup_grid_filter();
+        app_instance.setup_gamepad();
 
         Ok(app_instance)
     }
@@ -270,20 +301,30 @@ impl App {
         let game_grid = self.game_grid.clone();
         let center_stack = self.center_stack.clone();
         let config = self.config.clone();
+        let grid_filter = self.grid_filter.clone();
+        let selected_game = self.selected_game.clone();
+        let detail_content = self.detail_content.clone();
+        let conn = self.conn.clone();
+        let current_console = self.current_console.clone();
 
         search_entry.connect_search_changed(move |entry| {
-            let text = entry.text().to_string().to_lowercase();
+            let text = entry.text().to_string();
             let all = all_games.borrow();
-            let filtered: Vec<Game> = if text.is_empty() {
-                all.clone()
-            } else {
-                all.iter()
-                    .filter(|g| g.title.to_lowercase().contains(&text))
-                    .cloned()
-                    .collect()
-            };
-            *games.borrow_mut() = filtered;
-            Self::update_game_grid(&game_grid, &center_stack, &games.borrow(), &config.borrow());
+            let visible = visible_games(&all, &text, *grid_filter.borrow());
+            let library_empty = all.is_empty();
+            drop(all);
+            Self::replace_visible_games(
+                &game_grid,
+                &center_stack,
+                &config.borrow(),
+                visible,
+                library_empty,
+                &games,
+                &selected_game,
+                &detail_content,
+                &conn,
+                &current_console.borrow(),
+            );
         });
     }
 
@@ -340,6 +381,13 @@ impl App {
                 }
                 button:hover {
                     background-color: #3a3a3a;
+                }
+                .favorite-badge {
+                    color: #ffffff;
+                    background-color: #c0392b;
+                    border-radius: 999px;
+                    padding: 1px 6px;
+                    font-weight: 700;
                 }"
             );
             gtk4::style_context_add_provider_for_display(
@@ -435,6 +483,13 @@ impl App {
                     }
                     button:hover {
                         background-color: #3a3a3a;
+                    }
+                    .favorite-badge {
+                        color: #ffffff;
+                        background-color: #c0392b;
+                        border-radius: 999px;
+                        padding: 1px 6px;
+                        font-weight: 700;
                     }"
                 );
                 gtk4::style_context_add_provider_for_display(
@@ -474,6 +529,9 @@ impl App {
         let detail_content = self.detail_content.clone();
         let grid_art_combo = self.grid_art_combo.clone();
         let updating_grid_art = self.updating_grid_art.clone();
+        let grid_filter = self.grid_filter.clone();
+        let focus_pane = self.focus_pane.clone();
+        let search_entry = self.search_entry.clone();
 
         self.console_list.connect_row_selected(move |_, row| {
             if let Some(row) = row {
@@ -482,15 +540,30 @@ impl App {
                     let console = &config.borrow().consoles[idx];
                     *current_console.borrow_mut() = Some(console.id.clone());
                     *selected_game.borrow_mut() = None;
+                    *focus_pane.borrow_mut() = FocusPane::Systems;
 
                     if let Ok(loaded_games) = database::load_games(&conn.borrow(), Some(&console.id)) {
-                        *all_games.borrow_mut() = loaded_games.clone();
-                        *games.borrow_mut() = loaded_games;
-                        Self::update_game_grid(&game_grid, &center_stack, &games.borrow(), &config.borrow());
+                        *all_games.borrow_mut() = loaded_games;
+                        let visible = visible_games(
+                            &all_games.borrow(),
+                            &search_entry.text(),
+                            *grid_filter.borrow(),
+                        );
+                        let library_empty = all_games.borrow().is_empty();
+                        Self::replace_visible_games(
+                            &game_grid,
+                            &center_stack,
+                            &config.borrow(),
+                            visible,
+                            library_empty,
+                            &games,
+                            &selected_game,
+                            &detail_content,
+                            &conn,
+                            &current_console.borrow(),
+                        );
                     }
                     Self::sync_grid_art_combo(&grid_art_combo, &updating_grid_art, console.grid_art);
-
-                    Self::update_console_details(&detail_content, &console.id, &conn.borrow(), &config.borrow());
                 }
             }
         });
@@ -588,7 +661,7 @@ impl App {
                 *current_console.borrow_mut() = None;
                 *games.borrow_mut() = Vec::new();
                 *all_games.borrow_mut() = Vec::new();
-                Self::update_game_grid(&game_grid, &center_stack, &[], &config.borrow());
+                Self::update_game_grid(&game_grid, &center_stack, &[], &config.borrow(), true);
                 while let Some(child) = detail_content.first_child() {
                     detail_content.remove(&child);
                 }
@@ -596,7 +669,13 @@ impl App {
         })
     }
 
-    fn update_game_grid(grid: &gtk4::FlowBox, stack: &gtk4::Stack, games: &[Game], config: &Config) {
+    fn update_game_grid(
+        grid: &gtk4::FlowBox,
+        stack: &gtk4::Stack,
+        games: &[Game],
+        config: &Config,
+        library_empty: bool,
+    ) {
         while let Some(child) = grid.first_child() {
             grid.remove(&child);
         }
@@ -610,12 +689,28 @@ impl App {
             frame.set_size_request(150, 150);
             Self::set_tile_art(&frame, game, config);
 
+            let heart = gtk4::Label::new(Some("♥"));
+            heart.set_widget_name("favorite-badge");
+            heart.add_css_class("favorite-badge");
+            heart.set_halign(gtk4::Align::End);
+            heart.set_valign(gtk4::Align::Start);
+            heart.set_margin_top(6);
+            heart.set_margin_end(6);
+            heart.set_can_target(false);
+            heart.set_visible(game.favorite);
+
+            let art = gtk4::Overlay::new();
+            art.set_child(Some(&frame));
+            art.add_overlay(&heart);
+
             let title = gtk4::Label::new(Some(&game.title));
             title.set_wrap(true);
             title.set_max_width_chars(20);
             title.set_lines(2);
             title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
+            game_box.append(&art);
+            game_box.append(&title);
             if let Some(console) = config.consoles.iter().find(|c| c.id == game.console) {
                 let console_label = gtk4::Label::new(Some(&console.name));
                 console_label.set_wrap(false);
@@ -623,22 +718,50 @@ impl App {
                 console_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
                 console_label.add_css_class("caption");
                 console_label.add_css_class("console-subtitle");
-
-                game_box.append(&frame);
-                game_box.append(&title);
                 game_box.append(&console_label);
-            } else {
-                game_box.append(&frame);
-                game_box.append(&title);
             }
 
             grid.insert(&game_box, -1);
         }
 
-        if games.is_empty() {
+        if games.is_empty() && library_empty {
             stack.set_visible_child_name("empty");
         } else {
             stack.set_visible_child_name("grid");
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replace_visible_games(
+        grid: &gtk4::FlowBox,
+        stack: &gtk4::Stack,
+        config: &Config,
+        visible: Vec<Game>,
+        library_empty: bool,
+        games: &Rc<RefCell<Vec<Game>>>,
+        selected: &Rc<RefCell<Option<usize>>>,
+        detail: &gtk4::Box,
+        conn: &Rc<RefCell<Connection>>,
+        current_console: &Option<String>,
+    ) {
+        let keep = selected
+            .borrow()
+            .and_then(|idx| games.borrow().get(idx).map(|game| game.id.clone()));
+        *games.borrow_mut() = visible;
+        Self::update_game_grid(grid, stack, &games.borrow(), config, library_empty);
+        if let Some(id) = keep.as_deref() {
+            if let Some(idx) = games.borrow().iter().position(|game| game.id == id) {
+                if let Some(child) = grid.child_at_index(idx as i32) {
+                    grid.select_child(&child);
+                    *selected.borrow_mut() = Some(idx);
+                    return;
+                }
+            }
+        }
+        grid.unselect_all();
+        *selected.borrow_mut() = None;
+        if let Some(console_id) = current_console {
+            Self::update_console_details(detail, console_id, &conn.borrow(), config);
         }
     }
 
@@ -884,8 +1007,10 @@ impl App {
         let detail_content = self.detail_content.clone();
         let config = self.config.clone();
         let conn = self.conn.clone();
+        let focus_pane = self.focus_pane.clone();
 
         self.game_grid.connect_child_activated(move |_, child| {
+            *focus_pane.borrow_mut() = FocusPane::Games;
             let idx = child.index() as usize;
             *selected_game.borrow_mut() = Some(idx);
             
@@ -901,9 +1026,13 @@ impl App {
         let detail_content2 = self.detail_content.clone();
         let config2 = self.config.clone();
         let conn2 = self.conn.clone();
+        let focus_pane2 = self.focus_pane.clone();
 
         game_grid.connect_selected_children_changed(move |grid| {
             if let Some(child) = grid.selected_children().first() {
+                if child.has_focus() || grid.has_focus() {
+                    *focus_pane2.borrow_mut() = FocusPane::Games;
+                }
                 let idx = child.index() as usize;
                 *selected_game2.borrow_mut() = Some(idx);
                 
@@ -938,17 +1067,22 @@ impl App {
         let status_label = self.status_label.clone();
         let scrape_running = self.scrape_running.clone();
         let grid_art_combo = self.grid_art_combo.clone();
+        let grid_filter_combo = self.grid_filter_combo.clone();
+        let grid_filter = self.grid_filter.clone();
+        let focus_pane = self.focus_pane.clone();
         let updating_grid_art = self.updating_grid_art.clone();
 
         key_controller.connect_key_pressed(move |_, key, _, mods| {
             let focused = gtk4::prelude::RootExt::focus(&window);
-            let search_has_focus = focused.as_ref().map_or(false, |w| {
+            let search_has_focus = focused.as_ref().is_some_and(|w| {
                 w.upcast_ref::<gtk4::Widget>() == search_entry.upcast_ref::<gtk4::Widget>() ||
                 search_entry.is_ancestor(w)
             });
-            let combo_has_focus = focused.as_ref().map_or(false, |w| {
+            let combo_has_focus = focused.as_ref().is_some_and(|w| {
                 w.upcast_ref::<gtk4::Widget>() == grid_art_combo.upcast_ref::<gtk4::Widget>()
                     || grid_art_combo.is_ancestor(w)
+                    || w.upcast_ref::<gtk4::Widget>() == grid_filter_combo.upcast_ref::<gtk4::Widget>()
+                    || grid_filter_combo.is_ancestor(w)
             });
             
             if mods.contains(gdk::ModifierType::CONTROL_MASK) && !search_has_focus {
@@ -980,9 +1114,6 @@ impl App {
                     if search_bar.is_search_mode() {
                         search_bar.set_search_mode(false);
                         search_entry.set_text("");
-                        let all = all_games.borrow();
-                        *games.borrow_mut() = all.clone();
-                        Self::update_game_grid(&game_grid, &center_stack, &games.borrow(), &config.borrow());
                     } else {
                         *selected_game.borrow_mut() = None;
                         game_grid.unselect_all();
@@ -994,47 +1125,7 @@ impl App {
                 }
                 gdk::Key::Return | gdk::Key::KP_Enter => {
                     if !search_has_focus {
-                        if let Some(idx) = *selected_game.borrow() {
-                            let games = games.borrow();
-                            if let Some(game) = games.get(idx) {
-                                let Some(profile) = Self::resolve_profile(&config.borrow(), game) else {
-                                    Self::alert_missing_profile(&window);
-                                    return glib::Propagation::Stop;
-                                };
-                                if let Ok(mut child) = launcher::launch_game_tracked(&profile, &game.rom) {
-                                        let game_id = game.id.clone();
-                                        let game_console = game.console.clone();
-                                        let conn_for_update = conn.clone();
-                                        let detail_for_update = detail_content.clone();
-                                        let config_for_update = config.clone();
-                                        let start_time = Instant::now();
-
-                                        let (sender, receiver) = std::sync::mpsc::channel();
-                                        
-                                        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-                                            if let Ok((game_id, game_console, elapsed)) = receiver.try_recv() {
-                                                let _ = database::increment_play_stats(&conn_for_update.borrow(), &game_id, elapsed);
-                                                let _ = database::update_last_played(&conn_for_update.borrow(), &game_id);
-                                                
-                                                if let Ok(updated_games) = database::load_games(&conn_for_update.borrow(), Some(&game_console)) {
-                                                    if let Some(updated_game) = updated_games.iter().find(|g| g.id == game_id) {
-                                                        Self::update_game_details(&detail_for_update, updated_game, &config_for_update.borrow(), &conn_for_update);
-                                                    }
-                                                }
-                                                glib::ControlFlow::Break
-                                            } else {
-                                                glib::ControlFlow::Continue
-                                            }
-                                        });
-
-                                        std::thread::spawn(move || {
-                                            let _ = child.wait();
-                                            let elapsed = start_time.elapsed().as_secs() as u32;
-                                            let _ = sender.send((game_id, game_console, elapsed));
-                                        });
-                                    }
-                                }
-                            }
+                        Self::launch_selected(&window, &config, &conn, &detail_content, &games, &selected_game);
                         glib::Propagation::Stop
                     } else {
                         glib::Propagation::Proceed
@@ -1059,7 +1150,7 @@ impl App {
                             _ => GridArt::Screenshot,
                         };
                         Self::set_current_grid_art(&config, &current_console, &grid_art_combo, &updating_grid_art, art);
-                        Self::update_game_grid(&game_grid, &center_stack, &games.borrow(), &config.borrow());
+                        Self::redraw_current_games(&game_grid, &center_stack, &config, &games, &all_games, &selected_game, &detail_content, &conn, &current_console);
                         glib::Propagation::Stop
                     } else {
                         glib::Propagation::Proceed
@@ -1078,9 +1169,25 @@ impl App {
                                     let _ = database::remove_missing_games(&conn.borrow(), &console_id, &ids);
 
                                     if let Ok(loaded) = database::load_games(&conn.borrow(), Some(&console_id)) {
-                                        *all_games.borrow_mut() = loaded.clone();
-                                        *games.borrow_mut() = loaded;
-                                        Self::update_game_grid(&game_grid, &center_stack, &games.borrow(), &config.borrow());
+                                        *all_games.borrow_mut() = loaded;
+                                        let visible = visible_games(
+                                            &all_games.borrow(),
+                                            &search_entry.text(),
+                                            *grid_filter.borrow(),
+                                        );
+                                        let library_empty = all_games.borrow().is_empty();
+                                        Self::replace_visible_games(
+                                            &game_grid,
+                                            &center_stack,
+                                            &config.borrow(),
+                                            visible,
+                                            library_empty,
+                                            &games,
+                                            &selected_game,
+                                            &detail_content,
+                                            &conn,
+                                            &current_console.borrow(),
+                                        );
                                     }
 
                                     Self::update_console_details(&detail_content, &console_id, &conn.borrow(), &config.borrow());
@@ -1096,22 +1203,7 @@ impl App {
                     if combo_has_focus {
                         glib::Propagation::Proceed
                     } else if !search_has_focus {
-                        let selected = game_grid.selected_children().first().cloned();
-                        if let Some(selected) = selected {
-                            let idx = selected.index();
-                            if idx > 0 {
-                                if let Some(prev) = game_grid.child_at_index(idx - 1) {
-                                    game_grid.select_child(&prev);
-                                    let new_idx = (idx - 1) as usize;
-                                    *selected_game.borrow_mut() = Some(new_idx);
-                                    update_details(new_idx);
-                                }
-                            }
-                        } else if let Some(first) = game_grid.child_at_index(0) {
-                            game_grid.select_child(&first);
-                            *selected_game.borrow_mut() = Some(0);
-                            update_details(0);
-                        }
+                        Self::move_grid(&game_grid, &games, &selected_game, &focus_pane, NavDir::Left, &update_details);
                         glib::Propagation::Stop
                     } else {
                         glib::Propagation::Proceed
@@ -1121,20 +1213,7 @@ impl App {
                     if combo_has_focus {
                         glib::Propagation::Proceed
                     } else if !search_has_focus {
-                        let selected = game_grid.selected_children().first().cloned();
-                        if let Some(selected) = selected {
-                            let idx = selected.index();
-                            if let Some(next) = game_grid.child_at_index(idx + 1) {
-                                game_grid.select_child(&next);
-                                let new_idx = (idx + 1) as usize;
-                                *selected_game.borrow_mut() = Some(new_idx);
-                                update_details(new_idx);
-                            }
-                        } else if let Some(first) = game_grid.child_at_index(0) {
-                            game_grid.select_child(&first);
-                            *selected_game.borrow_mut() = Some(0);
-                            update_details(0);
-                        }
+                        Self::move_grid(&game_grid, &games, &selected_game, &focus_pane, NavDir::Right, &update_details);
                         glib::Propagation::Stop
                     } else {
                         glib::Propagation::Proceed
@@ -1144,22 +1223,7 @@ impl App {
                     if combo_has_focus {
                         glib::Propagation::Proceed
                     } else if !search_has_focus {
-                        let selected = game_grid.selected_children().first().cloned();
-                        if let Some(selected) = selected {
-                            let idx = selected.index();
-                            if idx >= 6 {
-                                if let Some(prev) = game_grid.child_at_index(idx - 6) {
-                                    game_grid.select_child(&prev);
-                                    let new_idx = (idx - 6) as usize;
-                                    *selected_game.borrow_mut() = Some(new_idx);
-                                    update_details(new_idx);
-                                }
-                            }
-                        } else if let Some(first) = game_grid.child_at_index(0) {
-                            game_grid.select_child(&first);
-                            *selected_game.borrow_mut() = Some(0);
-                            update_details(0);
-                        }
+                        Self::move_grid(&game_grid, &games, &selected_game, &focus_pane, NavDir::Up, &update_details);
                         glib::Propagation::Stop
                     } else {
                         glib::Propagation::Proceed
@@ -1169,26 +1233,22 @@ impl App {
                     if combo_has_focus {
                         glib::Propagation::Proceed
                     } else if !search_has_focus {
-                        let selected = game_grid.selected_children().first().cloned();
-                        if let Some(selected) = selected {
-                            let idx = selected.index();
-                            if let Some(next) = game_grid.child_at_index(idx + 6) {
-                                game_grid.select_child(&next);
-                                let new_idx = (idx + 6) as usize;
-                                *selected_game.borrow_mut() = Some(new_idx);
-                                update_details(new_idx);
-                            }
-                        } else if let Some(first) = game_grid.child_at_index(0) {
-                            game_grid.select_child(&first);
-                            *selected_game.borrow_mut() = Some(0);
-                            update_details(0);
-                        }
+                        Self::move_grid(&game_grid, &games, &selected_game, &focus_pane, NavDir::Down, &update_details);
+                        glib::Propagation::Stop
+                    } else {
+                        glib::Propagation::Proceed
+                    }
+                }
+                gdk::Key::f => {
+                    if !search_has_focus && !combo_has_focus {
+                        Self::toggle_favorite(&conn, &games, &all_games, &selected_game, &grid_filter, &game_grid, &center_stack, &config, &detail_content, &current_console, &search_entry);
                         glib::Propagation::Stop
                     } else {
                         glib::Propagation::Proceed
                     }
                 }
                 gdk::Key::Tab => {
+                    *focus_pane.borrow_mut() = FocusPane::Games;
                     game_grid.grab_focus();
                     if game_grid.selected_children().is_empty() {
                         if let Some(first) = game_grid.child_at_index(0) {
@@ -1281,6 +1341,13 @@ impl App {
                                 }
                                 button:hover {
                                     background-color: #3a3a3a;
+                                }
+                                .favorite-badge {
+                                    color: #ffffff;
+                                    background-color: #c0392b;
+                                    border-radius: 999px;
+                                    padding: 1px 6px;
+                                    font-weight: 700;
                                 }"
                             );
                             gtk4::style_context_add_provider_for_display(
@@ -1335,6 +1402,10 @@ impl App {
         let game_grid = self.game_grid.clone();
         let center_stack = self.center_stack.clone();
         let games = self.games.clone();
+        let all_games = self.all_games.clone();
+        let selected_game = self.selected_game.clone();
+        let detail_content = self.detail_content.clone();
+        let conn = self.conn.clone();
         let updating = self.updating_grid_art.clone();
         self.grid_art_combo.connect_changed(move |combo| {
             if *updating.borrow() {
@@ -1343,7 +1414,40 @@ impl App {
             let Some(id) = combo.active_id() else { return };
             let Some(art) = GridArt::parse(id.as_str()) else { return };
             Self::set_current_grid_art(&config, &current_console, combo, &updating, art);
-            Self::update_game_grid(&game_grid, &center_stack, &games.borrow(), &config.borrow());
+            Self::redraw_current_games(&game_grid, &center_stack, &config, &games, &all_games, &selected_game, &detail_content, &conn, &current_console);
+        });
+    }
+
+    fn setup_grid_filter(&self) {
+        let games = self.games.clone();
+        let all_games = self.all_games.clone();
+        let game_grid = self.game_grid.clone();
+        let center_stack = self.center_stack.clone();
+        let config = self.config.clone();
+        let grid_filter = self.grid_filter.clone();
+        let selected_game = self.selected_game.clone();
+        let detail_content = self.detail_content.clone();
+        let conn = self.conn.clone();
+        let current_console = self.current_console.clone();
+        let search_entry = self.search_entry.clone();
+        self.grid_filter_combo.connect_changed(move |combo| {
+            let Some(id) = combo.active_id() else { return };
+            let Some(filter) = GridFilter::parse(id.as_str()) else { return };
+            *grid_filter.borrow_mut() = filter;
+            let visible = visible_games(&all_games.borrow(), &search_entry.text(), filter);
+            let library_empty = all_games.borrow().is_empty();
+            Self::replace_visible_games(
+                &game_grid,
+                &center_stack,
+                &config.borrow(),
+                visible,
+                library_empty,
+                &games,
+                &selected_game,
+                &detail_content,
+                &conn,
+                &current_console.borrow(),
+            );
         });
     }
 
@@ -1624,15 +1728,378 @@ impl App {
         let Some(tile) = flow_child.child().and_downcast::<gtk4::Box>() else {
             return;
         };
-        let Some(frame) = tile.first_child().and_downcast::<gtk4::Frame>() else {
+        let Some(frame) = Self::tile_art_frame(&tile) else {
             return;
         };
         Self::set_tile_art(&frame, game, config);
     }
 
+    fn tile_art_frame(tile: &gtk4::Box) -> Option<gtk4::Frame> {
+        let first = tile.first_child()?;
+        if let Ok(frame) = first.clone().downcast::<gtk4::Frame>() {
+            return Some(frame);
+        }
+        let overlay = first.downcast::<gtk4::Overlay>().ok()?;
+        overlay.child()?.downcast::<gtk4::Frame>().ok()
+    }
+
     fn show_status(status: &gtk4::Label, text: &str) {
         status.set_text(text);
         status.set_visible(!text.is_empty());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn redraw_current_games(
+        grid: &gtk4::FlowBox,
+        stack: &gtk4::Stack,
+        config: &Rc<RefCell<Config>>,
+        games: &Rc<RefCell<Vec<Game>>>,
+        all_games: &Rc<RefCell<Vec<Game>>>,
+        selected: &Rc<RefCell<Option<usize>>>,
+        detail: &gtk4::Box,
+        conn: &Rc<RefCell<Connection>>,
+        current_console: &Rc<RefCell<Option<String>>>,
+    ) {
+        let visible = games.borrow().clone();
+        let library_empty = all_games.borrow().is_empty();
+        Self::replace_visible_games(
+            grid,
+            stack,
+            &config.borrow(),
+            visible,
+            library_empty,
+            games,
+            selected,
+            detail,
+            conn,
+            &current_console.borrow(),
+        );
+    }
+
+    fn move_grid(
+        grid: &gtk4::FlowBox,
+        games: &Rc<RefCell<Vec<Game>>>,
+        selected: &Rc<RefCell<Option<usize>>>,
+        focus_pane: &Rc<RefCell<FocusPane>>,
+        dir: NavDir,
+        update_details: &impl Fn(usize),
+    ) {
+        *focus_pane.borrow_mut() = FocusPane::Games;
+        let len = games.borrow().len() as i32;
+        let current = grid.selected_children().first().map(|child| child.index());
+        let Some(next) = gamepad::grid_step(current, dir, len, GRID_COLUMNS) else {
+            return;
+        };
+        if let Some(child) = grid.child_at_index(next) {
+            grid.select_child(&child);
+            child.grab_focus();
+            *selected.borrow_mut() = Some(next as usize);
+            update_details(next as usize);
+        }
+    }
+
+    fn list_len(list: &gtk4::ListBox) -> i32 {
+        let mut count = 0;
+        while list.row_at_index(count).is_some() {
+            count += 1;
+        }
+        count
+    }
+
+    fn move_systems(list: &gtk4::ListBox, dir: NavDir) {
+        let current = list.selected_row().map(|row| row.index());
+        let Some(next) = gamepad::list_step(current, dir, Self::list_len(list)) else {
+            return;
+        };
+        if let Some(row) = list.row_at_index(next) {
+            list.select_row(Some(&row));
+            row.grab_focus();
+        }
+    }
+
+    fn enter_games(
+        grid: &gtk4::FlowBox,
+        games: &Rc<RefCell<Vec<Game>>>,
+        selected: &Rc<RefCell<Option<usize>>>,
+        focus_pane: &Rc<RefCell<FocusPane>>,
+        detail: &gtk4::Box,
+        config: &Rc<RefCell<Config>>,
+        conn: &Rc<RefCell<Connection>>,
+    ) {
+        if grid.child_at_index(0).is_none() {
+            return;
+        }
+        *focus_pane.borrow_mut() = FocusPane::Games;
+        let idx = selected
+            .borrow()
+            .filter(|idx| grid.child_at_index(*idx as i32).is_some())
+            .unwrap_or(0);
+        if let Some(child) = grid.child_at_index(idx as i32) {
+            grid.select_child(&child);
+            child.grab_focus();
+            *selected.borrow_mut() = Some(idx);
+            if let Some(game) = games.borrow().get(idx) {
+                Self::update_game_details(detail, game, &config.borrow(), conn);
+            }
+        }
+    }
+
+    fn write_favorite(games: &Rc<RefCell<Vec<Game>>>, id: &str, favorite: bool) {
+        if let Some(game) = games.borrow_mut().iter_mut().find(|game| game.id == id) {
+            game.favorite = favorite;
+        }
+    }
+
+    fn set_tile_favorite(grid: &gtk4::FlowBox, index: usize, favorite: bool) {
+        let Some(flow_child) = grid.child_at_index(index as i32) else {
+            return;
+        };
+        let Some(tile) = flow_child.child().and_downcast::<gtk4::Box>() else {
+            return;
+        };
+        let Some(overlay) = tile.first_child().and_downcast::<gtk4::Overlay>() else {
+            return;
+        };
+        let mut widget = overlay.first_child();
+        while let Some(current) = widget {
+            if current.widget_name() == "favorite-badge" {
+                current.set_visible(favorite);
+                return;
+            }
+            widget = current.next_sibling();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn toggle_favorite(
+        conn: &Rc<RefCell<Connection>>,
+        games: &Rc<RefCell<Vec<Game>>>,
+        all_games: &Rc<RefCell<Vec<Game>>>,
+        selected: &Rc<RefCell<Option<usize>>>,
+        grid_filter: &Rc<RefCell<GridFilter>>,
+        grid: &gtk4::FlowBox,
+        stack: &gtk4::Stack,
+        config: &Rc<RefCell<Config>>,
+        detail: &gtk4::Box,
+        current_console: &Rc<RefCell<Option<String>>>,
+        search: &gtk4::SearchEntry,
+    ) {
+        let Some(idx) = *selected.borrow() else {
+            return;
+        };
+        let Some(game) = games.borrow().get(idx).cloned() else {
+            return;
+        };
+        let next = !game.favorite;
+        if database::set_favorite(&conn.borrow(), &game.id, next).is_err() {
+            return;
+        }
+        Self::write_favorite(all_games, &game.id, next);
+        Self::write_favorite(games, &game.id, next);
+        if *grid_filter.borrow() == GridFilter::Favorites && !next {
+            let visible = visible_games(&all_games.borrow(), &search.text(), GridFilter::Favorites);
+            let library_empty = all_games.borrow().is_empty();
+            Self::replace_visible_games(
+                grid,
+                stack,
+                &config.borrow(),
+                visible,
+                library_empty,
+                games,
+                selected,
+                detail,
+                conn,
+                &current_console.borrow(),
+            );
+            return;
+        }
+        Self::set_tile_favorite(grid, idx, next);
+    }
+
+    fn launch_selected(
+        window: &adw::ApplicationWindow,
+        config: &Rc<RefCell<Config>>,
+        conn: &Rc<RefCell<Connection>>,
+        detail: &gtk4::Box,
+        games: &Rc<RefCell<Vec<Game>>>,
+        selected: &Rc<RefCell<Option<usize>>>,
+    ) {
+        let Some(idx) = *selected.borrow() else {
+            return;
+        };
+        let Some(game) = games.borrow().get(idx).cloned() else {
+            return;
+        };
+        Self::launch_game(window, config, conn, detail, &game);
+    }
+
+    fn launch_game(
+        window: &adw::ApplicationWindow,
+        config: &Rc<RefCell<Config>>,
+        conn: &Rc<RefCell<Connection>>,
+        detail: &gtk4::Box,
+        game: &Game,
+    ) {
+        let Some(profile) = Self::resolve_profile(&config.borrow(), game) else {
+            Self::alert_missing_profile(window);
+            return;
+        };
+        let Ok(mut child) = launcher::launch_game_tracked(&profile, &game.rom) else {
+            return;
+        };
+        let game_id = game.id.clone();
+        let game_console = game.console.clone();
+        let conn_for_update = conn.clone();
+        let detail_for_update = detail.clone();
+        let config_for_update = config.clone();
+        let start_time = Instant::now();
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            if let Ok((game_id, game_console, elapsed)) = receiver.try_recv() {
+                let _ = database::increment_play_stats(&conn_for_update.borrow(), &game_id, elapsed);
+                let _ = database::update_last_played(&conn_for_update.borrow(), &game_id);
+                if let Ok(updated_games) = database::load_games(&conn_for_update.borrow(), Some(&game_console)) {
+                    if let Some(updated_game) = updated_games.iter().find(|g| g.id == game_id) {
+                        Self::update_game_details(
+                            &detail_for_update,
+                            updated_game,
+                            &config_for_update.borrow(),
+                            &conn_for_update,
+                        );
+                    }
+                }
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+
+        std::thread::spawn(move || {
+            let _ = child.wait();
+            let elapsed = start_time.elapsed().as_secs() as u32;
+            let _ = sender.send((game_id, game_console, elapsed));
+        });
+    }
+
+    fn pad_blocked(window: &adw::ApplicationWindow, search: &gtk4::SearchEntry, combos: &[&gtk4::ComboBoxText]) -> bool {
+        if !window.is_active() {
+            return true;
+        }
+        let Some(focused) = gtk4::prelude::RootExt::focus(window) else {
+            return false;
+        };
+        let widget = focused.upcast_ref::<gtk4::Widget>();
+        if widget == search.upcast_ref::<gtk4::Widget>() || search.is_ancestor(&focused) {
+            return true;
+        }
+        combos.iter().any(|combo| {
+            widget == combo.upcast_ref::<gtk4::Widget>() || combo.is_ancestor(&focused)
+        })
+    }
+
+    fn setup_gamepad(&self) {
+        let mut gilrs = match gilrs::Gilrs::new() {
+            Ok(gilrs) => gilrs,
+            Err(err) => {
+                eprintln!("Gamepad unavailable: {err}");
+                return;
+            }
+        };
+        let mut latch = gamepad::StickLatch::default();
+        let window = self.window.clone();
+        let game_grid = self.game_grid.clone();
+        let console_list = self.console_list.clone();
+        let games = self.games.clone();
+        let all_games = self.all_games.clone();
+        let selected_game = self.selected_game.clone();
+        let focus_pane = self.focus_pane.clone();
+        let config = self.config.clone();
+        let conn = self.conn.clone();
+        let detail_content = self.detail_content.clone();
+        let center_stack = self.center_stack.clone();
+        let grid_filter = self.grid_filter.clone();
+        let current_console = self.current_console.clone();
+        let search_entry = self.search_entry.clone();
+        let grid_art_combo = self.grid_art_combo.clone();
+        let grid_filter_combo = self.grid_filter_combo.clone();
+
+        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+            let blocked = Self::pad_blocked(&window, &search_entry, &[&grid_art_combo, &grid_filter_combo]);
+            while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
+                if blocked {
+                    continue;
+                }
+                let Some(action) = gamepad::event_action(&event, &mut latch) else {
+                    continue;
+                };
+                let update_details = |idx: usize| {
+                    if let Some(game) = games.borrow().get(idx) {
+                        Self::update_game_details(&detail_content, game, &config.borrow(), &conn);
+                    }
+                };
+                match action {
+                    PadAction::Move(dir) => match *focus_pane.borrow() {
+                        FocusPane::Systems => Self::move_systems(&console_list, dir),
+                        FocusPane::Games => Self::move_grid(
+                            &game_grid,
+                            &games,
+                            &selected_game,
+                            &focus_pane,
+                            dir,
+                            &update_details,
+                        ),
+                    },
+                    PadAction::Confirm => match *focus_pane.borrow() {
+                        FocusPane::Systems => Self::enter_games(
+                            &game_grid,
+                            &games,
+                            &selected_game,
+                            &focus_pane,
+                            &detail_content,
+                            &config,
+                            &conn,
+                        ),
+                        FocusPane::Games => Self::launch_selected(
+                            &window,
+                            &config,
+                            &conn,
+                            &detail_content,
+                            &games,
+                            &selected_game,
+                        ),
+                    },
+                    PadAction::Back => {
+                        if *focus_pane.borrow() == FocusPane::Games {
+                            *focus_pane.borrow_mut() = FocusPane::Systems;
+                            if let Some(row) = console_list.selected_row() {
+                                row.grab_focus();
+                            } else {
+                                console_list.grab_focus();
+                            }
+                        }
+                    }
+                    PadAction::Favorite => {
+                        if *focus_pane.borrow() == FocusPane::Games {
+                            Self::toggle_favorite(
+                                &conn,
+                                &games,
+                                &all_games,
+                                &selected_game,
+                                &grid_filter,
+                                &game_grid,
+                                &center_stack,
+                                &config,
+                                &detail_content,
+                                &current_console,
+                                &search_entry,
+                            );
+                        }
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     pub fn show(&self) {

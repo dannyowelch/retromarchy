@@ -33,6 +33,57 @@ pub struct Game {
     pub last_played: Option<DateTime<Utc>>,
     pub play_count: u32,
     pub play_time: u32,
+    /// User-pinned. Stored on the game row; scans do not clear it.
+    pub favorite: bool,
+}
+
+/// Which games the grid shows for the current console. Session UI state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridFilter {
+    All,
+    Favorites,
+}
+
+impl GridFilter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Favorites => "favorites",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Favorites => "Favorites",
+        }
+    }
+
+    pub fn parse(id: &str) -> Option<Self> {
+        match id {
+            "all" => Some(Self::All),
+            "favorites" => Some(Self::Favorites),
+            _ => None,
+        }
+    }
+
+    pub fn matches(self, game: &Game) -> bool {
+        match self {
+            Self::All => true,
+            Self::Favorites => game.favorite,
+        }
+    }
+}
+
+/// Title query plus [`GridFilter`]. `query` is matched case-insensitively.
+pub fn visible_games(games: &[Game], query: &str, filter: GridFilter) -> Vec<Game> {
+    let query = query.trim().to_lowercase();
+    games
+        .iter()
+        .filter(|game| filter.matches(game))
+        .filter(|game| query.is_empty() || game.title.to_lowercase().contains(&query))
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,5 +330,47 @@ impl EmulatorProfile {
             EmulatorProfile::RetroArch { id, .. } => id,
             EmulatorProfile::Standalone { id, .. } => id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn game(title: &str, favorite: bool) -> Game {
+        Game {
+            id: title.to_string(),
+            console: "snes".to_string(),
+            rom: PathBuf::from(title),
+            title: title.to_string(),
+            crc32: None,
+            profile: None,
+            media: Vec::new(),
+            last_played: None,
+            play_count: 0,
+            play_time: 0,
+            favorite,
+        }
+    }
+
+    #[test]
+    fn visible_games_composes_query_and_favorites() {
+        let games = vec![
+            game("Alpha", true),
+            game("Beta", false),
+            game("Alpine", true),
+        ];
+        let favorites = visible_games(&games, "", GridFilter::Favorites);
+        assert_eq!(
+            favorites.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(),
+            vec!["Alpha", "Alpine"]
+        );
+        let queried = visible_games(&games, "alp", GridFilter::All);
+        assert_eq!(
+            queried.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(),
+            vec!["Alpha", "Alpine"]
+        );
+        let both = visible_games(&games, "beta", GridFilter::Favorites);
+        assert!(both.is_empty());
     }
 }

@@ -2,6 +2,7 @@ mod catalog;
 mod config;
 mod cores;
 mod database;
+mod gamepad;
 mod dialogs;
 mod importer;
 mod launcher;
