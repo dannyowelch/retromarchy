@@ -56,6 +56,8 @@ fn process_rom(rom_path: &Path, console: &Console) -> Result<Option<Game>> {
         profile: None,
         media,
         last_played: None,
+        play_count: 0,
+        play_time: 0,
     }))
 }
 
