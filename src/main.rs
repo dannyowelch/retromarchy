@@ -6,6 +6,7 @@ mod dialogs;
 mod importer;
 mod launcher;
 mod scanner;
+mod scraper;
 mod types;
 mod ui;
 

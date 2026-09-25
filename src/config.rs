@@ -1,4 +1,4 @@
-use crate::types::{Console, EmulatorProfile};
+use crate::types::{Console, EmulatorProfile, ScraperConfig};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -22,6 +22,8 @@ pub struct Config {
     pub profiles: Vec<EmulatorProfile>,
     #[serde(default)]
     pub consoles: Vec<Console>,
+    #[serde(default)]
+    pub scraper: ScraperConfig,
 }
 
 fn default_theme() -> String {
@@ -39,6 +41,7 @@ impl Default for Config {
             details_visible: default_true(),
             profiles: Vec::new(),
             consoles: Vec::new(),
+            scraper: ScraperConfig::default(),
         }
     }
 }
@@ -71,6 +74,36 @@ pub fn load_config() -> Result<Config> {
     let config: Config = toml::from_str(&content)
         .with_context(|| format!("Failed to parse config from {}", path.display()))?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Console, GridArt, MediaToggles};
+
+    #[test]
+    fn grid_art_roundtrip_saves() {
+        let config = Config {
+            consoles: vec![Console {
+                id: "snes".into(),
+                name: "Super Nintendo".into(),
+                rom_dirs: vec![],
+                extensions: vec!["sfc".into()],
+                profile: None,
+                grid_art: GridArt::TitleScreen,
+                media: MediaToggles::default(),
+            }],
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            text.contains("grid_art = 'title_screen'") || text.contains("grid_art = \"title_screen\""),
+            "{text}"
+        );
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.consoles[0].grid_art, GridArt::TitleScreen);
+        assert_eq!(back.scraper.providers.len(), 2);
+    }
 }
 
 pub fn save_config(config: &Config) -> Result<()> {

@@ -188,6 +188,7 @@ mod tests {
             rom_dirs: vec![rom_dir.clone()],
             extensions: vec!["sfc".to_string()],
             profile: Some("retroarch-snes9x".to_string()),
+            grid_art: crate::types::GridArt::default(),
             media: MediaToggles::default(),
         };
 
@@ -225,6 +226,7 @@ mod tests {
             rom_dirs: vec![rom_dir.clone()],
             extensions: vec!["sfc".to_string()],
             profile: Some("retroarch-snes9x".to_string()),
+            grid_art: crate::types::GridArt::default(),
             media: MediaToggles {
                 box_art: true,
                 screenshot: false,

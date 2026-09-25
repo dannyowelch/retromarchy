@@ -2,7 +2,8 @@ use crate::config::Config;
 use crate::database;
 use crate::launcher;
 use crate::scanner;
-use crate::types::{Game, MediaKind};
+use crate::scraper::{self, pick_kind, present_kinds};
+use crate::types::{Game, GridArt, MediaKind};
 use anyhow::Result;
 use gtk4::gdk_pixbuf::Pixbuf;
 use gtk4::prelude::*;
@@ -31,6 +32,10 @@ pub struct App {
     details_visible: Rc<RefCell<bool>>,
     theme_css_provider: gtk4::CssProvider,
     center_stack: gtk4::Stack,
+    grid_art_combo: gtk4::ComboBoxText,
+    status_label: gtk4::Label,
+    scrape_running: Rc<RefCell<bool>>,
+    updating_grid_art: Rc<RefCell<bool>>,
 }
 
 impl App {
@@ -47,7 +52,8 @@ impl App {
              .console-subtitle { opacity: 0.65; font-size: 0.9em; }
              .rom-tile { background: #2c2c2c; border-radius: 8px; padding: 8px; }
              .rom-art { background: #444444; color: #f2f2f2; }
-             .empty-state { background: transparent; }"
+             .empty-state { background: transparent; }
+             .scrape-status { padding: 6px 12px; background: alpha(@accent_bg_color, 0.35); }"
         );
         gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().expect("Could not get default display"),
@@ -67,6 +73,28 @@ impl App {
         emulator_button.add_css_class("flat");
         header_bar.pack_start(&emulator_button);
 
+        let scraper_button = gtk4::Button::with_label("Scraper");
+        scraper_button.add_css_class("flat");
+        scraper_button.set_tooltip_text(Some("Scraper settings (Ctrl+G)"));
+        header_bar.pack_start(&scraper_button);
+
+        let scrape_button = gtk4::Button::with_label("Scrape");
+        scrape_button.add_css_class("flat");
+        scrape_button.set_tooltip_text(Some("Scrape artwork for the selected game (S)"));
+        header_bar.pack_start(&scrape_button);
+
+        let scrape_missing_button = gtk4::Button::with_label("Scrape Missing");
+        scrape_missing_button.add_css_class("flat");
+        scrape_missing_button.set_tooltip_text(Some("Scrape missing artwork for this system (Shift+S)"));
+        header_bar.pack_start(&scrape_missing_button);
+
+        let grid_art_combo = gtk4::ComboBoxText::new();
+        grid_art_combo.append(Some(GridArt::BoxArt.as_str()), GridArt::BoxArt.label());
+        grid_art_combo.append(Some(GridArt::TitleScreen.as_str()), GridArt::TitleScreen.label());
+        grid_art_combo.append(Some(GridArt::Screenshot.as_str()), GridArt::Screenshot.label());
+        grid_art_combo.set_active_id(Some(GridArt::BoxArt.as_str()));
+        grid_art_combo.set_tooltip_text(Some("Grid artwork for this system (1 box, 2 title, 3 screenshot)"));
+
         let details_toggle = gtk4::ToggleButton::builder()
             .icon_name("sidebar-show-right-symbolic")
             .tooltip_text("Toggle Details Panel")
@@ -79,6 +107,7 @@ impl App {
             .tooltip_text("Toggle Theme")
             .build();
         header_bar.pack_end(&theme_toggle);
+        header_bar.pack_end(&grid_art_combo);
 
         let window = adw::ApplicationWindow::builder()
             .application(app)
@@ -89,6 +118,19 @@ impl App {
 
         let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         vbox.append(&header_bar);
+
+        let status_label = gtk4::Label::new(None);
+        status_label.set_widget_name("scrape-status");
+        status_label.add_css_class("scrape-status");
+        status_label.set_halign(gtk4::Align::Fill);
+        status_label.set_xalign(0.0);
+        status_label.set_wrap(true);
+        status_label.set_margin_start(12);
+        status_label.set_margin_end(12);
+        status_label.set_margin_top(6);
+        status_label.set_margin_bottom(6);
+        status_label.set_visible(false);
+        vbox.append(&status_label);
 
         let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
 
@@ -202,6 +244,10 @@ impl App {
             details_visible,
             theme_css_provider: theme_css_provider.clone(),
             center_stack: center_stack.clone(),
+            grid_art_combo: grid_art_combo.clone(),
+            status_label: status_label.clone(),
+            scrape_running: Rc::new(RefCell::new(false)),
+            updating_grid_art: Rc::new(RefCell::new(false)),
         };
 
         app_instance.apply_theme(&config.theme);
@@ -212,6 +258,8 @@ impl App {
         app_instance.setup_details_toggle(details_toggle);
         app_instance.setup_theme_toggle(theme_toggle);
         app_instance.wire_library_actions(&import_button, &emulator_button, &empty_import, &empty_emulators);
+        app_instance.wire_scrape_actions(&scraper_button, &scrape_button, &scrape_missing_button);
+        app_instance.setup_grid_art();
 
         Ok(app_instance)
     }
@@ -425,6 +473,8 @@ impl App {
         let center_stack = self.center_stack.clone();
         let selected_game = self.selected_game.clone();
         let detail_content = self.detail_content.clone();
+        let grid_art_combo = self.grid_art_combo.clone();
+        let updating_grid_art = self.updating_grid_art.clone();
 
         self.console_list.connect_row_selected(move |_, row| {
             if let Some(row) = row {
@@ -439,6 +489,7 @@ impl App {
                         *games.borrow_mut() = loaded_games;
                         Self::update_game_grid(&game_grid, &center_stack, &games.borrow(), &config.borrow());
                     }
+                    Self::sync_grid_art_combo(&grid_art_combo, &updating_grid_art, console.grid_art);
 
                     Self::update_console_details(&detail_content, &console.id, &conn.borrow(), &config.borrow());
                 }
@@ -559,7 +610,7 @@ impl App {
             frame.add_css_class("rom-art");
             frame.set_size_request(150, 150);
 
-            if let Some(media) = game.media.iter().find(|m| m.kind == MediaKind::BoxArt) {
+            if let Some(media) = Self::grid_tile_media(game, config) {
                 if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&media.path, 150, 150, true) {
                     let picture = gtk4::Picture::for_pixbuf(&pixbuf);
                     frame.set_child(Some(&picture));
@@ -714,14 +765,17 @@ impl App {
             detail_content.remove(&child);
         }
 
-        if let Some(media) = game.media.iter().find(|m| m.kind == MediaKind::BoxArt) {
-            if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&media.path, 250, 250, true) {
+        if let Some(media) = game.media.iter().find(|m| m.kind == MediaKind::BoxArt && m.path.is_file()) {
+            if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&media.path, 250, 180, true) {
                 let picture = gtk4::Picture::for_pixbuf(&pixbuf);
                 picture.set_can_shrink(true);
-                picture.set_height_request(250);
+                picture.set_height_request(180);
                 detail_content.append(&picture);
             }
         }
+
+        Self::append_detail_media(detail_content, game, MediaKind::TitleScreen, "Title screen");
+        Self::append_detail_media(detail_content, game, MediaKind::Screenshot, "Screenshot");
 
         let title_label = gtk4::Label::new(Some(&game.title));
         title_label.set_wrap(true);
@@ -897,6 +951,10 @@ impl App {
         let theme_css_provider = self.theme_css_provider.clone();
         let center_stack = self.center_stack.clone();
         let console_list = self.console_list.clone();
+        let status_label = self.status_label.clone();
+        let scrape_running = self.scrape_running.clone();
+        let grid_art_combo = self.grid_art_combo.clone();
+        let updating_grid_art = self.updating_grid_art.clone();
 
         key_controller.connect_key_pressed(move |_, key, _, mods| {
             let focused = gtk4::prelude::RootExt::focus(&window);
@@ -904,8 +962,16 @@ impl App {
                 w.upcast_ref::<gtk4::Widget>() == search_entry.upcast_ref::<gtk4::Widget>() ||
                 search_entry.is_ancestor(w)
             });
+            let combo_has_focus = focused.as_ref().map_or(false, |w| {
+                w.upcast_ref::<gtk4::Widget>() == grid_art_combo.upcast_ref::<gtk4::Widget>()
+                    || grid_art_combo.is_ancestor(w)
+            });
             
             if mods.contains(gdk::ModifierType::CONTROL_MASK) && !search_has_focus {
+                if key == gdk::Key::g || key == gdk::Key::G {
+                    crate::dialogs::open_scraper(&window, config.clone());
+                    return glib::Propagation::Stop;
+                }
                 if key == gdk::Key::i || key == gdk::Key::I {
                     let done = Self::refresh_action(console_list.clone(), config.clone(), conn.clone(), games.clone(), all_games.clone(), game_grid.clone(), center_stack.clone(), current_console.clone(), detail_content.clone());
                     crate::dialogs::open_import(&window, config.clone(), conn.clone(), done);
@@ -990,6 +1056,32 @@ impl App {
                         glib::Propagation::Proceed
                     }
                 }
+                gdk::Key::s | gdk::Key::S => {
+                    if !search_has_focus {
+                        if mods.contains(gdk::ModifierType::SHIFT_MASK) || key == gdk::Key::S {
+                            Self::request_scrape_missing(&status_label, &scrape_running, &config, &conn, &all_games, &games, &game_grid, &center_stack, &detail_content, &selected_game, &search_entry, &current_console);
+                        } else {
+                            Self::request_scrape_selected(&status_label, &scrape_running, &config, &conn, &games, &all_games, &game_grid, &center_stack, &detail_content, &selected_game, &search_entry);
+                        }
+                        glib::Propagation::Stop
+                    } else {
+                        glib::Propagation::Proceed
+                    }
+                }
+                gdk::Key::_1 | gdk::Key::_2 | gdk::Key::_3 => {
+                    if !search_has_focus {
+                        let art = match key {
+                            gdk::Key::_1 => GridArt::BoxArt,
+                            gdk::Key::_2 => GridArt::TitleScreen,
+                            _ => GridArt::Screenshot,
+                        };
+                        Self::set_current_grid_art(&config, &current_console, &grid_art_combo, &updating_grid_art, art);
+                        Self::update_game_grid(&game_grid, &center_stack, &games.borrow(), &config.borrow());
+                        glib::Propagation::Stop
+                    } else {
+                        glib::Propagation::Proceed
+                    }
+                }
                 gdk::Key::r => {
                     if !search_has_focus {
                         if let Some(console_id) = current_console.borrow().clone() {
@@ -1018,7 +1110,9 @@ impl App {
                     }
                 }
                 gdk::Key::Left | gdk::Key::h => {
-                    if !search_has_focus {
+                    if combo_has_focus {
+                        glib::Propagation::Proceed
+                    } else if !search_has_focus {
                         let selected = game_grid.selected_children().first().cloned();
                         if let Some(selected) = selected {
                             let idx = selected.index();
@@ -1041,7 +1135,9 @@ impl App {
                     }
                 }
                 gdk::Key::Right | gdk::Key::l => {
-                    if !search_has_focus {
+                    if combo_has_focus {
+                        glib::Propagation::Proceed
+                    } else if !search_has_focus {
                         let selected = game_grid.selected_children().first().cloned();
                         if let Some(selected) = selected {
                             let idx = selected.index();
@@ -1062,7 +1158,9 @@ impl App {
                     }
                 }
                 gdk::Key::Up | gdk::Key::k => {
-                    if !search_has_focus {
+                    if combo_has_focus {
+                        glib::Propagation::Proceed
+                    } else if !search_has_focus {
                         let selected = game_grid.selected_children().first().cloned();
                         if let Some(selected) = selected {
                             let idx = selected.index();
@@ -1085,7 +1183,9 @@ impl App {
                     }
                 }
                 gdk::Key::Down | gdk::Key::j => {
-                    if !search_has_focus {
+                    if combo_has_focus {
+                        glib::Propagation::Proceed
+                    } else if !search_has_focus {
                         let selected = game_grid.selected_children().first().cloned();
                         if let Some(selected) = selected {
                             let idx = selected.index();
@@ -1244,6 +1344,281 @@ impl App {
         dialog.set_title(Some("Configure an emulator"));
         dialog.connect_response(|dialog, _| dialog.close());
         dialog.present();
+    }
+
+    fn setup_grid_art(&self) {
+        let config = self.config.clone();
+        let current_console = self.current_console.clone();
+        let game_grid = self.game_grid.clone();
+        let center_stack = self.center_stack.clone();
+        let games = self.games.clone();
+        let updating = self.updating_grid_art.clone();
+        self.grid_art_combo.connect_changed(move |combo| {
+            if *updating.borrow() {
+                return;
+            }
+            let Some(id) = combo.active_id() else { return };
+            let Some(art) = GridArt::parse(id.as_str()) else { return };
+            Self::set_current_grid_art(&config, &current_console, combo, &updating, art);
+            Self::update_game_grid(&game_grid, &center_stack, &games.borrow(), &config.borrow());
+        });
+    }
+
+    fn sync_grid_art_combo(combo: &gtk4::ComboBoxText, updating: &Rc<RefCell<bool>>, art: GridArt) {
+        *updating.borrow_mut() = true;
+        combo.set_active_id(Some(art.as_str()));
+        *updating.borrow_mut() = false;
+    }
+
+    fn set_current_grid_art(
+        config: &Rc<RefCell<crate::config::Config>>,
+        current_console: &Rc<RefCell<Option<String>>>,
+        combo: &gtk4::ComboBoxText,
+        updating: &Rc<RefCell<bool>>,
+        art: GridArt,
+    ) {
+        let Some(console_id) = current_console.borrow().clone() else { return };
+        {
+            let mut cfg = config.borrow_mut();
+            if let Some(console) = cfg.consoles.iter_mut().find(|c| c.id == console_id) {
+                console.grid_art = art;
+            }
+            let _ = crate::config::save_config(&cfg);
+        }
+        if combo.active_id().as_deref() != Some(art.as_str()) {
+            Self::sync_grid_art_combo(combo, updating, art);
+        }
+    }
+
+    fn grid_tile_media<'a>(game: &'a Game, config: &crate::config::Config) -> Option<&'a crate::types::Media> {
+        let preferred = config
+            .consoles
+            .iter()
+            .find(|console| console.id == game.console)
+            .map(|console| console.grid_art)
+            .unwrap_or_default();
+        let have = present_kinds(&game.media);
+        let kind = pick_kind(&have, preferred)?;
+        game.media.iter().find(|media| media.kind == kind && media.path.is_file())
+    }
+
+    fn append_detail_media(detail_content: &gtk4::Box, game: &Game, kind: MediaKind, caption: &str) {
+        let Some(media) = game.media.iter().find(|media| media.kind == kind && media.path.is_file()) else {
+            return;
+        };
+        let Ok(pixbuf) = Pixbuf::from_file_at_scale(&media.path, 250, 120, true) else {
+            return;
+        };
+        let label = gtk4::Label::new(Some(caption));
+        label.set_halign(gtk4::Align::Start);
+        label.add_css_class("title-4");
+        detail_content.append(&label);
+        let picture = gtk4::Picture::for_pixbuf(&pixbuf);
+        picture.set_can_shrink(true);
+        picture.set_height_request(120);
+        detail_content.append(&picture);
+    }
+
+    fn wire_scrape_actions(
+        &self,
+        scraper_button: &gtk4::Button,
+        scrape_button: &gtk4::Button,
+        scrape_missing_button: &gtk4::Button,
+    ) {
+        let window = self.window.clone();
+        let config = self.config.clone();
+        scraper_button.connect_clicked(move |_| {
+            crate::dialogs::open_scraper(&window, config.clone());
+        });
+
+        let status = self.status_label.clone();
+        let running = self.scrape_running.clone();
+        let config = self.config.clone();
+        let conn = self.conn.clone();
+        let games = self.games.clone();
+        let all_games = self.all_games.clone();
+        let grid = self.game_grid.clone();
+        let stack = self.center_stack.clone();
+        let detail = self.detail_content.clone();
+        let selected = self.selected_game.clone();
+        let search = self.search_entry.clone();
+        scrape_button.connect_clicked(move |_| {
+            Self::request_scrape_selected(&status, &running, &config, &conn, &games, &all_games, &grid, &stack, &detail, &selected, &search);
+        });
+
+        let status = self.status_label.clone();
+        let running = self.scrape_running.clone();
+        let config = self.config.clone();
+        let conn = self.conn.clone();
+        let games = self.games.clone();
+        let all_games = self.all_games.clone();
+        let grid = self.game_grid.clone();
+        let stack = self.center_stack.clone();
+        let detail = self.detail_content.clone();
+        let selected = self.selected_game.clone();
+        let search = self.search_entry.clone();
+        let current = self.current_console.clone();
+        scrape_missing_button.connect_clicked(move |_| {
+            Self::request_scrape_missing(&status, &running, &config, &conn, &all_games, &games, &grid, &stack, &detail, &selected, &search, &current);
+        });
+    }
+
+    fn request_scrape_selected(
+        status: &gtk4::Label,
+        running: &Rc<RefCell<bool>>,
+        config: &Rc<RefCell<crate::config::Config>>,
+        conn: &Rc<RefCell<rusqlite::Connection>>,
+        games: &Rc<RefCell<Vec<Game>>>,
+        all_games: &Rc<RefCell<Vec<Game>>>,
+        grid: &gtk4::FlowBox,
+        stack: &gtk4::Stack,
+        detail: &gtk4::Box,
+        selected: &Rc<RefCell<Option<usize>>>,
+        search: &gtk4::SearchEntry,
+    ) {
+        let idx = *selected.borrow();
+        let Some(idx) = idx else {
+            Self::show_status(status, "Select a game to scrape.");
+            return;
+        };
+        let Some(game) = games.borrow().get(idx).cloned() else {
+            Self::show_status(status, "Select a game to scrape.");
+            return;
+        };
+        Self::begin_scrape(status, running, config, conn, vec![game], all_games, games, grid, stack, detail, selected, search);
+    }
+
+    fn request_scrape_missing(
+        status: &gtk4::Label,
+        running: &Rc<RefCell<bool>>,
+        config: &Rc<RefCell<crate::config::Config>>,
+        conn: &Rc<RefCell<rusqlite::Connection>>,
+        all_games: &Rc<RefCell<Vec<Game>>>,
+        games: &Rc<RefCell<Vec<Game>>>,
+        grid: &gtk4::FlowBox,
+        stack: &gtk4::Stack,
+        detail: &gtk4::Box,
+        selected: &Rc<RefCell<Option<usize>>>,
+        search: &gtk4::SearchEntry,
+        current: &Rc<RefCell<Option<String>>>,
+    ) {
+        let Some(console_id) = current.borrow().clone() else {
+            Self::show_status(status, "Select a system before scraping missing artwork.");
+            return;
+        };
+        let targets: Vec<Game> = all_games
+            .borrow()
+            .iter()
+            .filter(|game| game.console == console_id)
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            Self::show_status(status, "This system has no games to scrape.");
+            return;
+        }
+        Self::begin_scrape(status, running, config, conn, targets, all_games, games, grid, stack, detail, selected, search);
+    }
+
+    fn begin_scrape(
+        status: &gtk4::Label,
+        running: &Rc<RefCell<bool>>,
+        config: &Rc<RefCell<crate::config::Config>>,
+        conn: &Rc<RefCell<rusqlite::Connection>>,
+        targets: Vec<Game>,
+        all_games: &Rc<RefCell<Vec<Game>>>,
+        games: &Rc<RefCell<Vec<Game>>>,
+        grid: &gtk4::FlowBox,
+        stack: &gtk4::Stack,
+        detail: &gtk4::Box,
+        selected: &Rc<RefCell<Option<usize>>>,
+        search: &gtk4::SearchEntry,
+    ) {
+        if *running.borrow() {
+            Self::show_status(status, "A scrape is already running.");
+            return;
+        }
+        *running.borrow_mut() = true;
+        Self::show_status(status, "Scraping artwork…");
+        let scraper = config.borrow().scraper.clone();
+        let rx = scraper::spawn_scrape(targets, scraper, scraper::fixture_dir_from_env());
+        let status = status.clone();
+        let running = running.clone();
+        let conn = conn.clone();
+        let config = config.clone();
+        let all_games = all_games.clone();
+        let games = games.clone();
+        let grid = grid.clone();
+        let stack = stack.clone();
+        let detail = detail.clone();
+        let selected = selected.clone();
+        let search = search.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            loop {
+                match rx.try_recv() {
+                    Ok(scraper::ScrapeUpdate::Status(text)) => Self::show_status(&status, &text),
+                    Ok(scraper::ScrapeUpdate::Saved { game_id, media }) => {
+                        if database::set_game_media(&conn.borrow(), &game_id, &media).is_ok() {
+                            Self::reload_visible_games(&conn, &config, &all_games, &games, &grid, &stack, &detail, &selected, &search);
+                        }
+                    }
+                    Ok(scraper::ScrapeUpdate::Done(text)) => {
+                        Self::show_status(&status, &text);
+                        Self::reload_visible_games(&conn, &config, &all_games, &games, &grid, &stack, &detail, &selected, &search);
+                        *running.borrow_mut() = false;
+                        return glib::ControlFlow::Break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        *running.borrow_mut() = false;
+                        return glib::ControlFlow::Break;
+                    }
+                }
+            }
+        });
+    }
+
+    fn reload_visible_games(
+        conn: &Rc<RefCell<rusqlite::Connection>>,
+        config: &Rc<RefCell<crate::config::Config>>,
+        all_games: &Rc<RefCell<Vec<Game>>>,
+        games: &Rc<RefCell<Vec<Game>>>,
+        grid: &gtk4::FlowBox,
+        stack: &gtk4::Stack,
+        detail: &gtk4::Box,
+        selected: &Rc<RefCell<Option<usize>>>,
+        search: &gtk4::SearchEntry,
+    ) {
+        let console_id = all_games.borrow().first().map(|game| game.console.clone());
+        let Some(console_id) = console_id else { return };
+        let Ok(loaded) = database::load_games(&conn.borrow(), Some(&console_id)) else { return };
+        let selected_id = selected.borrow().and_then(|idx| games.borrow().get(idx).map(|game| game.id.clone()));
+        *all_games.borrow_mut() = loaded;
+        let text = search.text().to_string().to_lowercase();
+        let filtered: Vec<Game> = if text.is_empty() {
+            all_games.borrow().clone()
+        } else {
+            all_games
+                .borrow()
+                .iter()
+                .filter(|game| game.title.to_lowercase().contains(&text))
+                .cloned()
+                .collect()
+        };
+        *games.borrow_mut() = filtered;
+        Self::update_game_grid(grid, stack, &games.borrow(), &config.borrow());
+        if let Some(id) = selected_id {
+            if let Some(idx) = games.borrow().iter().position(|game| game.id == id) {
+                *selected.borrow_mut() = Some(idx);
+                if let Some(game) = games.borrow().get(idx) {
+                    Self::update_game_details(detail, game, &config.borrow(), conn);
+                }
+            }
+        }
+    }
+
+    fn show_status(status: &gtk4::Label, text: &str) {
+        status.set_text(text);
+        status.set_visible(!text.is_empty());
     }
 
     pub fn show(&self) {

@@ -16,6 +16,7 @@ xdg = "2.5"
 anyhow = "1.0"
 regex = "1.10"
 shell-words = "1.1"
+ureq = "2.12"
 
 [dev-dependencies]
 tempfile = "3.12"

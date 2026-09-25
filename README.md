@@ -7,6 +7,7 @@ A LaunchBox-style retro game launcher for Omarchy Linux (Arch + Hyprland), built
 - Console-based game library organization
 - ROM scanning with CRC32 checksums
 - Local media support (box art, screenshots, manuals, videos)
+- Artwork scraper for box art, title screens, and screenshots (ScreenScraper and TheGamesDB)
 - RetroArch and standalone emulator support
 - Keyboard-first navigation optimized for tiling window managers
 - System theme integration via libadwaita
@@ -68,6 +69,7 @@ name = "Super Nintendo"
 rom_dirs = ["/home/user/roms/snes"]
 extensions = ["sfc", "smc", "zip"]
 profile = "retroarch-snes9x"
+grid_art = "box_art"
 
 [consoles.media]
 box_art = true
@@ -75,6 +77,32 @@ screenshot = true
 manual = false
 video = false
 ```
+
+### Artwork scraper
+
+Global settings live in `config.toml` under `[scraper]`. The app edits the same file from **Scraper** (Ctrl+G). Nothing here downloads ROMs or BIOS.
+
+```toml
+[scraper]
+box_art = true
+title_screen = true
+screenshot = true
+
+[[scraper.providers]]
+id = "screenscraper"   # or "thegamesdb"
+enabled = true
+
+[scraper.credentials]
+screenscraper_user = ""
+screenscraper_password = ""
+screenscraper_dev_id = ""
+screenscraper_dev_password = ""
+thegamesdb_api_key = ""
+```
+
+Provider order is priority: the first enabled provider that returns a kind wins, then that kind stops. Kinds that already have a file are skipped. ScreenScraper’s HTTP API requires a developer id and password in addition to the member username and password.
+
+Scraped images are stored at `~/.local/share/retromarchy/media/<console>/<game-id>/<kind>.<ext>` and recorded in the `media` table of `~/.local/share/retromarchy/library.db`.
 
 ### Media Discovery Convention
 
@@ -90,11 +118,15 @@ Retromarchy looks for media files matching the ROM filename:
 - **Arrow keys / hjkl**: Navigate game grid
 - **Enter**: Launch selected game
 - **r**: Rescan current console for ROMs
+- **s**: Scrape artwork for the selected game
+- **Shift+S**: Scrape missing artwork for the current system
+- **Ctrl+G**: Scraper settings
+- **1 / 2 / 3**: Grid artwork for this system (box art, title screen, screenshot)
 - **Tab**: Switch between sidebar and grid (GTK default)
 
 ## Database
 
-Games and media metadata are stored in `~/.local/share/retromarchy/library.db` (SQLite).
+Games and media metadata are stored in `~/.local/share/retromarchy/library.db` (SQLite). Scraped artwork files are stored in `~/.local/share/retromarchy/media/`.
 
 ## License
 
