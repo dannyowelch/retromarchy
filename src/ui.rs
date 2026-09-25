@@ -18,7 +18,7 @@ use std::time::Instant;
 
 const GRID_COLUMNS: i32 = 6;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusPane {
     Systems,
     Games,
@@ -1806,6 +1806,13 @@ impl App {
         count
     }
 
+    /// `FocusPane` is `Copy`. The `Ref` ends before `body` runs, so `body`
+    /// may `borrow_mut` this cell. `row-selected` does that from `move_systems`.
+    fn with_focus_pane(focus: &RefCell<FocusPane>, body: impl FnOnce(FocusPane)) {
+        let pane = *focus.borrow();
+        body(pane);
+    }
+
     fn move_systems(list: &gtk4::ListBox, dir: NavDir) {
         let current = list.selected_row().map(|row| row.index());
         let Some(next) = gamepad::list_step(current, dir, Self::list_len(list)) else {
@@ -2038,8 +2045,11 @@ impl App {
                         Self::update_game_details(&detail_content, game, &config.borrow(), &conn);
                     }
                 };
-                match action {
-                    PadAction::Move(dir) => match *focus_pane.borrow() {
+                // Copy the pane out before any GTK call. `move_systems` selects a
+                // row, which emits `row-selected` on this same stack and writes
+                // `focus_pane` again. A live `borrow()` here aborts the process.
+                Self::with_focus_pane(&focus_pane, |pane| match action {
+                    PadAction::Move(dir) => match pane {
                         FocusPane::Systems => Self::move_systems(&console_list, dir),
                         FocusPane::Games => Self::move_grid(
                             &game_grid,
@@ -2050,7 +2060,7 @@ impl App {
                             &update_details,
                         ),
                     },
-                    PadAction::Confirm => match *focus_pane.borrow() {
+                    PadAction::Confirm => match pane {
                         FocusPane::Systems => Self::enter_games(
                             &game_grid,
                             &games,
@@ -2070,7 +2080,7 @@ impl App {
                         ),
                     },
                     PadAction::Back => {
-                        if *focus_pane.borrow() == FocusPane::Games {
+                        if pane == FocusPane::Games {
                             *focus_pane.borrow_mut() = FocusPane::Systems;
                             if let Some(row) = console_list.selected_row() {
                                 row.grab_focus();
@@ -2080,7 +2090,7 @@ impl App {
                         }
                     }
                     PadAction::Favorite => {
-                        if *focus_pane.borrow() == FocusPane::Games {
+                        if pane == FocusPane::Games {
                             Self::toggle_favorite(
                                 &conn,
                                 &games,
@@ -2096,7 +2106,7 @@ impl App {
                             );
                         }
                     }
-                }
+                });
             }
             glib::ControlFlow::Continue
         });
@@ -2104,5 +2114,43 @@ impl App {
 
     pub fn show(&self) {
         self.window.present();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gamepad::NavDir;
+
+    #[test]
+    fn systems_move_can_rewrite_focus_while_the_tick_runs() {
+        let focus = RefCell::new(FocusPane::Systems);
+        App::with_focus_pane(&focus, |pane| {
+            assert_eq!(pane, FocusPane::Systems);
+            // `row-selected` does this synchronously from `ListBox::select_row`.
+            *focus.borrow_mut() = FocusPane::Systems;
+        });
+        assert_eq!(*focus.borrow(), FocusPane::Systems);
+    }
+
+    #[test]
+    fn stick_move_selects_the_next_system_without_reborrowing() {
+        gtk4::init().expect("gtk init");
+        let list = gtk4::ListBox::new();
+        list.append(&gtk4::Label::new(Some("nes")));
+        list.append(&gtk4::Label::new(Some("snes")));
+        let focus = Rc::new(RefCell::new(FocusPane::Systems));
+        let focus_in_handler = focus.clone();
+        list.connect_row_selected(move |_, _| {
+            *focus_in_handler.borrow_mut() = FocusPane::Systems;
+        });
+        list.select_row(list.row_at_index(0).as_ref());
+
+        App::with_focus_pane(&focus, |pane| {
+            assert_eq!(pane, FocusPane::Systems);
+            App::move_systems(&list, NavDir::Down);
+        });
+
+        assert_eq!(list.selected_row().map(|row| row.index()), Some(1));
     }
 }
