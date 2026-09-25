@@ -54,7 +54,7 @@ You do not need to copy `config.example.toml` first. Start the app; a missing co
 3. Select a console in the sidebar, then a game. **Play** or Enter launches it.
 4. Artwork is optional and manual. **Scraper** (Ctrl+G) stores credentials. **Scrape** (`s`) fetches missing artwork for the selected game. **Scrape Missing** (Shift+S) does the same for every game on the current system. Kinds that already have a file are skipped.
 
-The header combo (tooltip **Grid artwork for this system**) chooses what the grid prefers for the current console: **Box art** or **Screenshot** (`1` / `2`). If that file is missing, the grid falls back to the other one. An older `grid_art = "title_screen"` value is read as box art. `/` opens the filter (**Filter games...**). Escape closes the filter, or clears the game selection and returns the details pane to console info.
+The header combo (tooltip **Grid artwork for this system**) chooses what the grid prefers for the current console: **Box art** or **Screenshot** (`1` / `2`). If that file is missing, the grid falls back to the other one. An older `grid_art = "title_screen"` value is read as box art. The combo beside it (tooltip **Show all games or favorites**) is **All** or **Favorites** and filters the current console. A favorited game shows a heart on its tile. `/` opens the filter (**Filter games...**). Escape closes the filter, or clears the game selection and returns the details pane to console info.
 
 ## Configuration
 
@@ -153,6 +153,7 @@ Ignored while the filter entry is focused, except Escape, `/`, and Tab.
 
 - **Arrow keys / h j k l**: Move in the grid (up and down jump six tiles)
 - **Enter**: Launch the selected game
+- **f**: Toggle the selected game as a favorite
 - **r**: Rescan the current console
 - **s**: Scrape artwork for the selected game
 - **Shift+S**: Scrape missing artwork for the current system
@@ -166,10 +167,21 @@ Ignored while the filter entry is focused, except Escape, `/`, and Tab.
 - **t**: Toggle system theme and the LaunchBox dark theme
 - **Tab**: Focus the grid and select the first game if none is selected
 
+## Controller
+
+A gamepad is optional. Buttons follow the SDL / Xbox layout (South is the bottom face button: Xbox A, PlayStation Cross, Nintendo B):
+
+- **Left stick or d-pad**: Move. On the systems list, up and down change console. On the game grid, the stick and d-pad match the arrow keys (one tile left or right, six tiles up or down). The stick fires one step per push and must return near center before the next step. The d-pad is one step per press.
+- **A (South)**: From the systems list, move into that console’s games. On a game, launch it (same as Enter).
+- **B (East)**: From the game grid, return to the systems list.
+- **Y (North)**: Toggle the focused game as a favorite. Does nothing when focus is on the systems list.
+
+Start, Select, and X are ignored. The header buttons are not mapped.
+
 ## Data locations
 
 - Config: `~/.config/retromarchy/config.toml`
-- Library: `~/.local/share/retromarchy/library.db` (SQLite)
+- Library: `~/.local/share/retromarchy/library.db` (SQLite). Each game has a `favorite` flag (0 or 1). Existing libraries gain that column on startup.
 - Scraped artwork: `~/.local/share/retromarchy/media/`
 
 ## License
