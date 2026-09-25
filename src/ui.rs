@@ -90,10 +90,9 @@ impl App {
 
         let grid_art_combo = gtk4::ComboBoxText::new();
         grid_art_combo.append(Some(GridArt::BoxArt.as_str()), GridArt::BoxArt.label());
-        grid_art_combo.append(Some(GridArt::TitleScreen.as_str()), GridArt::TitleScreen.label());
         grid_art_combo.append(Some(GridArt::Screenshot.as_str()), GridArt::Screenshot.label());
         grid_art_combo.set_active_id(Some(GridArt::BoxArt.as_str()));
-        grid_art_combo.set_tooltip_text(Some("Grid artwork for this system (1 box, 2 title, 3 screenshot)"));
+        grid_art_combo.set_tooltip_text(Some("Grid artwork for this system (1 box, 2 screenshot)"));
 
         let details_toggle = gtk4::ToggleButton::builder()
             .icon_name("sidebar-show-right-symbolic")
@@ -760,7 +759,6 @@ impl App {
             }
         }
 
-        Self::append_detail_media(detail_content, game, MediaKind::TitleScreen, "Title screen");
         Self::append_detail_media(detail_content, game, MediaKind::Screenshot, "Screenshot");
 
         let title_label = gtk4::Label::new(Some(&game.title));
@@ -1054,11 +1052,10 @@ impl App {
                         glib::Propagation::Proceed
                     }
                 }
-                gdk::Key::_1 | gdk::Key::_2 | gdk::Key::_3 => {
+                gdk::Key::_1 | gdk::Key::_2 => {
                     if !search_has_focus {
                         let art = match key {
                             gdk::Key::_1 => GridArt::BoxArt,
-                            gdk::Key::_2 => GridArt::TitleScreen,
                             _ => GridArt::Screenshot,
                         };
                         Self::set_current_grid_art(&config, &current_console, &grid_art_combo, &updating_grid_art, art);

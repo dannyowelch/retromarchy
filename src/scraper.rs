@@ -7,11 +7,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub const SCRAPE_KINDS: [MediaKind; 3] = [
-    MediaKind::BoxArt,
-    MediaKind::TitleScreen,
-    MediaKind::Screenshot,
-];
+pub const SCRAPE_KINDS: [MediaKind; 2] = [MediaKind::BoxArt, MediaKind::Screenshot];
 
 /// Kinds whose file is already on disk. Missing paths do not count.
 pub fn present_kinds(media: &[Media]) -> Vec<MediaKind> {
@@ -274,9 +270,8 @@ pub fn pick_screenscraper_url(medias: &[(String, String, String)], kind: MediaKi
 fn screenscraper_media_type(kind: MediaKind) -> Option<&'static str> {
     match kind {
         MediaKind::BoxArt => Some("box-2D"),
-        MediaKind::TitleScreen => Some("sstitle"),
         MediaKind::Screenshot => Some("ss"),
-        MediaKind::Manual | MediaKind::Video => None,
+        MediaKind::TitleScreen | MediaKind::Manual | MediaKind::Video => None,
     }
 }
 
@@ -364,9 +359,8 @@ pub fn join_base_url(base: &str, filename: &str) -> String {
 fn thegamesdb_media_type(kind: MediaKind) -> Option<&'static str> {
     match kind {
         MediaKind::BoxArt => Some("boxart"),
-        MediaKind::TitleScreen => Some("titlescreen"),
         MediaKind::Screenshot => Some("screenshot"),
-        MediaKind::Manual | MediaKind::Video => None,
+        MediaKind::TitleScreen | MediaKind::Manual | MediaKind::Video => None,
     }
 }
 
@@ -686,7 +680,7 @@ fn load_thegamesdb_images(
         ("games_id".to_string(), game_id.to_string()),
         (
             "filter[type]".to_string(),
-            "boxart,screenshot,titlescreen".to_string(),
+            "boxart,screenshot".to_string(),
         ),
     ];
     let url = format!(
@@ -820,7 +814,7 @@ fn run_scrape(
 ) -> String {
     let enabled = scraper.enabled_kinds();
     if enabled.is_empty() {
-        return "Enable box art, title screen, or screenshot in Scraper settings.".into();
+        return "Enable box art or screenshot in Scraper settings.".into();
     }
     if games.is_empty() {
         return "No games to scrape.".into();
@@ -957,10 +951,7 @@ mod tests {
         let have = present_kinds(&media);
         assert_eq!(have, vec![MediaKind::BoxArt]);
         let fetch = kinds_to_fetch(&have, &ScraperConfig::default().enabled_kinds());
-        assert_eq!(
-            fetch,
-            vec![MediaKind::TitleScreen, MediaKind::Screenshot]
-        );
+        assert_eq!(fetch, vec![MediaKind::Screenshot]);
     }
 
     #[test]
@@ -985,7 +976,7 @@ mod tests {
             provider(ScrapeProvider::TheGamesDb, true),
         ];
         let fetch = kinds_to_fetch(&[], &config.enabled_kinds());
-        assert_eq!(fetch, vec![MediaKind::TitleScreen, MediaKind::Screenshot]);
+        assert_eq!(fetch, vec![MediaKind::Screenshot]);
         assert_eq!(
             provider_order(&config.providers),
             vec![ScrapeProvider::TheGamesDb]
@@ -1093,10 +1084,6 @@ mod tests {
             pick_kind(&have, GridArt::BoxArt),
             Some(MediaKind::Screenshot)
         );
-        assert_eq!(
-            pick_kind(&have, GridArt::TitleScreen),
-            Some(MediaKind::Screenshot)
-        );
         assert_eq!(pick_kind(&[], GridArt::BoxArt), None);
     }
 
@@ -1162,10 +1149,7 @@ mod tests {
             pick_screenscraper_url(&medias, MediaKind::BoxArt).as_deref(),
             Some("https://example.test/us.png")
         );
-        assert_eq!(
-            pick_screenscraper_url(&medias, MediaKind::TitleScreen).as_deref(),
-            Some("https://example.test/title.png")
-        );
+        assert!(pick_screenscraper_url(&medias, MediaKind::TitleScreen).is_none());
         assert_eq!(
             pick_screenscraper_url(&medias, MediaKind::Screenshot).as_deref(),
             Some("https://example.test/shot.png")
@@ -1216,10 +1200,10 @@ mod tests {
     fn cached_image_is_one_file_per_kind() {
         let dir = tempfile::tempdir().unwrap();
         let png = tiny_png();
-        let path = write_cached_image(dir.path(), "snes", "abc", MediaKind::TitleScreen, &png).unwrap();
-        assert!(path.ends_with("snes/abc/title_screen.png"));
+        let path = write_cached_image(dir.path(), "snes", "abc", MediaKind::Screenshot, &png).unwrap();
+        assert!(path.ends_with("snes/abc/screenshot.png"));
         assert_eq!(fs::read(&path).unwrap(), png);
-        assert!(write_cached_image(dir.path(), "snes", "abc", MediaKind::TitleScreen, b"not-an-image").is_err());
+        assert!(write_cached_image(dir.path(), "snes", "abc", MediaKind::Screenshot, b"not-an-image").is_err());
     }
 
     fn tiny_png() -> Vec<u8> {
