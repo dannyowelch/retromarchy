@@ -100,7 +100,36 @@ pub fn event_action(event: &EventType, latch: &mut StickLatch) -> Option<PadActi
     }
 }
 
+/// One FlowBox child's allocation, in sibling order.
+/// `height <= 0` means the box has not been allocated yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlowTile {
+    pub y: i32,
+    pub height: i32,
+}
+
+/// How many tiles the FlowBox placed on the first line.
+/// Children on one line share `y`. A zero-height tile ends the scan so the
+/// caller can fall back to `max_children_per_line` before the first layout.
+pub fn line_columns(tiles: &[FlowTile], fallback: i32) -> i32 {
+    let Some(first) = tiles.first() else {
+        return fallback.max(1);
+    };
+    if first.height <= 0 {
+        return fallback.max(1);
+    }
+    let mut columns = 1i32;
+    for tile in tiles.iter().skip(1) {
+        if tile.height <= 0 || tile.y != first.y {
+            break;
+        }
+        columns += 1;
+    }
+    columns.max(1)
+}
+
 /// Same jumps as the arrow keys: one tile left or right, one row of `columns` up or down.
+/// `columns` is the live line length, not a fixed grid width.
 /// With nothing selected, any direction selects the first tile.
 pub fn grid_step(index: Option<i32>, dir: NavDir, len: i32, columns: i32) -> Option<i32> {
     if len <= 0 {
@@ -187,9 +216,26 @@ mod tests {
         assert_eq!(grid_step(Some(7), NavDir::Up, 10, 6), Some(1));
         assert_eq!(grid_step(Some(2), NavDir::Down, 10, 6), Some(8));
         assert_eq!(grid_step(Some(8), NavDir::Down, 10, 6), None);
+        assert_eq!(grid_step(Some(0), NavDir::Down, 24, 4), Some(4));
+        assert_eq!(grid_step(Some(5), NavDir::Up, 24, 4), Some(1));
+        assert_eq!(grid_step(Some(0), NavDir::Down, 24, 6), Some(6));
+        assert_eq!(grid_step(Some(7), NavDir::Up, 24, 6), Some(1));
+        assert_eq!(grid_step(Some(4), NavDir::Left, 24, 4), Some(3));
+        assert_eq!(grid_step(Some(4), NavDir::Right, 24, 4), Some(5));
         assert_eq!(list_step(Some(1), NavDir::Down, 3), Some(2));
         assert_eq!(list_step(Some(0), NavDir::Up, 3), None);
         assert_eq!(list_step(Some(1), NavDir::Left, 3), None);
         assert_eq!(list_step(None, NavDir::Down, 3), Some(0));
+    }
+
+    #[test]
+    fn line_columns_matches_the_laid_out_row() {
+        let tile = |y| FlowTile { y, height: 80 };
+        let four = [tile(12), tile(12), tile(12), tile(12), tile(104)];
+        assert_eq!(line_columns(&four, 6), 4);
+        let six = [tile(12), tile(12), tile(12), tile(12), tile(12), tile(12), tile(104)];
+        assert_eq!(line_columns(&six, 6), 6);
+        assert_eq!(line_columns(&[], 6), 6);
+        assert_eq!(line_columns(&[FlowTile { y: 0, height: 0 }], 6), 6);
     }
 }

@@ -16,8 +16,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
 
-const GRID_COLUMNS: i32 = 6;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusPane {
     Systems,
@@ -1787,7 +1785,7 @@ impl App {
         *focus_pane.borrow_mut() = FocusPane::Games;
         let len = games.borrow().len() as i32;
         let current = grid.selected_children().first().map(|child| child.index());
-        let Some(next) = gamepad::grid_step(current, dir, len, GRID_COLUMNS) else {
+        let Some(next) = gamepad::grid_step(current, dir, len, Self::flow_columns(grid)) else {
             return;
         };
         if let Some(child) = grid.child_at_index(next) {
@@ -1796,6 +1794,30 @@ impl App {
             *selected.borrow_mut() = Some(next as usize);
             update_details(next as usize);
         }
+    }
+
+    /// Live column count from the FlowBox layout. GTK keeps `cur_children_per_line`
+    /// private, so this reads the first line it already placed: those children
+    /// share an allocation y. Hiding the details pane or resizing the window
+    /// changes that y-run, and the next up/down uses the new length.
+    fn flow_columns(grid: &gtk4::FlowBox) -> i32 {
+        let fallback = i32::try_from(grid.max_children_per_line()).unwrap_or(1).max(1);
+        let mut tiles = Vec::new();
+        let mut index = 0;
+        while let Some(child) = grid.child_at_index(index) {
+            let rect = child.allocation();
+            tiles.push(gamepad::FlowTile {
+                y: rect.y(),
+                height: rect.height(),
+            });
+            index += 1;
+            if tiles.len() > 1
+                && tiles.last().is_some_and(|tile| tile.y != tiles[0].y || tile.height <= 0)
+            {
+                break;
+            }
+        }
+        gamepad::line_columns(&tiles, fallback)
     }
 
     fn list_len(list: &gtk4::ListBox) -> i32 {
@@ -2152,5 +2174,27 @@ mod tests {
         });
 
         assert_eq!(list.selected_row().map(|row| row.index()), Some(1));
+
+        // GTK init is process-wide and thread-affine. A second test that calls
+        // `gtk4::init` aborts, so the column check shares this init.
+        flow_columns_follows_the_allocated_line();
+    }
+
+    fn flow_columns_follows_the_allocated_line() {
+        let grid = gtk4::FlowBox::new();
+        grid.set_max_children_per_line(6);
+        grid.set_homogeneous(true);
+        grid.set_column_spacing(12);
+        grid.set_row_spacing(12);
+        for _ in 0..12 {
+            let tile = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            tile.set_size_request(100, 80);
+            grid.insert(&tile, -1);
+        }
+        // Same max of 6 as the games grid. A narrower allocation wraps at 4.
+        grid.allocate(480, 400, -1, None);
+        assert_eq!(App::flow_columns(&grid), 4);
+        grid.allocate(720, 400, -1, None);
+        assert_eq!(App::flow_columns(&grid), 6);
     }
 }
