@@ -734,27 +734,13 @@ impl App {
             frame.set_size_request(150, 150);
             Self::set_tile_art(&frame, game, config);
 
-            let heart = gtk4::Label::new(Some("♥"));
-            heart.set_widget_name("favorite-badge");
-            heart.add_css_class("favorite-badge");
-            heart.set_halign(gtk4::Align::End);
-            heart.set_valign(gtk4::Align::End);
-            heart.set_margin_bottom(6);
-            heart.set_margin_end(6);
-            heart.set_can_target(false);
-            heart.set_visible(game.favorite);
-
-            let art = gtk4::Overlay::new();
-            art.set_child(Some(&frame));
-            art.add_overlay(&heart);
-
             let title = gtk4::Label::new(Some(&game.title));
             title.set_wrap(true);
             title.set_max_width_chars(20);
             title.set_lines(2);
             title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
-            game_box.append(&art);
+            game_box.append(&frame);
             game_box.append(&title);
             if let Some(console) = config.consoles.iter().find(|c| c.id == game.console) {
                 let console_label = gtk4::Label::new(Some(&console.name));
@@ -766,7 +752,22 @@ impl App {
                 game_box.append(&console_label);
             }
 
-            grid.insert(&game_box, -1);
+            // Overlay the whole rom-tile so the heart sits in the title band, not on the art.
+            let heart = gtk4::Label::new(Some("♥"));
+            heart.set_widget_name("favorite-badge");
+            heart.add_css_class("favorite-badge");
+            heart.set_halign(gtk4::Align::End);
+            heart.set_valign(gtk4::Align::End);
+            heart.set_margin_bottom(6);
+            heart.set_margin_end(6);
+            heart.set_can_target(false);
+            heart.set_visible(game.favorite);
+
+            let card = gtk4::Overlay::new();
+            card.set_child(Some(&game_box));
+            card.add_overlay(&heart);
+
+            grid.insert(&card, -1);
         }
 
         if games.is_empty() && library_empty {
@@ -2164,7 +2165,7 @@ impl App {
         let Some(flow_child) = grid.child_at_index(index as i32) else {
             return;
         };
-        let Some(tile) = flow_child.child().and_downcast::<gtk4::Box>() else {
+        let Some(tile) = Self::tile_box(&flow_child) else {
             return;
         };
         let Some(frame) = Self::tile_art_frame(&tile) else {
@@ -2173,13 +2174,18 @@ impl App {
         Self::set_tile_art(&frame, game, config);
     }
 
+    fn tile_box(flow_child: &gtk4::FlowBoxChild) -> Option<gtk4::Box> {
+        flow_child
+            .child()?
+            .downcast::<gtk4::Overlay>()
+            .ok()?
+            .child()?
+            .downcast::<gtk4::Box>()
+            .ok()
+    }
+
     fn tile_art_frame(tile: &gtk4::Box) -> Option<gtk4::Frame> {
-        let first = tile.first_child()?;
-        if let Ok(frame) = first.clone().downcast::<gtk4::Frame>() {
-            return Some(frame);
-        }
-        let overlay = first.downcast::<gtk4::Overlay>().ok()?;
-        overlay.child()?.downcast::<gtk4::Frame>().ok()
+        tile.first_child()?.downcast::<gtk4::Frame>().ok()
     }
 
     fn show_status(status: &gtk4::Label, text: &str) {
@@ -2328,10 +2334,7 @@ impl App {
         let Some(flow_child) = grid.child_at_index(index as i32) else {
             return;
         };
-        let Some(tile) = flow_child.child().and_downcast::<gtk4::Box>() else {
-            return;
-        };
-        let Some(overlay) = tile.first_child().and_downcast::<gtk4::Overlay>() else {
+        let Some(overlay) = flow_child.child().and_downcast::<gtk4::Overlay>() else {
             return;
         };
         let mut widget = overlay.first_child();
@@ -2705,8 +2708,9 @@ mod tests {
         assert_eq!(list.selected_row().map(|row| row.index()), Some(1));
 
         // GTK init is process-wide and thread-affine. A second test that calls
-        // `gtk4::init` aborts, so the column check shares this init.
+        // `gtk4::init` aborts, so the other GTK checks share this init.
         flow_columns_follows_the_allocated_line();
+        favorite_badge_toggles_on_the_card_overlay();
     }
 
     fn flow_columns_follows_the_allocated_line() {
@@ -2725,5 +2729,115 @@ mod tests {
         assert_eq!(App::flow_columns(&grid), 4);
         grid.allocate(720, 400, -1, None);
         assert_eq!(App::flow_columns(&grid), 6);
+    }
+
+    fn favorite_badge_toggles_on_the_card_overlay() {
+        use crate::config::Config;
+        use crate::types::{Console, GridArt, MediaToggles};
+
+        let config = Config {
+            consoles: vec![Console {
+                id: "snes".into(),
+                name: "Super Nintendo".into(),
+                rom_dirs: Vec::new(),
+                extensions: Vec::new(),
+                profile: None,
+                grid_art: GridArt::BoxArt,
+                media: MediaToggles::default(),
+            }],
+            ..Config::default()
+        };
+        let games = vec![
+            sample_game("Chrono Trigger", false),
+            sample_game("Super Metroid", true),
+        ];
+        let grid = gtk4::FlowBox::new();
+        let stack = gtk4::Stack::new();
+        stack.add_named(
+            &gtk4::Box::new(gtk4::Orientation::Vertical, 0),
+            Some("grid"),
+        );
+        stack.add_named(
+            &gtk4::Box::new(gtk4::Orientation::Vertical, 0),
+            Some("empty"),
+        );
+        App::update_game_grid(&grid, &stack, &games, &config, false);
+
+        assert!(!favorite_badge(&grid, 0).is_visible());
+        assert!(favorite_badge(&grid, 1).is_visible());
+
+        let flow_child = grid.child_at_index(1).unwrap();
+        let tile = App::tile_box(&flow_child).unwrap();
+        let frame = App::tile_art_frame(&tile).unwrap();
+        let badge = favorite_badge(&grid, 1);
+        let overlay = badge.parent().unwrap().downcast::<gtk4::Overlay>().unwrap();
+        assert!(overlay.child().unwrap().downcast::<gtk4::Box>().is_ok());
+        assert!(frame.parent().unwrap().downcast::<gtk4::Box>().is_ok());
+
+        App::set_tile_favorite(&grid, 1, false);
+        assert!(!favorite_badge(&grid, 1).is_visible());
+        App::set_tile_favorite(&grid, 1, true);
+        assert!(favorite_badge(&grid, 1).is_visible());
+
+        App::refresh_grid_tile(&grid, 1, &games[1], &config);
+        let frame = App::tile_art_frame(&App::tile_box(&flow_child).unwrap()).unwrap();
+        assert_eq!(
+            frame.child().and_downcast::<gtk4::Label>().unwrap().text(),
+            "No Art"
+        );
+
+        let window = gtk4::Window::new();
+        window.set_default_size(480, 400);
+        window.set_child(Some(&grid));
+        window.present();
+        for _ in 0..8 {
+            while glib::MainContext::default().iteration(false) {}
+        }
+        let frame_bounds = frame.compute_bounds(&overlay).expect("art bounds");
+        let badge_bounds = favorite_badge(&grid, 1)
+            .compute_bounds(&overlay)
+            .expect("heart bounds");
+        let art_bottom = frame_bounds.y() + frame_bounds.height();
+        assert!(
+            badge_bounds.y() >= art_bottom - 1.0,
+            "heart top {} is on the art, which ends at {}",
+            badge_bounds.y(),
+            art_bottom
+        );
+        assert!(badge_bounds.x() > frame_bounds.x() + frame_bounds.width() / 2.0);
+        window.close();
+    }
+
+    fn sample_game(title: &str, favorite: bool) -> Game {
+        Game {
+            id: title.to_string(),
+            console: "snes".into(),
+            rom: std::path::PathBuf::from(title),
+            title: title.to_string(),
+            crc32: None,
+            profile: None,
+            media: Vec::new(),
+            last_played: None,
+            play_count: 0,
+            play_time: 0,
+            favorite,
+        }
+    }
+
+    fn favorite_badge(grid: &gtk4::FlowBox, index: i32) -> gtk4::Widget {
+        let overlay = grid
+            .child_at_index(index)
+            .expect("tile")
+            .child()
+            .and_downcast::<gtk4::Overlay>()
+            .expect("card overlay");
+        let mut widget = overlay.first_child();
+        while let Some(current) = widget {
+            if current.widget_name() == "favorite-badge" {
+                return current;
+            }
+            widget = current.next_sibling();
+        }
+        panic!("favorite-badge missing");
     }
 }
