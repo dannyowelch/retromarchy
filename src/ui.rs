@@ -70,11 +70,24 @@ impl App {
              .empty-state { background: transparent; }
              .scrape-status { padding: 6px 12px; background: alpha(@accent_bg_color, 0.35); }
              .favorite-badge {
-                color: #ffffff;
-                background-color: #c0392b;
-                border-radius: 999px;
-                padding: 1px 6px;
+                color: #e01b24;
+                background-color: transparent;
+                border-radius: 0;
+                padding: 0;
+                font-family: \"DejaVu Sans\", sans-serif;
+                font-size: 18px;
                 font-weight: 700;
+             }
+             .favorite-toggle {
+                min-width: 0;
+                min-height: 0;
+                padding: 4px 10px;
+                font-family: \"DejaVu Sans\", sans-serif;
+                font-size: 18px;
+             }
+             .favorite-toggle.is-favorite,
+             .favorite-toggle.is-favorite label {
+                color: #e01b24;
              }",
         );
         gtk4::style_context_add_provider_for_display(
@@ -321,6 +334,7 @@ impl App {
         app_instance.setup_grid_art();
         app_instance.setup_grid_filter();
         app_instance.setup_direction_repeat(key_x, key_y, repeat_x, repeat_y, nav_started);
+        app_instance.setup_favorite_action();
         {
             let window = window.clone();
             let config = config_rc.clone();
@@ -421,11 +435,24 @@ impl App {
                     background-color: #3a3a3a;
                 }
                 .favorite-badge {
-                    color: #ffffff;
-                    background-color: #c0392b;
-                    border-radius: 999px;
-                    padding: 1px 6px;
+                    color: #e01b24;
+                    background-color: transparent;
+                    border-radius: 0;
+                    padding: 0;
+                    font-family: \"DejaVu Sans\", sans-serif;
+                    font-size: 18px;
                     font-weight: 700;
+                }
+                .favorite-toggle {
+                    min-width: 0;
+                    min-height: 0;
+                    padding: 4px 10px;
+                    font-family: \"DejaVu Sans\", sans-serif;
+                    font-size: 18px;
+                }
+                .favorite-toggle.is-favorite,
+                .favorite-toggle.is-favorite label {
+                    color: #e01b24;
                 }",
             );
             gtk4::style_context_add_provider_for_display(
@@ -523,11 +550,24 @@ impl App {
                         background-color: #3a3a3a;
                     }
                     .favorite-badge {
-                        color: #ffffff;
-                        background-color: #c0392b;
-                        border-radius: 999px;
-                        padding: 1px 6px;
+                        color: #e01b24;
+                        background-color: transparent;
+                        border-radius: 0;
+                        padding: 0;
+                        font-family: \"DejaVu Sans\", sans-serif;
+                        font-size: 18px;
                         font-weight: 700;
+                    }
+                    .favorite-toggle {
+                        min-width: 0;
+                        min-height: 0;
+                        padding: 4px 10px;
+                        font-family: \"DejaVu Sans\", sans-serif;
+                        font-size: 18px;
+                    }
+                    .favorite-toggle.is-favorite,
+                    .favorite-toggle.is-favorite label {
+                        color: #e01b24;
                     }",
                 );
                 gtk4::style_context_add_provider_for_display(
@@ -936,53 +976,9 @@ impl App {
             detail_content.remove(&child);
         }
 
-        if let Some(media) = game
-            .media
-            .iter()
-            .find(|m| m.kind == MediaKind::BoxArt && m.path.is_file())
-        {
-            if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&media.path, 250, 180, true) {
-                let picture = gtk4::Picture::for_pixbuf(&pixbuf);
-                picture.set_can_shrink(true);
-                picture.set_height_request(180);
-                detail_content.append(&picture);
-            }
-        }
-
-        Self::append_detail_media(detail_content, game, MediaKind::Screenshot, "Screenshot");
-
-        let title_label = gtk4::Label::new(Some(&game.title));
-        title_label.set_wrap(true);
-        title_label.set_halign(gtk4::Align::Start);
-        title_label.add_css_class("title-2");
-        detail_content.append(&title_label);
-
-        if let Some(console) = config.consoles.iter().find(|c| c.id == game.console) {
-            let console_label = gtk4::Label::new(Some(&format!("Console: {}", console.name)));
-            console_label.set_halign(gtk4::Align::Start);
-            console_label.add_css_class("caption");
-            detail_content.append(&console_label);
-        }
-
-        let rom_label = gtk4::Label::new(Some(&format!("ROM: {}", game.rom.display())));
-        rom_label.set_wrap(true);
-        rom_label.set_halign(gtk4::Align::Start);
-        rom_label.add_css_class("caption");
-        detail_content.append(&rom_label);
-
-        if let Some(crc) = game.crc32 {
-            let crc_label = gtk4::Label::new(Some(&format!("CRC32: {:08x}", crc)));
-            crc_label.set_halign(gtk4::Align::Start);
-            crc_label.add_css_class("caption");
-            detail_content.append(&crc_label);
-        }
-
-        let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-        separator.set_margin_top(8);
-        separator.set_margin_bottom(8);
-        detail_content.append(&separator);
-
+        let play_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         let play_button = gtk4::Button::with_label("Play");
+        play_button.set_hexpand(true);
         play_button.set_halign(gtk4::Align::Fill);
 
         let game_clone = game.clone();
@@ -1046,7 +1042,37 @@ impl App {
             }
         });
 
-        detail_content.append(&play_button);
+        play_row.append(&play_button);
+        play_row.append(&Self::favorite_toggle_button(game.favorite));
+        detail_content.append(&play_row);
+
+        if let Some(media) = game
+            .media
+            .iter()
+            .find(|m| m.kind == MediaKind::BoxArt && m.path.is_file())
+        {
+            if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&media.path, 250, 180, true) {
+                let picture = gtk4::Picture::for_pixbuf(&pixbuf);
+                picture.set_can_shrink(true);
+                picture.set_height_request(180);
+                detail_content.append(&picture);
+            }
+        }
+
+        Self::append_detail_media(detail_content, game, MediaKind::Screenshot, "Screenshot");
+
+        let title_label = gtk4::Label::new(Some(&game.title));
+        title_label.set_wrap(true);
+        title_label.set_halign(gtk4::Align::Start);
+        title_label.add_css_class("title-2");
+        detail_content.append(&title_label);
+
+        if let Some(console) = config.consoles.iter().find(|c| c.id == game.console) {
+            let console_label = gtk4::Label::new(Some(&format!("Console: {}", console.name)));
+            console_label.set_halign(gtk4::Align::Start);
+            console_label.add_css_class("caption");
+            detail_content.append(&console_label);
+        }
 
         if let Some(dt) = game.last_played {
             let formatted = dt.format("%Y-%m-%d %H:%M").to_string();
@@ -1078,6 +1104,24 @@ impl App {
             time_label.set_halign(gtk4::Align::Start);
             time_label.add_css_class("caption");
             detail_content.append(&time_label);
+        }
+
+        let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        separator.set_margin_top(8);
+        separator.set_margin_bottom(8);
+        detail_content.append(&separator);
+
+        let rom_label = gtk4::Label::new(Some(&format!("ROM: {}", game.rom.display())));
+        rom_label.set_wrap(true);
+        rom_label.set_halign(gtk4::Align::Start);
+        rom_label.add_css_class("caption");
+        detail_content.append(&rom_label);
+
+        if let Some(crc) = game.crc32 {
+            let crc_label = gtk4::Label::new(Some(&format!("CRC32: {:08x}", crc)));
+            crc_label.set_halign(gtk4::Align::Start);
+            crc_label.add_css_class("caption");
+            detail_content.append(&crc_label);
         }
     }
 
@@ -1657,11 +1701,24 @@ impl App {
                                     background-color: #3a3a3a;
                                 }
                                 .favorite-badge {
-                                    color: #ffffff;
-                                    background-color: #c0392b;
-                                    border-radius: 999px;
-                                    padding: 1px 6px;
+                                    color: #e01b24;
+                                    background-color: transparent;
+                                    border-radius: 0;
+                                    padding: 0;
+                                    font-family: \"DejaVu Sans\", sans-serif;
+                                    font-size: 18px;
                                     font-weight: 700;
+                                }
+                                .favorite-toggle {
+                                    min-width: 0;
+                                    min-height: 0;
+                                    padding: 4px 10px;
+                                    font-family: \"DejaVu Sans\", sans-serif;
+                                    font-size: 18px;
+                                }
+                                .favorite-toggle.is-favorite,
+                                .favorite-toggle.is-favorite label {
+                                    color: #e01b24;
                                 }",
                             );
                             gtk4::style_context_add_provider_for_display(
@@ -2391,6 +2448,83 @@ impl App {
             return;
         }
         Self::set_tile_favorite(grid, idx, next);
+        Self::set_detail_favorite(detail, next);
+    }
+
+    fn favorite_toggle_button(favorite: bool) -> gtk4::Button {
+        let button = gtk4::Button::new();
+        button.set_widget_name("favorite-toggle");
+        button.add_css_class("favorite-toggle");
+        button.set_tooltip_text(Some("Toggle favorite"));
+        button.set_action_name(Some("win.toggle-favorite"));
+        button.set_hexpand(false);
+        button.set_valign(gtk4::Align::Center);
+        Self::apply_favorite_toggle(&button, favorite);
+        button
+    }
+
+    fn apply_favorite_toggle(button: &gtk4::Button, favorite: bool) {
+        button.set_label(if favorite { "♥" } else { "♡" });
+        if favorite {
+            button.add_css_class("is-favorite");
+        } else {
+            button.remove_css_class("is-favorite");
+        }
+    }
+
+    fn set_detail_favorite(detail: &gtk4::Box, favorite: bool) {
+        let Some(widget) = Self::find_widget_name(detail.upcast_ref(), "favorite-toggle") else {
+            return;
+        };
+        let Ok(button) = widget.downcast::<gtk4::Button>() else {
+            return;
+        };
+        Self::apply_favorite_toggle(&button, favorite);
+    }
+
+    fn find_widget_name(root: &gtk4::Widget, name: &str) -> Option<gtk4::Widget> {
+        if root.widget_name() == name {
+            return Some(root.clone());
+        }
+        let mut child = root.first_child();
+        while let Some(current) = child {
+            if let Some(found) = Self::find_widget_name(&current, name) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
+    fn setup_favorite_action(&self) {
+        let action = gtk4::gio::SimpleAction::new("toggle-favorite", None);
+        let conn = self.conn.clone();
+        let games = self.games.clone();
+        let all_games = self.all_games.clone();
+        let selected_game = self.selected_game.clone();
+        let grid_filter = self.grid_filter.clone();
+        let game_grid = self.game_grid.clone();
+        let center_stack = self.center_stack.clone();
+        let config = self.config.clone();
+        let detail_content = self.detail_content.clone();
+        let current_console = self.current_console.clone();
+        let search_entry = self.search_entry.clone();
+        action.connect_activate(move |_, _| {
+            Self::toggle_favorite(
+                &conn,
+                &games,
+                &all_games,
+                &selected_game,
+                &grid_filter,
+                &game_grid,
+                &center_stack,
+                &config,
+                &detail_content,
+                &current_console,
+                &search_entry,
+            );
+        });
+        self.window.add_action(&action);
     }
 
     fn launch_selected(
@@ -2711,6 +2845,8 @@ mod tests {
         // `gtk4::init` aborts, so the other GTK checks share this init.
         flow_columns_follows_the_allocated_line();
         favorite_badge_toggles_on_the_card_overlay();
+        detail_pane_puts_play_above_stats_and_rom_at_the_bottom();
+        favorite_toggle_updates_badge_and_detail_heart();
     }
 
     fn flow_columns_follows_the_allocated_line() {
@@ -2765,6 +2901,14 @@ mod tests {
 
         assert!(!favorite_badge(&grid, 0).is_visible());
         assert!(favorite_badge(&grid, 1).is_visible());
+        assert_eq!(
+            favorite_badge(&grid, 1)
+                .downcast::<gtk4::Label>()
+                .unwrap()
+                .text()
+                .as_str(),
+            "♥"
+        );
 
         let flow_child = grid.child_at_index(1).unwrap();
         let tile = App::tile_box(&flow_child).unwrap();
@@ -2839,5 +2983,174 @@ mod tests {
             widget = current.next_sibling();
         }
         panic!("favorite-badge missing");
+    }
+
+    fn detail_pane_puts_play_above_stats_and_rom_at_the_bottom() {
+        use crate::config::Config;
+        use crate::types::{Console, GridArt, MediaToggles};
+        use chrono::TimeZone;
+
+        let config = Config {
+            consoles: vec![Console {
+                id: "atari2600".into(),
+                name: "Atari 2600".into(),
+                rom_dirs: Vec::new(),
+                extensions: Vec::new(),
+                profile: None,
+                grid_art: GridArt::BoxArt,
+                media: MediaToggles::default(),
+            }],
+            ..Config::default()
+        };
+        let conn = Rc::new(RefCell::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        ));
+        let mut game = sample_game("Airlock", false);
+        game.console = "atari2600".into();
+        game.rom = std::path::PathBuf::from("/tmp/Airlock.zip");
+        game.crc32 = Some(0x8678_f408);
+        game.play_count = 3;
+        game.play_time = 26;
+        game.last_played = Some(
+            chrono::Utc
+                .with_ymd_and_hms(2026, 9, 25, 17, 48, 0)
+                .unwrap(),
+        );
+
+        let detail = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        App::update_game_details(&detail, &game, &config, &conn);
+
+        let row = detail.first_child().unwrap();
+        let play = row.first_child().and_downcast::<gtk4::Button>().unwrap();
+        assert_eq!(play.label().as_deref(), Some("Play"));
+        let heart = play.next_sibling().and_downcast::<gtk4::Button>().unwrap();
+        assert_eq!(heart.widget_name().as_str(), "favorite-toggle");
+        assert_eq!(heart.label().as_deref(), Some("♡"));
+        assert!(!heart.has_css_class("is-favorite"));
+        assert_eq!(heart.action_name().as_deref(), Some("win.toggle-favorite"));
+
+        assert_eq!(
+            detail_texts(&detail),
+            vec![
+                "play-row",
+                "Airlock",
+                "Console: Atari 2600",
+                "Last played: 2026-09-25 17:48",
+                "Play count: 3",
+                "Play time: 26s",
+                "separator",
+                "ROM: /tmp/Airlock.zip",
+                "CRC32: 8678f408",
+            ]
+        );
+
+        App::set_detail_favorite(&detail, true);
+        assert_eq!(heart.label().as_deref(), Some("♥"));
+        assert!(heart.has_css_class("is-favorite"));
+
+        game.favorite = true;
+        App::update_game_details(&detail, &game, &config, &conn);
+        let heart = App::find_widget_name(detail.upcast_ref(), "favorite-toggle")
+            .and_downcast::<gtk4::Button>()
+            .unwrap();
+        assert_eq!(heart.label().as_deref(), Some("♥"));
+        assert!(heart.has_css_class("is-favorite"));
+
+        App::update_console_details(&detail, "atari2600", &conn.borrow(), &config);
+        assert!(App::find_widget_name(detail.upcast_ref(), "favorite-toggle").is_none());
+        assert!(detail_texts(&detail).iter().all(|text| text != "play-row"));
+    }
+
+    fn favorite_toggle_updates_badge_and_detail_heart() {
+        use crate::config::Config;
+        use crate::types::{Console, GridArt, GridFilter, MediaToggles};
+
+        let config = Config {
+            consoles: vec![Console {
+                id: "snes".into(),
+                name: "Super Nintendo".into(),
+                rom_dirs: Vec::new(),
+                extensions: Vec::new(),
+                profile: None,
+                grid_art: GridArt::BoxArt,
+                media: MediaToggles::default(),
+            }],
+            ..Config::default()
+        };
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let conn = Rc::new(RefCell::new(database::open_db(file.path()).unwrap()));
+        let game = sample_game("Chrono Trigger", false);
+        database::upsert_game(&conn.borrow(), &game).unwrap();
+
+        let games = Rc::new(RefCell::new(vec![game.clone()]));
+        let all_games = Rc::new(RefCell::new(vec![game.clone()]));
+        let selected = Rc::new(RefCell::new(Some(0usize)));
+        let filter = Rc::new(RefCell::new(GridFilter::All));
+        let grid = gtk4::FlowBox::new();
+        let stack = gtk4::Stack::new();
+        stack.add_named(
+            &gtk4::Box::new(gtk4::Orientation::Vertical, 0),
+            Some("grid"),
+        );
+        stack.add_named(
+            &gtk4::Box::new(gtk4::Orientation::Vertical, 0),
+            Some("empty"),
+        );
+        App::update_game_grid(&grid, &stack, &games.borrow(), &config, false);
+        let detail = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        let config_rc = Rc::new(RefCell::new(config));
+        App::update_game_details(&detail, &game, &config_rc.borrow(), &conn);
+        let current = Rc::new(RefCell::new(Some("snes".into())));
+        let search = gtk4::SearchEntry::new();
+
+        let toggle = || {
+            App::toggle_favorite(
+                &conn, &games, &all_games, &selected, &filter, &grid, &stack, &config_rc, &detail,
+                &current, &search,
+            );
+        };
+
+        toggle();
+        assert!(games.borrow()[0].favorite);
+        assert!(database::load_games(&conn.borrow(), None).unwrap()[0].favorite);
+        assert!(favorite_badge(&grid, 0).is_visible());
+        let heart = App::find_widget_name(detail.upcast_ref(), "favorite-toggle")
+            .and_downcast::<gtk4::Button>()
+            .unwrap();
+        assert_eq!(heart.label().as_deref(), Some("♥"));
+        assert!(heart.has_css_class("is-favorite"));
+
+        toggle();
+        assert!(!games.borrow()[0].favorite);
+        assert!(!favorite_badge(&grid, 0).is_visible());
+        assert_eq!(heart.label().as_deref(), Some("♡"));
+        assert!(!heart.has_css_class("is-favorite"));
+
+        toggle();
+        *filter.borrow_mut() = GridFilter::Favorites;
+        toggle();
+        assert!(App::find_widget_name(detail.upcast_ref(), "favorite-toggle").is_none());
+        assert!(selected.borrow().is_none());
+        assert!(!database::load_games(&conn.borrow(), None).unwrap()[0].favorite);
+    }
+
+    fn detail_texts(detail: &gtk4::Box) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut child = detail.first_child();
+        while let Some(current) = child {
+            if current.downcast_ref::<gtk4::Separator>().is_some() {
+                out.push("separator".into());
+            } else if let Some(label) = current.downcast_ref::<gtk4::Label>() {
+                out.push(label.text().to_string());
+            } else if current
+                .first_child()
+                .and_downcast::<gtk4::Button>()
+                .is_some()
+            {
+                out.push("play-row".into());
+            }
+            child = current.next_sibling();
+        }
+        out
     }
 }
