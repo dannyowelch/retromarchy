@@ -2,7 +2,7 @@ use crate::catalog;
 use crate::config::{self, Config};
 use crate::cores::{self, CoreProfile, DiscoveredCore};
 use crate::importer::{self, FoundFolder, ImportChoice};
-use crate::types::EmulatorProfile;
+use crate::types::{EmulatorProfile, ProviderEntry, ScraperConfig, ScraperCredentials};
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box, Button, CheckButton, ComboBoxText, Entry, FileChooserAction, FileChooserDialog,
@@ -936,6 +936,200 @@ fn fill_consoles(list: &ListBox, config: &Rc<RefCell<Config>>) {
         {
             combo.grab_focus();
         }
+    }
+}
+
+pub fn open_scraper(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config>>) {
+    let window = Window::builder()
+        .title("Scraper settings")
+        .modal(true)
+        .transient_for(parent)
+        .default_width(560)
+        .default_height(640)
+        .build();
+
+    let page = Box::new(Orientation::Vertical, 12);
+    page.set_margin_top(16);
+    page.set_margin_bottom(16);
+    page.set_margin_start(16);
+    page.set_margin_end(16);
+
+    let title = Label::new(Some("Artwork scraper"));
+    title.add_css_class("title-2");
+    title.set_halign(Align::Start);
+    page.append(&title);
+
+    let hint = Label::new(Some(
+        "Downloads box art, title screens, and screenshots only. ROMs and BIOS are never downloaded.",
+    ));
+    hint.set_wrap(true);
+    hint.set_halign(Align::Start);
+    hint.add_css_class("dim-label");
+    page.append(&hint);
+
+    let scraper = config.borrow().scraper.clone();
+    let box_art = CheckButton::with_label("Box art");
+    box_art.set_active(scraper.box_art);
+    let title_screen = CheckButton::with_label("Title screen");
+    title_screen.set_active(scraper.title_screen);
+    let screenshot = CheckButton::with_label("Screenshot");
+    screenshot.set_active(scraper.screenshot);
+    page.append(&box_art);
+    page.append(&title_screen);
+    page.append(&screenshot);
+
+    let providers_label = Label::new(Some("Providers, highest priority first"));
+    providers_label.add_css_class("title-4");
+    providers_label.set_halign(Align::Start);
+    providers_label.set_margin_top(8);
+    page.append(&providers_label);
+
+    let provider_note = Label::new(Some(
+        "Each missing artwork type tries this list in order and stops at the first hit.",
+    ));
+    provider_note.set_wrap(true);
+    provider_note.set_halign(Align::Start);
+    provider_note.add_css_class("dim-label");
+    page.append(&provider_note);
+
+    let list = ListBox::new();
+    list.add_css_class("boxed-list");
+    list.set_selection_mode(gtk4::SelectionMode::None);
+    let providers = Rc::new(RefCell::new(scraper.providers));
+    refill_providers(&list, &providers);
+    page.append(&list);
+
+    let creds_label = Label::new(Some("Credentials"));
+    creds_label.add_css_class("title-4");
+    creds_label.set_halign(Align::Start);
+    creds_label.set_margin_top(8);
+    page.append(&creds_label);
+
+    let creds_note = Label::new(Some(
+        "Stored in the scraper.credentials table of config.toml. ScreenScraper’s API also requires the developer id and password from your ScreenScraper application registration.",
+    ));
+    creds_note.set_wrap(true);
+    creds_note.set_halign(Align::Start);
+    creds_note.add_css_class("dim-label");
+    page.append(&creds_note);
+
+    let user = Entry::builder()
+        .placeholder_text("ScreenScraper username")
+        .text(&scraper.credentials.screenscraper_user)
+        .build();
+    let password = Entry::builder()
+        .placeholder_text("ScreenScraper password")
+        .text(&scraper.credentials.screenscraper_password)
+        .visibility(false)
+        .build();
+    let dev_id = Entry::builder()
+        .placeholder_text("ScreenScraper developer id")
+        .text(&scraper.credentials.screenscraper_dev_id)
+        .build();
+    let dev_password = Entry::builder()
+        .placeholder_text("ScreenScraper developer password")
+        .text(&scraper.credentials.screenscraper_dev_password)
+        .visibility(false)
+        .build();
+    let api_key = Entry::builder()
+        .placeholder_text("TheGamesDB API key")
+        .text(&scraper.credentials.thegamesdb_api_key)
+        .visibility(false)
+        .build();
+    page.append(&user);
+    page.append(&password);
+    page.append(&dev_id);
+    page.append(&dev_password);
+    page.append(&api_key);
+
+    let save = Button::with_label("Save");
+    save.add_css_class("suggested-action");
+    save.set_halign(Align::End);
+    let window_save = window.clone();
+    save.connect_clicked(move |_| {
+        let mut cfg = config.borrow_mut();
+        cfg.scraper = ScraperConfig {
+            box_art: box_art.is_active(),
+            title_screen: title_screen.is_active(),
+            screenshot: screenshot.is_active(),
+            providers: providers.borrow().clone(),
+            credentials: ScraperCredentials {
+                screenscraper_user: user.text().to_string(),
+                screenscraper_password: password.text().to_string(),
+                screenscraper_dev_id: dev_id.text().to_string(),
+                screenscraper_dev_password: dev_password.text().to_string(),
+                thegamesdb_api_key: api_key.text().to_string(),
+            },
+        };
+        let _ = config::save_config(&cfg);
+        window_save.close();
+    });
+    page.append(&save);
+
+    let scrolled = ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(PolicyType::Never)
+        .child(&page)
+        .build();
+    window.set_child(Some(&scrolled));
+    window.set_default_widget(Some(&save));
+    close_on_escape(&window);
+    window.present();
+}
+
+fn refill_providers(list: &ListBox, providers: &Rc<RefCell<Vec<ProviderEntry>>>) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    let entries = providers.borrow().clone();
+    for (index, entry) in entries.iter().enumerate() {
+        let row = Box::new(Orientation::Horizontal, 8);
+        row.set_margin_top(6);
+        row.set_margin_bottom(6);
+        row.set_margin_start(8);
+        row.set_margin_end(8);
+        let check = CheckButton::with_label(entry.id.label());
+        check.set_active(entry.enabled);
+        check.set_hexpand(true);
+        check.set_halign(Align::Start);
+        let providers_toggle = providers.clone();
+        let list_toggle = list.clone();
+        check.connect_toggled(move |btn| {
+            if let Some(slot) = providers_toggle.borrow_mut().get_mut(index) {
+                slot.enabled = btn.is_active();
+            }
+            let _ = &list_toggle;
+        });
+        row.append(&check);
+
+        let up = Button::with_label("Up");
+        up.set_sensitive(index > 0);
+        let providers_up = providers.clone();
+        let list_up = list.clone();
+        up.connect_clicked(move |_| {
+            let mut entries = providers_up.borrow_mut();
+            if index > 0 && index < entries.len() {
+                entries.swap(index, index - 1);
+            }
+            drop(entries);
+            refill_providers(&list_up, &providers_up);
+        });
+        row.append(&up);
+
+        let down = Button::with_label("Down");
+        down.set_sensitive(index + 1 < entries.len());
+        let providers_down = providers.clone();
+        let list_down = list.clone();
+        down.connect_clicked(move |_| {
+            let mut entries = providers_down.borrow_mut();
+            if index + 1 < entries.len() {
+                entries.swap(index, index + 1);
+            }
+            drop(entries);
+            refill_providers(&list_down, &providers_down);
+        });
+        row.append(&down);
+        list.append(&row);
     }
 }
 

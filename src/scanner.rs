@@ -189,6 +189,7 @@ mod tests {
             extensions: vec!["sfc".to_string()],
             profile: Some("retroarch-snes9x".to_string()),
             media: MediaToggles::default(),
+            grid_art: crate::types::GridArt::default(),
         };
 
         let games1 = scan_console(&console)?;
@@ -231,6 +232,7 @@ mod tests {
                 manual: false,
                 video: false,
             },
+            grid_art: crate::types::GridArt::default(),
         };
 
         let media = discover_local_media(&rom_path, &console)?;

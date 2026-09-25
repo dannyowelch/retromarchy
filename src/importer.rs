@@ -129,6 +129,7 @@ fn upsert_console(config: &mut Config, system: &SystemEntry, path: &Path) {
         extensions: system.extensions.clone(),
         profile: None,
         media: MediaToggles::default(),
+        grid_art: crate::types::GridArt::default(),
     });
 }
 

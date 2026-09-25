@@ -108,6 +108,10 @@ pub fn upsert_game(conn: &Connection, game: &Game) -> Result<()> {
     for media in &game.media {
         if media.source == Source::Local {
             conn.execute(
+                "DELETE FROM media WHERE game_id = ?1 AND kind = ?2",
+                params![game.id, media_kind_to_i32(media.kind)],
+            )?;
+            conn.execute(
                 "INSERT INTO media (game_id, kind, path, source) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     game.id,
@@ -205,6 +209,24 @@ fn load_media(conn: &Connection, game_id: &GameId) -> Result<Vec<Media>> {
     Ok(media)
 }
 
+/// One file per kind. Replaces any previous row for this game and kind.
+pub fn set_game_media(conn: &Connection, game_id: &GameId, media: &Media) -> Result<()> {
+    conn.execute(
+        "DELETE FROM media WHERE game_id = ?1 AND kind = ?2",
+        params![game_id, media_kind_to_i32(media.kind)],
+    )?;
+    conn.execute(
+        "INSERT INTO media (game_id, kind, path, source) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            game_id,
+            media_kind_to_i32(media.kind),
+            media.path.to_string_lossy().to_string(),
+            source_to_i32(media.source),
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn update_last_played(conn: &Connection, game_id: &GameId) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     conn.execute(
@@ -284,6 +306,7 @@ fn media_kind_to_i32(kind: MediaKind) -> i32 {
         MediaKind::Screenshot => 1,
         MediaKind::Manual => 2,
         MediaKind::Video => 3,
+        MediaKind::TitleScreen => 4,
     }
 }
 
@@ -293,6 +316,7 @@ fn i32_to_media_kind(val: i32) -> MediaKind {
         1 => MediaKind::Screenshot,
         2 => MediaKind::Manual,
         3 => MediaKind::Video,
+        4 => MediaKind::TitleScreen,
         _ => MediaKind::BoxArt,
     }
 }

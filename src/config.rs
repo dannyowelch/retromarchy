@@ -1,4 +1,4 @@
-use crate::types::{Console, EmulatorProfile};
+use crate::types::{Console, EmulatorProfile, ScraperConfig};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -22,6 +22,8 @@ pub struct Config {
     pub profiles: Vec<EmulatorProfile>,
     #[serde(default)]
     pub consoles: Vec<Console>,
+    #[serde(default)]
+    pub scraper: ScraperConfig,
 }
 
 fn default_theme() -> String {
@@ -39,6 +41,7 @@ impl Default for Config {
             details_visible: default_true(),
             profiles: Vec::new(),
             consoles: Vec::new(),
+            scraper: ScraperConfig::default(),
         }
     }
 }
