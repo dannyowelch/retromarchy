@@ -128,8 +128,8 @@ fn upsert_console(config: &mut Config, system: &SystemEntry, path: &Path) {
         rom_dirs: vec![path.to_path_buf()],
         extensions: system.extensions.clone(),
         profile: None,
-        media: MediaToggles::default(),
         grid_art: crate::types::GridArt::default(),
+        media: MediaToggles::default(),
     });
 }
 

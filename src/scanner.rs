@@ -188,8 +188,8 @@ mod tests {
             rom_dirs: vec![rom_dir.clone()],
             extensions: vec!["sfc".to_string()],
             profile: Some("retroarch-snes9x".to_string()),
-            media: MediaToggles::default(),
             grid_art: crate::types::GridArt::default(),
+            media: MediaToggles::default(),
         };
 
         let games1 = scan_console(&console)?;
@@ -226,13 +226,13 @@ mod tests {
             rom_dirs: vec![rom_dir.clone()],
             extensions: vec!["sfc".to_string()],
             profile: Some("retroarch-snes9x".to_string()),
+            grid_art: crate::types::GridArt::default(),
             media: MediaToggles {
                 box_art: true,
                 screenshot: false,
                 manual: false,
                 video: false,
             },
-            grid_art: crate::types::GridArt::default(),
         };
 
         let media = discover_local_media(&rom_path, &console)?;

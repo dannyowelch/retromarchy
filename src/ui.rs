@@ -962,6 +962,10 @@ impl App {
                 w.upcast_ref::<gtk4::Widget>() == search_entry.upcast_ref::<gtk4::Widget>() ||
                 search_entry.is_ancestor(w)
             });
+            let combo_has_focus = focused.as_ref().map_or(false, |w| {
+                w.upcast_ref::<gtk4::Widget>() == grid_art_combo.upcast_ref::<gtk4::Widget>()
+                    || grid_art_combo.is_ancestor(w)
+            });
             
             if mods.contains(gdk::ModifierType::CONTROL_MASK) && !search_has_focus {
                 if key == gdk::Key::g || key == gdk::Key::G {
@@ -1106,7 +1110,9 @@ impl App {
                     }
                 }
                 gdk::Key::Left | gdk::Key::h => {
-                    if !search_has_focus {
+                    if combo_has_focus {
+                        glib::Propagation::Proceed
+                    } else if !search_has_focus {
                         let selected = game_grid.selected_children().first().cloned();
                         if let Some(selected) = selected {
                             let idx = selected.index();
@@ -1129,7 +1135,9 @@ impl App {
                     }
                 }
                 gdk::Key::Right | gdk::Key::l => {
-                    if !search_has_focus {
+                    if combo_has_focus {
+                        glib::Propagation::Proceed
+                    } else if !search_has_focus {
                         let selected = game_grid.selected_children().first().cloned();
                         if let Some(selected) = selected {
                             let idx = selected.index();
@@ -1150,7 +1158,9 @@ impl App {
                     }
                 }
                 gdk::Key::Up | gdk::Key::k => {
-                    if !search_has_focus {
+                    if combo_has_focus {
+                        glib::Propagation::Proceed
+                    } else if !search_has_focus {
                         let selected = game_grid.selected_children().first().cloned();
                         if let Some(selected) = selected {
                             let idx = selected.index();
@@ -1173,7 +1183,9 @@ impl App {
                     }
                 }
                 gdk::Key::Down | gdk::Key::j => {
-                    if !search_has_focus {
+                    if combo_has_focus {
+                        glib::Propagation::Proceed
+                    } else if !search_has_focus {
                         let selected = game_grid.selected_children().first().cloned();
                         if let Some(selected) = selected {
                             let idx = selected.index();

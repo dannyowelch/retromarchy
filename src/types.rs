@@ -14,10 +14,11 @@ pub struct Console {
     pub extensions: Vec<String>,
     #[serde(default)]
     pub profile: Option<ProfileId>,
-    pub media: MediaToggles,
     /// Which cached artwork the game grid prefers for this console.
+    /// Serialized before `media` so it stays a key on the console table.
     #[serde(default)]
     pub grid_art: GridArt,
+    pub media: MediaToggles,
 }
 
 #[derive(Debug, Clone)]

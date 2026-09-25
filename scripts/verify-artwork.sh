@@ -124,8 +124,8 @@ xdotool windowmove "$MAIN" 40 40
 sleep 0.3
 xdotool key --window "$MAIN" r
 sleep 0.8
-xdotool key --window "$MAIN" Right
-sleep 0.3
+xdotool mousemove --window "$MAIN" 330 190 click 1
+sleep 0.4
 
 xdotool key --window "$MAIN" ctrl+g
 sleep 0.8
@@ -134,17 +134,21 @@ echo "settings window: ${SETTINGS:-missing}"
 xdotool windowsize "$SETTINGS" 560 640 || true
 shot "artwork-scraper-settings.png" "$SETTINGS"
 
-xdotool key --window "$SETTINGS" Escape
-sleep 0.4
+xdotool key Escape
+sleep 0.5
 MAIN="$(window_id Retromarchy)"
-xdotool key --window "$MAIN" s
-sleep 1.2
+xdotool mousemove --window "$MAIN" 330 190 click 1
+sleep 0.3
+xdotool mousemove --window "$MAIN" 400 30 click 1
+sleep 1.5
 shot "artwork-scrape-status.png" "$MAIN"
 
-xdotool key --window "$MAIN" 2
-sleep 0.6
+xdotool mousemove --window "$MAIN" 930 28 click 1
+sleep 0.4
+xdotool mousemove --window "$MAIN" 930 100 click 1
+sleep 0.5
 shot "artwork-grid-title-screen.png" "$MAIN"
-convert "$SHOTS/artwork-grid-title-screen.png" -crop 340x680+840+0 +repage "$SHOTS/artwork-details-title-screenshot.png"
+convert "$SHOTS/artwork-grid-title-screen.png" -crop 360x640+820+40 +repage "$SHOTS/artwork-details-title-screenshot.png"
 echo "saved artwork-details-title-screenshot.png $(md5sum "$SHOTS/artwork-details-title-screenshot.png" | awk '{print $1}')"
 
 echo "---- config grid_art ----"

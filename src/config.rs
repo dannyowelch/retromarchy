@@ -76,6 +76,36 @@ pub fn load_config() -> Result<Config> {
     Ok(config)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Console, GridArt, MediaToggles};
+
+    #[test]
+    fn grid_art_roundtrip_saves() {
+        let config = Config {
+            consoles: vec![Console {
+                id: "snes".into(),
+                name: "Super Nintendo".into(),
+                rom_dirs: vec![],
+                extensions: vec!["sfc".into()],
+                profile: None,
+                grid_art: GridArt::TitleScreen,
+                media: MediaToggles::default(),
+            }],
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            text.contains("grid_art = 'title_screen'") || text.contains("grid_art = \"title_screen\""),
+            "{text}"
+        );
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.consoles[0].grid_art, GridArt::TitleScreen);
+        assert_eq!(back.scraper.providers.len(), 2);
+    }
+}
+
 pub fn save_config(config: &Config) -> Result<()> {
     let path = config_path()?;
     let content = toml::to_string_pretty(config)?;
