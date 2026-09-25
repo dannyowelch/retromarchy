@@ -174,7 +174,7 @@ A gamepad is optional. Buttons follow the SDL / Xbox layout (South is the bottom
 - **Left stick or d-pad**: Move. On the systems list, up and down change console. On the game grid, the stick and d-pad match the arrow keys (one tile left or right, six tiles up or down). The stick fires one step per push and must return near center before the next step. The d-pad is one step per press.
 - **A (South)**: From the systems list, move into that console’s games. On a game, launch it (same as Enter).
 - **B (East)**: From the game grid, return to the systems list.
-- **Y (West)**: Toggle the focused game as a favorite. Does nothing when focus is on the systems list.
+- **Y (North)**: Toggle the focused game as a favorite. Does nothing when focus is on the systems list.
 
 Start, Select, and X are ignored. The header buttons are not mapped.
 

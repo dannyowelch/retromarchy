@@ -1,4 +1,4 @@
-//! SDL / Xbox layout via gilrs. South confirms, East goes back, West toggles a favorite.
+//! SDL / Xbox layout via gilrs. South confirms, East goes back, North (Y) toggles a favorite.
 //! The left stick fires one step per deflection and must return near center before the next.
 
 use gilrs::{Axis, Button, EventType};
@@ -76,7 +76,7 @@ pub fn button_action(button: Button) -> Option<PadAction> {
     match button {
         Button::South => Some(PadAction::Confirm),
         Button::East => Some(PadAction::Back),
-        Button::West => Some(PadAction::Favorite),
+        Button::North => Some(PadAction::Favorite),
         Button::DPadLeft => Some(PadAction::Move(NavDir::Left)),
         Button::DPadRight => Some(PadAction::Move(NavDir::Right)),
         Button::DPadUp => Some(PadAction::Move(NavDir::Up)),
@@ -169,8 +169,8 @@ mod tests {
     fn face_and_dpad_mapping() {
         assert_eq!(button_action(Button::South), Some(PadAction::Confirm));
         assert_eq!(button_action(Button::East), Some(PadAction::Back));
-        assert_eq!(button_action(Button::West), Some(PadAction::Favorite));
-        assert_eq!(button_action(Button::North), None);
+        assert_eq!(button_action(Button::North), Some(PadAction::Favorite));
+        assert_eq!(button_action(Button::West), None);
         assert_eq!(button_action(Button::Start), None);
         assert_eq!(button_action(Button::Select), None);
         assert_eq!(
