@@ -26,6 +26,8 @@ pub struct Game {
     pub profile: Option<ProfileId>,
     pub media: Vec<Media>,
     pub last_played: Option<DateTime<Utc>>,
+    pub play_count: u32,
+    pub play_time: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,14 +1,14 @@
 #!/bin/bash
-# UI Verification Script for Retromarchy
-# Tests keyboard navigation, filter, and launch functionality under Xvfb
+# UI Verification Script for Retromarchy PR #2
+# Tests details pane modes, play tracking, collapsible pane, theme, and keyboard shortcuts
 
 set -e
 
 DISPLAY="${DISPLAY:-:99}"
-SCREENSHOT_DIR="${1:-/opt/cursor/artifacts/retro-verify-$(date +%Y%m%d-%H%M%S)}"
+SCREENSHOT_DIR="/opt/cursor/artifacts"
 APP_LOG="/tmp/retro-verify.log"
 
-echo "=== Retromarchy UI Verification ==="
+echo "=== Retromarchy PR #2 Verification ==="
 echo "Display: $DISPLAY"
 echo "Screenshot dir: $SCREENSHOT_DIR"
 
@@ -16,9 +16,22 @@ echo "Screenshot dir: $SCREENSHOT_DIR"
 mkdir -p "$SCREENSHOT_DIR"
 rm -f "$APP_LOG"
 
+# Set XDG paths and copy config
+export XDG_CONFIG_HOME="/tmp"
+export XDG_DATA_HOME="/tmp"
+export RETROMARCHY_DEBUG=1
+mkdir -p /tmp/retromarchy
+cp /tmp/retro-test/config.toml /tmp/retromarchy/config.toml
+rm -f /tmp/retromarchy/library.db
+
+echo "Config path: /tmp/retromarchy/config.toml"
+echo "Database path: /tmp/retromarchy/library.db"
+echo "Initial config:"
+grep details_visible /tmp/retromarchy/config.toml
+
 # Helper to wait for UI to settle
 wait_ui() {
-    sleep "${1:-1}"
+    sleep "${1:-1.5}"
 }
 
 # Ensure window manager is running
@@ -37,11 +50,11 @@ echo "Starting retromarchy..."
 cd /workspace
 DISPLAY=$DISPLAY cargo run > "$APP_LOG" 2>&1 &
 APP_PID=$!
-sleep 3
+sleep 4
 
 # Wait for window to appear
 echo "Waiting for window..."
-WINDOW=$(DISPLAY=$DISPLAY xdotool search --sync --onlyvisible --name "Retromarchy" | head -1)
+WINDOW=$(DISPLAY=$DISPLAY xdotool search --sync --onlyvisible --name "Retromarchy" 2>/dev/null | head -1)
 if [ -z "$WINDOW" ]; then
     echo "ERROR: Window not found"
     cat "$APP_LOG"
@@ -52,7 +65,7 @@ echo "Found window: $WINDOW"
 # Helper function to send keys with focus
 send_keys() {
     DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 640 360 click 1
-    sleep 0.3
+    sleep 0.2
     DISPLAY=$DISPLAY xdotool key $@
     wait_ui 0.8
 }
@@ -67,104 +80,99 @@ screenshot() {
 echo ""
 echo "=== Test Sequence ==="
 
-# 1. Initial state
-echo "1. Initial state"
-screenshot "01-initial"
-
-# 2. Click sidebar to select console and load games
-echo "2. Select console (click sidebar)"
-DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 100 100 click 1
+# 1. Click sidebar to select console and trigger scan
+echo "1. Select SNES console and scan"
+DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 55 52 click 1
 wait_ui 1.5
-screenshot "02-console-selected"
-
-# 3. Tab to game grid
-echo "3. Tab to game grid"
-send_keys Tab
-screenshot "03-tab-to-grid"
-
-# 4. Navigate with hjkl
-echo "4. Navigate with h (left)"
-send_keys h h
-screenshot "04-hjkl-left"
-
-echo "5. Navigate with l (right)"
-send_keys l l l
-screenshot "05-hjkl-right"
-
-echo "6. Navigate with k (up)"
-send_keys k
-screenshot "06-hjkl-up"
-
-echo "7. Navigate with j (down)"
-send_keys j
-screenshot "07-hjkl-down"
-
-# 8. Navigate with arrow keys
-echo "8. Navigate with arrow keys"
-send_keys Right Right
-screenshot "08-arrow-right"
-
-send_keys Up
-screenshot "09-arrow-up"
-
-# 9. Open filter with /
-echo "10. Open filter with /"
-send_keys slash
-screenshot "10-filter-open"
-
-# 10. Type in filter
-echo "11. Type in filter"
-DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 640 360 click 1
-sleep 0.3
-DISPLAY=$DISPLAY xdotool type "5"
-wait_ui 0.8
-screenshot "11-filter-text"
-
-# 11. Close filter with Escape
-echo "12. Close filter with Escape"
-send_keys Escape
-screenshot "12-filter-closed"
-
-# 12. Press Tab to refocus grid and navigate
-echo "13. Tab back to grid"
-send_keys Tab Left Left
-screenshot "13-positioned-for-launch"
-
-# 13. Press Enter to launch (check logs for launch command)
-echo "14. Press Enter to launch game"
-rm -f /tmp/retro-launch-test.txt
-send_keys Return
-sleep 2
-screenshot "14-after-launch"
-
-# Check if launch was successful by looking for the output file
-if [ -f /tmp/retro-launch-test.txt ]; then
-    echo "  ✓ Launch succeeded!"
-    echo "  Launch output: $(cat /tmp/retro-launch-test.txt)"
-else
-    echo "  ✗ WARNING: Launch failed - no output file created"
-    echo "  Check app log for errors"
-fi
-
-# 14. Test rescan with 'r' key
-echo "15. Rescan console with 'r'"
 send_keys r
-sleep 2
-screenshot "15-after-rescan"
+wait_ui 2
+
+# (a) Console mode with stats - no game selected
+echo "2. Capture console mode with stats"
+screenshot "a-console-mode-stats"
+
+# (b) Select a game
+echo "3. Tab to grid and select a game"
+send_keys Tab Right Right
+wait_ui 0.5
+screenshot "b-game-selected"
+
+# (c) Escape back to console mode
+echo "4. Press Escape to return to console mode"
+send_keys Escape
+wait_ui 0.5
+screenshot "c-escape-console-mode"
+
+# (d) Test filter without collapsing pane
+echo "5. Open filter and type 'dr' to filter to Dragon"
+send_keys slash
+wait_ui 0.5
+DISPLAY=$DISPLAY xdotool type "dr"
+wait_ui 1
+screenshot "d-filter-d-pane-visible"
+
+# Close search
+send_keys Escape
+wait_ui 0.5
+
+# (e) Collapse the pane
+echo "6. Press 'd' to collapse details pane"
+send_keys d
+wait_ui 0.8
+echo "Config after collapse:"
+grep details_visible /tmp/retromarchy/config.toml
+screenshot "e-pane-collapsed"
+
+# (f) Restart and verify pane stays collapsed
+echo "7. Restart to verify collapsed state persists"
+kill $APP_PID
+wait_ui 2
+echo "Config before restart:"
+grep details_visible /tmp/retromarchy/config.toml
+DISPLAY=$DISPLAY cargo run > "$APP_LOG" 2>&1 &
+APP_PID=$!
+sleep 4
+WINDOW=$(DISPLAY=$DISPLAY xdotool search --sync --onlyvisible --name "Retromarchy" 2>/dev/null | head -1)
+DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 55 52 click 1
+wait_ui 1.5
+screenshot "e2-pane-collapsed-after-restart"
+echo "Config after restart:"
+grep details_visible /tmp/retromarchy/config.toml
+
+# Re-open pane for theme test
+echo "8. Press 'd' to re-open pane"
+send_keys d
+wait_ui 0.8
+
+# (g) Toggle to LaunchBox theme
+echo "9. Toggle to LaunchBox theme"
+send_keys t
+wait_ui 1
+screenshot "f-launchbox-theme"
+
+# (h) Launch game and verify play tracking
+echo "10. Select and launch game for play tracking"
+send_keys Tab Right
+wait_ui 0.5
+# Click on the grid area to ensure focus
+DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 300 200 click 1
+wait_ui 0.2
+DISPLAY=$DISPLAY xdotool key Return
+echo "  Waiting for stub emulator (3 seconds)..."
+sleep 5
+wait_ui 2
+screenshot "g-play-count-incremented"
 
 echo ""
 echo "=== Verification Complete ==="
 echo "Screenshots saved to: $SCREENSHOT_DIR"
-echo "App log: $APP_LOG"
 echo ""
-echo "To view screenshots:"
-echo "  ls -lh $SCREENSHOT_DIR/"
-echo ""
-echo "To check app output:"
-echo "  cat $APP_LOG"
+echo "Generated screenshots:"
+ls -1 $SCREENSHOT_DIR/*.png 2>/dev/null || echo "No screenshots found"
 
-# Keep app running for manual inspection
+# Cleanup
+kill $APP_PID 2>/dev/null || true
+
 echo ""
-echo "App is still running (PID $APP_PID). Press Ctrl+C to stop, or kill with:"
-echo "  kill $APP_PID"
-wait $APP_PID
+echo "Check app log at: $APP_LOG"
+echo "Verification script completed!"

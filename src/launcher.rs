@@ -1,7 +1,7 @@
 use crate::types::EmulatorProfile;
 use anyhow::{anyhow, Result};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command};
 
 pub fn build_launch_command(profile: &EmulatorProfile, rom: &Path) -> Result<(String, Vec<String>)> {
     match profile {
@@ -27,13 +27,13 @@ pub fn build_launch_command(profile: &EmulatorProfile, rom: &Path) -> Result<(St
     }
 }
 
-pub fn launch_game(profile: &EmulatorProfile, rom: &Path) -> Result<()> {
+
+pub fn launch_game_tracked(profile: &EmulatorProfile, rom: &Path) -> Result<Child> {
     let (program, args) = build_launch_command(profile, rom)?;
     Command::new(&program)
         .args(&args)
         .spawn()
-        .map_err(|e| anyhow!("Failed to launch {}: {}", program, e))?;
-    Ok(())
+        .map_err(|e| anyhow!("Failed to launch {}: {}", program, e))
 }
 
 #[cfg(test)]

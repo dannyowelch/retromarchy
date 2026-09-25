@@ -1,0 +1,50 @@
+# Bundled console metadata for Retromarchy
+# Used for console info display when no game is selected
+
+[[console]]
+id = "snes"
+manufacturer = "Nintendo"
+year = 1990
+description = "16-bit home video game console. Known for classics like Super Mario World, The Legend of Zelda: A Link to the Past, and Super Metroid."
+
+[[console]]
+id = "genesis"
+manufacturer = "Sega"
+year = 1988
+description = "16-bit home video game console. Known for Sonic the Hedgehog, Streets of Rage, and a strong library of arcade ports."
+
+[[console]]
+id = "nes"
+manufacturer = "Nintendo"
+year = 1983
+description = "8-bit home video game console that revitalized the gaming industry. Home to Super Mario Bros., The Legend of Zelda, and Metroid."
+
+[[console]]
+id = "n64"
+manufacturer = "Nintendo"
+year = 1996
+description = "64-bit home console pioneering 3D gaming. Famous for Super Mario 64, The Legend of Zelda: Ocarina of Time, and GoldenEye 007."
+
+[[console]]
+id = "ps1"
+manufacturer = "Sony"
+year = 1994
+description = "First PlayStation console that brought CD-ROM gaming mainstream. Home to Final Fantasy VII, Metal Gear Solid, and Crash Bandicoot."
+
+[[console]]
+id = "gamecube"
+manufacturer = "Nintendo"
+year = 2001
+description = "Compact Nintendo console using mini-DVDs. Known for Super Smash Bros. Melee, The Legend of Zelda: The Wind Waker, and Metroid Prime."
+
+[[console]]
+id = "gba"
+manufacturer = "Nintendo"
+year = 2001
+description = "32-bit handheld console, successor to Game Boy Color. Featured advanced ports and original titles like Pokémon Ruby/Sapphire."
+
+[[console]]
+id = "dreamcast"
+manufacturer = "Sega"
+year = 1998
+description = "Sega's final console with built-in modem for online play. Known for Shenmue, Sonic Adventure, and innovative games like Jet Set Radio."
