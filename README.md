@@ -64,7 +64,7 @@ Top-level keys the app uses:
 
 - `theme`: `"system"` (default) or `"launchbox"`.
 - `details_visible`: whether the right pane starts open (default `true`).
-- `profiles`, `consoles`, `scraper`.
+- `profiles`, `consoles`, `scraper`, `input`.
 
 **RetroArch profile** (launch is `retroarch -L <core> [--config <file>] <rom>`):
 
@@ -147,11 +147,15 @@ ScreenScraper needs a free member username and password. The application Softnam
 
 Images are written to `~/.local/share/retromarchy/media/<console>/<game-id>/<kind>.<ext>` (`box_art` or `screenshot`; png, jpg, gif, or webp). One file per kind. The `media` table in the library database records the path. Archive, ROM, BIOS, manual, and video URLs are rejected. Older `title_screen` rows are ignored and their files are not deleted.
 
+## Input
+
+**Options** in the header opens **Input**. Those fields control hold-repeat for arrow keys, the d-pad, and the left stick, and they are written to `[input]` as you edit them. Defaults are a 400 ms starting pause, 180 ms slow repeat, 50 ms fast repeat, and a 2000 ms slow-to-fast transition. Confirm, Back, and Favorite do not repeat.
+
 ## Keybindings
 
 Ignored while the filter entry is focused, except Escape, `/`, and Tab.
 
-- **Arrow keys / h j k l**: Move in the grid (up and down jump six tiles)
+- **Arrow keys**: Move the focused pane (systems list, or the game grid). Holding one repeats. **Options → Input** sets the pause, the slow repeat, the fast repeat, and the slow-to-fast transition. **h j k l** step the grid once per keypress (up and down jump one row)
 - **Enter**: Launch the selected game
 - **f**: Toggle the selected game as a favorite
 - **r**: Rescan the current console
@@ -171,7 +175,7 @@ Ignored while the filter entry is focused, except Escape, `/`, and Tab.
 
 A gamepad is optional. Buttons follow the SDL / Xbox layout (South is the bottom face button: Xbox A, PlayStation Cross, Nintendo B):
 
-- **Left stick or d-pad**: Move. On the systems list, up and down change console. On the game grid, the stick and d-pad match the arrow keys (one tile left or right, six tiles up or down). The stick fires one step per push and must return near center before the next step. The d-pad is one step per press.
+- **Left stick or d-pad**: Move, same as the arrow keys on the focused pane (systems list or game grid). Holding the direction repeats: one step right away, then a pause, then a slow repeat that speeds up. The stick counts as held once it passes the on-threshold and lets go when it returns near center. **Options → Input** stores that timing in `[input]`.
 - **A (South)**: From the systems list, move into that console’s games. On a game, launch it (same as Enter).
 - **B (East)**: From the game grid, return to the systems list.
 - **Y (North)**: Toggle the focused game as a favorite. Does nothing when focus is on the systems list.
