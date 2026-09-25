@@ -2,7 +2,7 @@
 
 A LaunchBox-style retro game launcher for Omarchy (Arch + Hyprland), built with Rust, GTK4, and libadwaita.
 
-The window is keyboard-first: a console sidebar on the left, a game grid in the center, and a collapsible details pane on the right. With nothing selected, the pane shows console info (bundled manufacturer, year, and description when that system is in `console_metadata.toml`, plus library stats). With a game selected, it shows box art, title screen, and screenshot when those files exist, plus title, console, ROM path, CRC32, a **Play** button, and play stats.
+The window is keyboard-first: a console sidebar on the left, a game grid in the center, and a collapsible details pane on the right. With nothing selected, the pane shows console info (bundled manufacturer, year, and description when that system is in `console_metadata.toml`, plus library stats). With a game selected, it shows box art and a screenshot when those files exist, plus title, console, ROM path, CRC32, a **Play** button, and play stats.
 
 The default look follows the Omarchy / libadwaita system theme. A header button (tooltip **Toggle Theme**, or `t`) switches to an optional LaunchBox-like dark theme. The choice is saved as `theme = "system"` or `theme = "launchbox"`.
 
@@ -15,7 +15,7 @@ The default look follows the Omarchy / libadwaita system theme. A header button 
 - When `retroarch` is on `PATH`, **Manage Emulators** lists local cores and can add a profile or add-and-assign it to a known system. You can still type a path or **Browse…** for a `.so`. Cores are not downloaded.
 - Launch uses the game’s profile, or the console’s default profile. After the process exits, last played, play count, and play time are updated.
 - ROM scan computes CRC32 and discovers local sidecars (box art, screenshot, manual, video) when those toggles are on.
-- Manual artwork scrape only: box art, title screen, and screenshot (one file per kind). Providers are ScreenScraper, then TheGamesDB, in that order unless you change it. The scraper does not download ROMs or BIOS.
+- Manual artwork scrape only: box art and screenshot (one file per kind). Providers are ScreenScraper, then TheGamesDB, in that order unless you change it. The scraper does not download ROMs or BIOS.
 
 ## Build (Arch)
 
@@ -54,7 +54,7 @@ You do not need to copy `config.example.toml` first. Start the app; a missing co
 3. Select a console in the sidebar, then a game. **Play** or Enter launches it.
 4. Artwork is optional and manual. **Scraper** (Ctrl+G) stores credentials. **Scrape** (`s`) fetches missing artwork for the selected game. **Scrape Missing** (Shift+S) does the same for every game on the current system. Kinds that already have a file are skipped.
 
-The header combo (tooltip **Grid artwork for this system**) chooses what the grid prefers for the current console: **Box art**, **Title screen**, or **Screenshot** (`1` / `2` / `3`). If that file is missing, the grid falls back to the other two. `/` opens the filter (**Filter games...**). Escape closes the filter, or clears the game selection and returns the details pane to console info.
+The header combo (tooltip **Grid artwork for this system**) chooses what the grid prefers for the current console: **Box art** or **Screenshot** (`1` / `2`). If that file is missing, the grid falls back to the other one. An older `grid_art = "title_screen"` value is read as box art. `/` opens the filter (**Filter games...**). Escape closes the filter, or clears the game selection and returns the details pane to console info.
 
 ## Configuration
 
@@ -87,7 +87,7 @@ id = "dolphin"
 command = "dolphin-emu -b -e {rom}"
 ```
 
-**Console** (`grid_art` is `box_art`, `title_screen`, or `screenshot`; default `box_art`). `media` only controls local sidecar discovery, not the scraper:
+**Console** (`grid_art` is `box_art` or `screenshot`; default `box_art`). `media` only controls local sidecar discovery, not the scraper:
 
 ```toml
 [[consoles]]
@@ -116,18 +116,17 @@ On scan, next to the ROM or in a subdirectory of the ROM’s folder (first match
 - **Manual**: `<rom_stem>.pdf` or `.txt`, or `manual/`
 - **Video**: `<rom_stem>.mp4`, `.mkv`, or `.avi`, or `video/`
 
-Title screens are not picked up as local sidecars. They come from the scraper. Manuals and videos are local only; the scraper does not fetch them.
+Manuals and videos are local only; the scraper does not fetch them. Title-screen files already on disk are left in place and are not shown or scraped.
 
 ## Scraper
 
 Open **Scraper** in the header or press Ctrl+G (**Scraper settings**). It saves the `[scraper]` table. Scrapes run only from **Scrape** / `s` and **Scrape Missing** / Shift+S. Import and rescan do not call the network.
 
-Enabled kinds are box art, title screen, and screenshot. Each missing kind walks the provider list and stops at the first hit. Default order is ScreenScraper, then TheGamesDB. Reorder with **Up** / **Down**, or edit the list.
+Enabled kinds are box art and screenshot. Each missing kind walks the provider list and stops at the first hit. Default order is ScreenScraper, then TheGamesDB. Reorder with **Up** / **Down**, or edit the list.
 
 ```toml
 [scraper]
 box_art = true
-title_screen = true
 screenshot = true
 
 [[scraper.providers]]
@@ -146,7 +145,7 @@ thegamesdb_api_key = ""
 
 ScreenScraper needs a free member username and password. The application Softname is built into the binary; it is not something you paste. TheGamesDB needs `thegamesdb_api_key`. Member credentials stay in this file. Older configs may still contain `screenscraper_dev_id` and `screenscraper_dev_password`; those keys are ignored and are not written back.
 
-Images are written to `~/.local/share/retromarchy/media/<console>/<game-id>/<kind>.<ext>` (`box_art`, `title_screen`, or `screenshot`; png, jpg, gif, or webp). One file per kind. The `media` table in the library database records the path. Archive, ROM, BIOS, manual, and video URLs are rejected.
+Images are written to `~/.local/share/retromarchy/media/<console>/<game-id>/<kind>.<ext>` (`box_art` or `screenshot`; png, jpg, gif, or webp). One file per kind. The `media` table in the library database records the path. Archive, ROM, BIOS, manual, and video URLs are rejected. Older `title_screen` rows are ignored and their files are not deleted.
 
 ## Keybindings
 
@@ -160,7 +159,7 @@ Ignored while the filter entry is focused, except Escape, `/`, and Tab.
 - **Ctrl+G**: Scraper settings
 - **Ctrl+I**: Import ROMs
 - **Ctrl+E** or **Ctrl+M**: Manage Emulators
-- **1 / 2 / 3**: Grid artwork for this system (box art, title screen, screenshot)
+- **1 / 2**: Grid artwork for this system (box art, screenshot)
 - **/**: Toggle the game filter
 - **Escape**: Close the filter, or clear the selection
 - **d**: Show or hide the details pane

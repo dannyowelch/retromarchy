@@ -90,18 +90,18 @@ mod tests {
                 rom_dirs: vec![],
                 extensions: vec!["sfc".into()],
                 profile: None,
-                grid_art: GridArt::TitleScreen,
+                grid_art: GridArt::Screenshot,
                 media: MediaToggles::default(),
             }],
             ..Config::default()
         };
         let text = toml::to_string_pretty(&config).unwrap();
         assert!(
-            text.contains("grid_art = 'title_screen'") || text.contains("grid_art = \"title_screen\""),
+            text.contains("grid_art = 'screenshot'") || text.contains("grid_art = \"screenshot\""),
             "{text}"
         );
         let back: Config = toml::from_str(&text).unwrap();
-        assert_eq!(back.consoles[0].grid_art, GridArt::TitleScreen);
+        assert_eq!(back.consoles[0].grid_art, GridArt::Screenshot);
         assert_eq!(back.scraper.providers.len(), 2);
     }
 
@@ -127,6 +127,35 @@ thegamesdb_api_key = "key"
         assert!(!text.contains("screenscraper_dev_id"));
         assert!(!text.contains("screenscraper_dev_password"));
         assert!(!text.contains("leftover"));
+    }
+
+    #[test]
+    fn title_screen_grid_art_loads_as_box_art() {
+        let raw = r#"
+[[consoles]]
+id = "nes"
+name = "NES"
+rom_dirs = []
+extensions = ["nes"]
+grid_art = "title_screen"
+
+[consoles.media]
+box_art = true
+screenshot = true
+manual = false
+video = false
+
+[scraper]
+box_art = true
+title_screen = true
+screenshot = false
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+        assert_eq!(config.consoles[0].grid_art, GridArt::BoxArt);
+        assert!(config.scraper.box_art);
+        assert!(!config.scraper.screenshot);
+        let text = toml::to_string(&config).unwrap();
+        assert!(!text.contains("title_screen"));
     }
 }
 

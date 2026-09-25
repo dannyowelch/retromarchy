@@ -69,7 +69,6 @@ video = false
 # The scraper never downloads ROMs or BIOS.
 [scraper]
 box_art = true
-title_screen = true
 screenshot = true
 
 [[scraper.providers]]
@@ -85,7 +84,8 @@ screenscraper_user = ""
 screenscraper_password = ""
 thegamesdb_api_key = ""
 
-# Per console, grid_art is box_art, title_screen, or screenshot (default box_art).
+# Per console, grid_art is box_art or screenshot (default box_art).
+# An older title_screen value is read as box_art.
 # [[consoles]]
 # grid_art = "box_art"
 

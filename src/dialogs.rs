@@ -960,7 +960,7 @@ pub fn open_scraper(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config>>
     page.append(&title);
 
     let hint = Label::new(Some(
-        "Downloads box art, title screens, and screenshots only. ROMs and BIOS are never downloaded.",
+        "Downloads box art and screenshots only. ROMs and BIOS are never downloaded.",
     ));
     hint.set_wrap(true);
     hint.set_halign(Align::Start);
@@ -970,12 +970,9 @@ pub fn open_scraper(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config>>
     let scraper = config.borrow().scraper.clone();
     let box_art = CheckButton::with_label("Box art");
     box_art.set_active(scraper.box_art);
-    let title_screen = CheckButton::with_label("Title screen");
-    title_screen.set_active(scraper.title_screen);
     let screenshot = CheckButton::with_label("Screenshot");
     screenshot.set_active(scraper.screenshot);
     page.append(&box_art);
-    page.append(&title_screen);
     page.append(&screenshot);
 
     let providers_label = Label::new(Some("Providers, highest priority first"));
@@ -1039,7 +1036,6 @@ pub fn open_scraper(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config>>
         let mut cfg = config.borrow_mut();
         cfg.scraper = ScraperConfig {
             box_art: box_art.is_active(),
-            title_screen: title_screen.is_active(),
             screenshot: screenshot.is_active(),
             providers: providers.borrow().clone(),
             credentials: ScraperCredentials {

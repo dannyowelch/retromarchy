@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 
 pub type ConsoleId = String;
@@ -45,11 +45,10 @@ pub enum MediaKind {
 }
 
 /// Artwork the grid shows for a console. Stored on the console, not the scraper.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GridArt {
     BoxArt,
-    TitleScreen,
     Screenshot,
 }
 
@@ -63,7 +62,6 @@ impl GridArt {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::BoxArt => "box_art",
-            Self::TitleScreen => "title_screen",
             Self::Screenshot => "screenshot",
         }
     }
@@ -71,26 +69,38 @@ impl GridArt {
     pub fn label(self) -> &'static str {
         match self {
             Self::BoxArt => "Box art",
-            Self::TitleScreen => "Title screen",
             Self::Screenshot => "Screenshot",
         }
     }
 
-    /// Preferred kind, then the other two v1 kinds.
-    pub fn fallback(self) -> [MediaKind; 3] {
+    /// Preferred kind, then the other scrape kind.
+    pub fn fallback(self) -> [MediaKind; 2] {
         match self {
-            Self::BoxArt => [MediaKind::BoxArt, MediaKind::TitleScreen, MediaKind::Screenshot],
-            Self::TitleScreen => [MediaKind::TitleScreen, MediaKind::BoxArt, MediaKind::Screenshot],
-            Self::Screenshot => [MediaKind::Screenshot, MediaKind::BoxArt, MediaKind::TitleScreen],
+            Self::BoxArt => [MediaKind::BoxArt, MediaKind::Screenshot],
+            Self::Screenshot => [MediaKind::Screenshot, MediaKind::BoxArt],
         }
     }
 
     pub fn parse(id: &str) -> Option<Self> {
         match id {
-            "box_art" => Some(Self::BoxArt),
-            "title_screen" => Some(Self::TitleScreen),
+            "box_art" | "title_screen" => Some(Self::BoxArt),
             "screenshot" => Some(Self::Screenshot),
             _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GridArt {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "screenshot" => Ok(Self::Screenshot),
+            // Older configs stored title_screen. That preference is box art now.
+            "box_art" | "title_screen" => Ok(Self::BoxArt),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["box_art", "screenshot"],
+            )),
         }
     }
 }
@@ -100,8 +110,6 @@ impl GridArt {
 pub struct ScraperConfig {
     #[serde(default = "default_true")]
     pub box_art: bool,
-    #[serde(default = "default_true")]
-    pub title_screen: bool,
     #[serde(default = "default_true")]
     pub screenshot: bool,
     #[serde(default = "default_providers")]
@@ -131,7 +139,6 @@ impl Default for ScraperConfig {
     fn default() -> Self {
         Self {
             box_art: true,
-            title_screen: true,
             screenshot: true,
             providers: default_providers(),
             credentials: ScraperCredentials::default(),
@@ -144,9 +151,6 @@ impl ScraperConfig {
         let mut kinds = Vec::new();
         if self.box_art {
             kinds.push(MediaKind::BoxArt);
-        }
-        if self.title_screen {
-            kinds.push(MediaKind::TitleScreen);
         }
         if self.screenshot {
             kinds.push(MediaKind::Screenshot);
