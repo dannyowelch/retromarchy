@@ -1,0 +1,70 @@
+# Retromarchy Configuration Example
+# Copy this to ~/.config/retromarchy/config.toml and adjust paths
+
+# Emulator profiles define how to launch games
+[[profiles]]
+type = "RetroArch"
+id = "retroarch-snes9x"
+core = "/usr/lib/libretro/snes9x_libretro.so"
+# config = "/home/user/.config/retroarch/snes.cfg"  # Optional
+
+[[profiles]]
+type = "RetroArch"
+id = "retroarch-genesis-plus-gx"
+core = "/usr/lib/libretro/genesis_plus_gx_libretro.so"
+
+[[profiles]]
+type = "Standalone"
+id = "dolphin"
+command = "dolphin-emu -b -e {rom}"
+
+[[profiles]]
+type = "Standalone"
+id = "pcsx2"
+command = "pcsx2 --fullscreen {rom}"
+
+# Console definitions
+[[consoles]]
+id = "snes"
+name = "Super Nintendo"
+rom_dirs = ["/home/user/roms/snes"]
+extensions = ["sfc", "smc", "zip"]
+profile = "retroarch-snes9x"
+
+[consoles.media]
+box_art = true
+screenshot = true
+manual = false
+video = false
+
+[[consoles]]
+id = "genesis"
+name = "Sega Genesis"
+rom_dirs = ["/home/user/roms/genesis"]
+extensions = ["md", "bin", "zip"]
+profile = "retroarch-genesis-plus-gx"
+
+[consoles.media]
+box_art = true
+screenshot = true
+manual = false
+video = false
+
+[[consoles]]
+id = "gamecube"
+name = "Nintendo GameCube"
+rom_dirs = ["/home/user/roms/gamecube"]
+extensions = ["iso", "gcm"]
+profile = "dolphin"
+
+[consoles.media]
+box_art = true
+screenshot = false
+manual = false
+video = false
+
+# Media discovery convention:
+# Box art: <rom_name>.png/jpg/jpeg in same dir or box_art/ subdir
+# Screenshot: <rom_name>.png/jpg/jpeg in same dir or screenshot/ subdir
+# Manual: <rom_name>.pdf/txt in same dir or manual/ subdir
+# Video: <rom_name>.mp4/mkv/avi in same dir or video/ subdir

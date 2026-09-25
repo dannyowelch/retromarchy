@@ -1,0 +1,4 @@
+/target
+*-verification/
+test-keyboard/
+test-screenshot-*.png

@@ -1,0 +1,20 @@
+[package]
+name = "retromarchy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk4 = "0.9"
+libadwaita = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.5.11"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+crc32fast = "1.4"
+xdg = "2.5"
+anyhow = "1.0"
+regex = "1.10"
+shell-words = "1.1"
+
+[dev-dependencies]
+tempfile = "3.12"
