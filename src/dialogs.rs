@@ -1,11 +1,12 @@
 use crate::catalog;
 use crate::config::{self, Config};
+use crate::cores::{self, CoreProfile, DiscoveredCore};
 use crate::importer::{self, FoundFolder, ImportChoice};
 use crate::types::EmulatorProfile;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box, Button, CheckButton, ComboBoxText, Entry, FileChooserAction, FileChooserDialog,
-    Label, ListBox, Orientation, PolicyType, ResponseType, ScrolledWindow, Window,
+    FileFilter, Label, ListBox, Orientation, PolicyType, ResponseType, ScrolledWindow, Window,
 };
 use libadwaita as adw;
 use rusqlite::Connection;
@@ -81,7 +82,9 @@ fn show_esde(
     page.set_margin_start(12);
     page.set_margin_end(12);
 
-    let label = Label::new(Some("ROMs root (immediate subfolders are matched to systems)"));
+    let label = Label::new(Some(
+        "ROMs root (immediate subfolders are matched to systems)",
+    ));
     label.set_halign(Align::Start);
     label.set_wrap(true);
     page.append(&label);
@@ -99,7 +102,10 @@ fn show_esde(
             Some("Choose ROMs folder"),
             Some(&parent_browse),
             FileChooserAction::SelectFolder,
-            &[("Cancel", ResponseType::Cancel), ("Select", ResponseType::Accept)],
+            &[
+                ("Cancel", ResponseType::Cancel),
+                ("Select", ResponseType::Accept),
+            ],
         );
         let entry = entry_browse.clone();
         dialog.connect_response(move |dialog, response| {
@@ -123,7 +129,13 @@ fn show_esde(
     next.connect_clicked(move |_| {
         let root = PathBuf::from(entry.text().as_str());
         let found = importer::discover_root(&root);
-        show_checklist(&parent_next, found, config.clone(), conn.clone(), on_done.clone());
+        show_checklist(
+            &parent_next,
+            found,
+            config.clone(),
+            conn.clone(),
+            on_done.clone(),
+        );
     });
     page.append(&next);
     parent.set_child(Some(&page));
@@ -150,7 +162,9 @@ fn show_checklist(
     page.set_margin_start(12);
     page.set_margin_end(12);
 
-    let label = Label::new(Some("Check systems to import. Unmatched folders stay listed so you can remap them."));
+    let label = Label::new(Some(
+        "Check systems to import. Unmatched folders stay listed so you can remap them.",
+    ));
     label.set_wrap(true);
     label.set_halign(Align::Start);
     page.append(&label);
@@ -192,10 +206,13 @@ fn show_checklist(
         });
         row_box.append(&check);
 
-        let system = folder.matched_id.as_deref().and_then(|id| {
-            catalog::systems().iter().find(|s| s.folder_id == id)
-        });
-        let name = system.map(|s| s.display_name.as_str()).unwrap_or("Unmatched");
+        let system = folder
+            .matched_id
+            .as_deref()
+            .and_then(|id| catalog::systems().iter().find(|s| s.folder_id == id));
+        let name = system
+            .map(|s| s.display_name.as_str())
+            .unwrap_or("Unmatched");
         let text = Label::new(Some(&format!(
             "{name}\n{} · {} files",
             folder.folder_name, folder.file_count
@@ -218,7 +235,10 @@ fn show_checklist(
         let rows_combo = rows.clone();
         combo.connect_changed(move |combo| {
             if let Some(row) = rows_combo.borrow_mut().get_mut(index) {
-                row.system_id = combo.active_id().filter(|id| !id.is_empty()).map(|id| id.to_string());
+                row.system_id = combo
+                    .active_id()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| id.to_string());
             }
         });
         row_box.append(&combo);
@@ -308,7 +328,10 @@ fn show_single(
                 {
                     continue;
                 }
-                let label = Label::new(Some(&format!("{} ({})", system.display_name, system.folder_id)));
+                let label = Label::new(Some(&format!(
+                    "{} ({})",
+                    system.display_name, system.folder_id
+                )));
                 label.set_widget_name(&system.folder_id);
                 label.set_halign(Align::Start);
                 label.set_margin_top(6);
@@ -323,7 +346,10 @@ fn show_single(
 
     let selected_search = selected.clone();
     list.connect_row_selected(move |_, row| {
-        *selected_search.borrow_mut() = row.and_then(|row| row.child()).map(|child| child.widget_name().to_string()).filter(|id| !id.is_empty());
+        *selected_search.borrow_mut() = row
+            .and_then(|row| row.child())
+            .map(|child| child.widget_name().to_string())
+            .filter(|id| !id.is_empty());
     });
 
     let list_filter = list.clone();
@@ -341,7 +367,10 @@ fn show_single(
             {
                 continue;
             }
-            let label = Label::new(Some(&format!("{} ({})", system.display_name, system.folder_id)));
+            let label = Label::new(Some(&format!(
+                "{} ({})",
+                system.display_name, system.folder_id
+            )));
             label.set_widget_name(&system.folder_id);
             label.set_halign(Align::Start);
             label.set_margin_top(6);
@@ -359,7 +388,13 @@ fn show_single(
         let Some(system_id) = selected.borrow().clone() else {
             return;
         };
-        show_single_folder(&parent_next, system_id, config.clone(), conn.clone(), on_done.clone());
+        show_single_folder(
+            &parent_next,
+            system_id,
+            config.clone(),
+            conn.clone(),
+            on_done.clone(),
+        );
     });
     page.append(&next);
     parent.set_child(Some(&page));
@@ -400,7 +435,10 @@ fn show_single_folder(
             Some("Choose system folder"),
             Some(&parent_b),
             FileChooserAction::SelectFolder,
-            &[("Cancel", ResponseType::Cancel), ("Select", ResponseType::Accept)],
+            &[
+                ("Cancel", ResponseType::Cancel),
+                ("Select", ResponseType::Accept),
+            ],
         );
         let entry = entry_b.clone();
         dialog.connect_response(move |dialog, response| {
@@ -440,13 +478,29 @@ fn show_single_folder(
     parent.set_child(Some(&page));
 }
 
-pub fn open_emulators(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config>>, on_done: Rc<dyn Fn()>) {
+#[derive(Clone)]
+struct EmulatorDialog {
+    profiles: ListBox,
+    profiles_scroll: ScrolledWindow,
+    consoles: ListBox,
+    cores: ListBox,
+    cores_scroll: ScrolledWindow,
+    cores_empty: Label,
+    config: Rc<RefCell<Config>>,
+    show_cores: bool,
+}
+
+pub fn open_emulators(
+    parent: &adw::ApplicationWindow,
+    config: Rc<RefCell<Config>>,
+    on_done: Rc<dyn Fn()>,
+) {
     let window = Window::builder()
         .title("Manage Emulators")
         .modal(true)
         .transient_for(parent)
-        .default_width(640)
-        .default_height(560)
+        .default_width(720)
+        .default_height(760)
         .build();
 
     let page = Box::new(Orientation::Vertical, 8);
@@ -460,53 +514,128 @@ pub fn open_emulators(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config
     heading.set_halign(Align::Start);
     page.append(&heading);
 
-    if which_retroarch() {
-        let note = Label::new(Some("retroarch is on PATH. Pick a core file to make a RetroArch profile. Cores are not downloaded."));
+    let show_cores = which_retroarch();
+    let cores_heading = Label::new(Some("Discovered cores"));
+    cores_heading.add_css_class("title-4");
+    cores_heading.set_halign(Align::Start);
+    cores_heading.set_visible(show_cores);
+    let cores_empty = Label::new(Some(
+        "No cores found in the usual directories. Paste a core path or browse for a .so file. Cores are not downloaded.",
+    ));
+    cores_empty.set_wrap(true);
+    cores_empty.set_halign(Align::Start);
+    cores_empty.add_css_class("dim-label");
+    cores_empty.set_visible(false);
+    let cores_scroll = ScrolledWindow::builder()
+        .vexpand(true)
+        .min_content_height(160)
+        .hscrollbar_policy(PolicyType::Never)
+        .build();
+    let cores = ListBox::new();
+    cores.add_css_class("boxed-list");
+    cores.set_selection_mode(gtk4::SelectionMode::None);
+    cores_scroll.set_child(Some(&cores));
+
+    if show_cores {
+        let note = Label::new(Some(
+            "retroarch is on PATH. Pick a discovered core or a core file to make a RetroArch profile. Cores are not downloaded.",
+        ));
         note.set_wrap(true);
         note.set_halign(Align::Start);
         note.add_css_class("dim-label");
         page.append(&note);
+        page.append(&cores_heading);
+        page.append(&cores_empty);
+        page.append(&cores_scroll);
     }
 
     let profiles_scroll = ScrolledWindow::builder()
-        .vexpand(true)
-        .min_content_height(140)
+        .min_content_height(48)
         .hscrollbar_policy(PolicyType::Never)
         .build();
-    let profiles_list = ListBox::new();
-    profiles_list.add_css_class("boxed-list");
-    profiles_scroll.set_child(Some(&profiles_list));
+    let profiles = ListBox::new();
+    profiles.add_css_class("boxed-list");
+    profiles_scroll.set_child(Some(&profiles));
     page.append(&profiles_scroll);
 
     let consoles_scroll = ScrolledWindow::builder()
         .vexpand(true)
-        .min_content_height(140)
+        .min_content_height(120)
         .hscrollbar_policy(PolicyType::Never)
         .build();
-    let consoles_list = ListBox::new();
-    consoles_list.add_css_class("boxed-list");
-    consoles_scroll.set_child(Some(&consoles_list));
+    let consoles = ListBox::new();
+    consoles.add_css_class("boxed-list");
+    consoles_scroll.set_child(Some(&consoles));
 
-    let profiles_list_r = profiles_list.clone();
-    let consoles_list_r = consoles_list.clone();
-    let config_r = config.clone();
-    let refresh: Rc<dyn Fn()> = Rc::new(move || {
-        fill_profiles(&profiles_list_r, &config_r);
-        fill_consoles(&consoles_list_r, &config_r);
-    });
-    refresh();
+    let dialog = EmulatorDialog {
+        profiles,
+        profiles_scroll,
+        consoles,
+        cores,
+        cores_scroll,
+        cores_empty,
+        config: config.clone(),
+        show_cores,
+    };
+    dialog.reload();
 
     let id_entry = Entry::builder().placeholder_text("Profile id").build();
-    let detail_entry = Entry::builder().placeholder_text("Command with {rom}, or core path").build();
+    let detail_entry = Entry::builder()
+        .placeholder_text("Command with {rom}, or core path")
+        .hexpand(true)
+        .build();
     let kind = ComboBoxText::new();
     kind.append(Some("standalone"), "Standalone");
     kind.append(Some("retroarch"), "RetroArch");
     kind.set_active_id(Some("standalone"));
 
+    let path_row = Box::new(Orientation::Horizontal, 8);
+    path_row.append(&detail_entry);
+    let browse = Button::with_label("Browse…");
+    let window_browse = window.clone();
+    let detail_browse = detail_entry.clone();
+    let id_browse = id_entry.clone();
+    let kind_browse = kind.clone();
+    browse.connect_clicked(move |_| {
+        let chooser = FileChooserDialog::new(
+            Some("Choose libretro core"),
+            Some(&window_browse),
+            FileChooserAction::Open,
+            &[
+                ("Cancel", ResponseType::Cancel),
+                ("Select", ResponseType::Accept),
+            ],
+        );
+        let filter = FileFilter::new();
+        filter.set_name(Some("Libretro cores (*.so)"));
+        filter.add_pattern("*.so");
+        chooser.set_filter(&filter);
+        let detail = detail_browse.clone();
+        let id_entry = id_browse.clone();
+        let kind = kind_browse.clone();
+        chooser.connect_response(move |chooser, response| {
+            if response == ResponseType::Accept {
+                if let Some(file) = chooser.file() {
+                    if let Some(path) = file.path() {
+                        detail.set_text(&path.display().to_string());
+                        kind.set_active_id(Some("retroarch"));
+                        if id_entry.text().is_empty() {
+                            if let Some(core) = DiscoveredCore::from_path(path) {
+                                id_entry.set_text(&core.name);
+                            }
+                        }
+                    }
+                }
+            }
+            chooser.close();
+        });
+        chooser.show();
+    });
+    path_row.append(&browse);
+
     let add = Button::with_label("Add profile");
     add.add_css_class("suggested-action");
-    let config_add = config.clone();
-    let refresh_add = refresh.clone();
+    let dialog_add = dialog.clone();
     let kind_add = kind.clone();
     let id_add = id_entry.clone();
     let detail_add = detail_entry.clone();
@@ -523,18 +652,21 @@ pub fn open_emulators(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config
                 config: None,
             }
         } else {
-            EmulatorProfile::Standalone { id, command: detail }
+            EmulatorProfile::Standalone {
+                id,
+                command: detail,
+            }
         };
-        config_add.borrow_mut().profiles.push(profile);
-        let _ = config::save_config(&config_add.borrow());
+        dialog_add.config.borrow_mut().profiles.push(profile);
+        let _ = config::save_config(&dialog_add.config.borrow());
         id_add.set_text("");
         detail_add.set_text("");
-        refresh_add();
+        dialog_add.reload();
     });
 
     page.append(&kind);
     page.append(&id_entry);
-    page.append(&detail_entry);
+    page.append(&path_row);
     page.append(&add);
 
     let assign = Label::new(Some("Default profile per system"));
@@ -560,38 +692,194 @@ pub fn open_emulators(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config
     window.present();
 }
 
-fn fill_profiles(list: &ListBox, config: &Rc<RefCell<Config>>) {
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
+impl EmulatorDialog {
+    fn reload(&self) {
+        self.fill_profiles();
+        fill_consoles(&self.consoles, &self.config);
+        self.fill_cores();
     }
-    let cfg = config.borrow();
-    for profile in &cfg.profiles {
+
+    fn add_core(&self, core: &DiscoveredCore, assign_console: Option<String>) {
+        {
+            let mut cfg = self.config.borrow_mut();
+            let id = match core.to_profile(&cfg.profiles) {
+                CoreProfile::AlreadyAdded { id } => id,
+                CoreProfile::New(profile) => {
+                    let id = profile.id().clone();
+                    cfg.profiles.push(profile);
+                    id
+                }
+            };
+            if let Some(console_id) = assign_console {
+                if let Some(console) = cfg
+                    .consoles
+                    .iter_mut()
+                    .find(|console| console.id == console_id)
+                {
+                    console.profile = Some(id);
+                }
+            }
+            let _ = config::save_config(&cfg);
+        }
+        self.reload();
+    }
+
+    fn fill_profiles(&self) {
+        while let Some(child) = self.profiles.first_child() {
+            self.profiles.remove(&child);
+        }
+        let profiles = self.config.borrow().profiles.clone();
+        let empty = profiles.is_empty();
+        self.profiles_scroll.set_vexpand(!empty || !self.show_cores);
+        self.profiles_scroll
+            .set_min_content_height(if empty { 48 } else { 100 });
+        for profile in profiles {
+            let row = Box::new(Orientation::Horizontal, 8);
+            row.set_margin_top(6);
+            row.set_margin_bottom(6);
+            row.set_margin_start(8);
+            row.set_margin_end(8);
+            let text = match &profile {
+                EmulatorProfile::RetroArch { id, core, .. } => {
+                    format!("{id} · RetroArch · {}", core.display())
+                }
+                EmulatorProfile::Standalone { id, command } => format!("{id} · {command}"),
+            };
+            let label = Label::new(Some(&text));
+            label.set_halign(Align::Start);
+            label.set_hexpand(true);
+            label.set_wrap(true);
+            row.append(&label);
+            let delete = Button::with_label("Delete");
+            delete.add_css_class("destructive-action");
+            let id = profile.id().clone();
+            let dialog = self.clone();
+            delete.connect_clicked(move |_| {
+                dialog
+                    .config
+                    .borrow_mut()
+                    .profiles
+                    .retain(|profile| profile.id() != &id);
+                let _ = config::save_config(&dialog.config.borrow());
+                dialog.reload();
+            });
+            row.append(&delete);
+            self.profiles.append(&row);
+        }
+    }
+
+    fn fill_cores(&self) {
+        while let Some(child) = self.cores.first_child() {
+            self.cores.remove(&child);
+        }
+        if !self.show_cores {
+            return;
+        }
+        let discovered = cores::discover_cores();
+        self.cores_empty.set_visible(discovered.is_empty());
+        self.cores_scroll.set_visible(!discovered.is_empty());
+        let consoles: Vec<(String, String, Option<String>)> = self
+            .config
+            .borrow()
+            .consoles
+            .iter()
+            .map(|console| {
+                (
+                    console.id.clone(),
+                    console.name.clone(),
+                    console.profile.clone(),
+                )
+            })
+            .collect();
+        let existing = self.config.borrow().profiles.clone();
+        for core in discovered {
+            self.cores
+                .append(&self.core_row(&core, &consoles, &existing));
+        }
+    }
+
+    fn core_row(
+        &self,
+        core: &DiscoveredCore,
+        consoles: &[(String, String, Option<String>)],
+        existing: &[EmulatorProfile],
+    ) -> Box {
         let row = Box::new(Orientation::Horizontal, 8);
         row.set_margin_top(6);
         row.set_margin_bottom(6);
         row.set_margin_start(8);
         row.set_margin_end(8);
-        let text = match profile {
-            EmulatorProfile::RetroArch { id, core, .. } => format!("{id} · RetroArch · {}", core.display()),
-            EmulatorProfile::Standalone { id, command } => format!("{id} · {command}"),
+
+        let text = Box::new(Orientation::Vertical, 2);
+        text.set_hexpand(true);
+        let name = Label::new(Some(&core.name));
+        name.set_halign(Align::Start);
+        name.set_xalign(0.0);
+        let path = Label::new(Some(&core.path.display().to_string()));
+        path.set_halign(Align::Start);
+        path.set_xalign(0.0);
+        path.set_wrap(true);
+        path.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        path.add_css_class("dim-label");
+        path.add_css_class("caption");
+        path.set_tooltip_text(Some(&core.path.display().to_string()));
+        path.set_selectable(true);
+        text.append(&name);
+        text.append(&path);
+        row.append(&text);
+
+        let actions = Box::new(Orientation::Vertical, 4);
+        actions.set_valign(Align::Center);
+        let resolved = core.to_profile(existing);
+        let add = match &resolved {
+            CoreProfile::AlreadyAdded { .. } => {
+                let button = Button::with_label("Added");
+                button.set_sensitive(false);
+                button
+            }
+            CoreProfile::New(_) => {
+                let button = Button::with_label("Add profile");
+                let dialog = self.clone();
+                let core = core.clone();
+                button.connect_clicked(move |_| dialog.add_core(&core, None));
+                button
+            }
         };
-        let label = Label::new(Some(&text));
-        label.set_halign(Align::Start);
-        label.set_hexpand(true);
-        label.set_wrap(true);
-        row.append(&label);
-        let delete = Button::with_label("Delete");
-        delete.add_css_class("destructive-action");
-        let id = profile.id().clone();
-        let config_del = config.clone();
-        let list_del = list.clone();
-        delete.connect_clicked(move |_| {
-            config_del.borrow_mut().profiles.retain(|p| p.id() != &id);
-            let _ = config::save_config(&config_del.borrow());
-            fill_profiles(&list_del, &config_del);
-        });
-        row.append(&delete);
-        list.append(&row);
+        actions.append(&add);
+
+        let added_id = match &resolved {
+            CoreProfile::AlreadyAdded { id } => Some(id.clone()),
+            CoreProfile::New(_) => None,
+        };
+        for system_id in core.system_ids() {
+            let Some((console_id, console_name, current)) =
+                consoles.iter().find(|(id, _, _)| id == system_id)
+            else {
+                continue;
+            };
+            let assigned = added_id
+                .as_ref()
+                .is_some_and(|id| current.as_ref() == Some(id));
+            let label = if assigned {
+                format!("Assigned to {console_name}")
+            } else if added_id.is_some() {
+                format!("Assign to {console_name}")
+            } else {
+                format!("Add & assign to {console_name}")
+            };
+            let button = Button::with_label(&label);
+            button.add_css_class("suggested-action");
+            button.set_sensitive(!assigned);
+            if !assigned {
+                let dialog = self.clone();
+                let core = core.clone();
+                let console_id = console_id.clone();
+                button.connect_clicked(move |_| dialog.add_core(&core, Some(console_id.clone())));
+            }
+            actions.append(&button);
+        }
+        row.append(&actions);
+        row
     }
 }
 
@@ -628,13 +916,18 @@ fn fill_consoles(list: &ListBox, config: &Rc<RefCell<Config>>) {
         combo.connect_changed(move |combo| {
             let mut cfg = config_set.borrow_mut();
             if let Some(console) = cfg.consoles.iter_mut().find(|c| c.id == console_id) {
-                console.profile = combo.active_id().filter(|id| !id.is_empty()).map(|id| id.to_string());
+                console.profile = combo
+                    .active_id()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| id.to_string());
                 let _ = config::save_config(&cfg);
             }
         });
         row.append(&combo);
         list.append(&row);
-        if console.id == cfg.consoles.first().map(|c| c.id.as_str()).unwrap_or("") && !cfg.profiles.is_empty() {
+        if console.id == cfg.consoles.first().map(|c| c.id.as_str()).unwrap_or("")
+            && !cfg.profiles.is_empty()
+        {
             combo.grab_focus();
         }
     }
@@ -656,8 +949,6 @@ fn close_on_escape(window: &Window) {
 
 fn which_retroarch() -> bool {
     std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| dir.join("retroarch").is_file())
-        })
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("retroarch").is_file()))
         .unwrap_or(false)
 }
