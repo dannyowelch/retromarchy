@@ -56,6 +56,8 @@ fn process_rom(rom_path: &Path, console: &Console) -> Result<Option<Game>> {
         profile: None,
         media,
         last_played: None,
+        play_count: 0,
+        play_time: 0,
     }))
 }
 
@@ -185,7 +187,7 @@ mod tests {
             name: "Super Nintendo".to_string(),
             rom_dirs: vec![rom_dir.clone()],
             extensions: vec!["sfc".to_string()],
-            profile: "retroarch-snes9x".to_string(),
+            profile: Some("retroarch-snes9x".to_string()),
             media: MediaToggles::default(),
         };
 
@@ -222,7 +224,7 @@ mod tests {
             name: "Super Nintendo".to_string(),
             rom_dirs: vec![rom_dir.clone()],
             extensions: vec!["sfc".to_string()],
-            profile: "retroarch-snes9x".to_string(),
+            profile: Some("retroarch-snes9x".to_string()),
             media: MediaToggles {
                 box_art: true,
                 screenshot: false,

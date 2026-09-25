@@ -12,7 +12,8 @@ pub struct Console {
     pub name: String,
     pub rom_dirs: Vec<PathBuf>,
     pub extensions: Vec<String>,
-    pub profile: ProfileId,
+    #[serde(default)]
+    pub profile: Option<ProfileId>,
     pub media: MediaToggles,
 }
 
@@ -26,6 +27,8 @@ pub struct Game {
     pub profile: Option<ProfileId>,
     pub media: Vec<Media>,
     pub last_played: Option<DateTime<Utc>>,
+    pub play_count: u32,
+    pub play_time: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

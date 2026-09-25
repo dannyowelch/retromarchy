@@ -1,5 +1,8 @@
+mod catalog;
 mod config;
 mod database;
+mod dialogs;
+mod importer;
 mod launcher;
 mod scanner;
 mod types;
@@ -29,6 +32,19 @@ fn main() -> Result<()> {
 
 fn run_app(app: &adw::Application) -> Result<()> {
     let config = config::load_config()?;
+    
+    if std::env::var("RETROMARCHY_DEBUG").is_ok() {
+        let config_path = config::config_path()?;
+        eprintln!("Loaded config from: {}", config_path.display());
+        eprintln!("  Consoles: {}", config.consoles.len());
+        eprintln!("  Profiles: {}", config.profiles.len());
+        eprintln!("  Theme: {}", config.theme);
+        eprintln!("  Details visible: {}", config.details_visible);
+        
+        let db_path = database::db_path()?;
+        eprintln!("Database: {}", db_path.display());
+    }
+    
     let conn = Rc::new(RefCell::new(database::init_db()?));
 
     let ui = ui::App::new(app, config, conn)?;
