@@ -499,7 +499,7 @@ pub fn open_emulators(
         .title("Manage Emulators")
         .modal(true)
         .transient_for(parent)
-        .default_width(720)
+        .default_width(860)
         .default_height(760)
         .build();
 
@@ -528,7 +528,7 @@ pub fn open_emulators(
     cores_empty.set_visible(false);
     let cores_scroll = ScrolledWindow::builder()
         .vexpand(true)
-        .min_content_height(160)
+        .min_content_height(220)
         .hscrollbar_policy(PolicyType::Never)
         .build();
     let cores = ListBox::new();
@@ -815,20 +815,20 @@ impl EmulatorDialog {
         let name = Label::new(Some(&core.name));
         name.set_halign(Align::Start);
         name.set_xalign(0.0);
-        let path = Label::new(Some(&core.path.display().to_string()));
+        let path_text = core.path.display().to_string();
+        let path = Label::new(Some(&path_text));
         path.set_halign(Align::Start);
         path.set_xalign(0.0);
-        path.set_wrap(true);
-        path.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        path.set_hexpand(true);
+        path.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
         path.add_css_class("dim-label");
         path.add_css_class("caption");
-        path.set_tooltip_text(Some(&core.path.display().to_string()));
-        path.set_selectable(true);
+        path.set_tooltip_text(Some(&path_text));
         text.append(&name);
         text.append(&path);
         row.append(&text);
 
-        let actions = Box::new(Orientation::Vertical, 4);
+        let actions = Box::new(Orientation::Horizontal, 6);
         actions.set_valign(Align::Center);
         let resolved = core.to_profile(existing);
         let add = match &resolved {
@@ -867,7 +867,13 @@ impl EmulatorDialog {
             } else {
                 format!("Add & assign to {console_name}")
             };
-            let button = Button::with_label(&label);
+            let button_label = Label::new(Some(&label));
+            button_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            button_label.set_max_width_chars(32);
+            button_label.set_tooltip_text(Some(&label));
+            let button = Button::new();
+            button.set_child(Some(&button_label));
+            button.set_tooltip_text(Some(&label));
             button.add_css_class("suggested-action");
             button.set_sensitive(!assigned);
             if !assigned {
