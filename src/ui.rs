@@ -3,7 +3,7 @@ use crate::database;
 use crate::launcher;
 use crate::scanner;
 use crate::scraper::{self, pick_kind, present_kinds};
-use crate::types::{Game, GridArt, MediaKind};
+use crate::types::{Game, GridArt, Media, MediaKind};
 use anyhow::Result;
 use gtk4::gdk_pixbuf::Pixbuf;
 use gtk4::prelude::*;
@@ -609,21 +609,7 @@ impl App {
             let frame = gtk4::Frame::new(None);
             frame.add_css_class("rom-art");
             frame.set_size_request(150, 150);
-
-            if let Some(media) = Self::grid_tile_media(game, config) {
-                if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&media.path, 150, 150, true) {
-                    let picture = gtk4::Picture::for_pixbuf(&pixbuf);
-                    frame.set_child(Some(&picture));
-                } else {
-                    let label = gtk4::Label::new(Some("No Art"));
-                    label.add_css_class("title-4");
-                    frame.set_child(Some(&label));
-                }
-            } else {
-                let label = gtk4::Label::new(Some("No Art"));
-                label.add_css_class("title-4");
-                frame.set_child(Some(&label));
-            }
+            Self::set_tile_art(&frame, game, config);
 
             let title = gtk4::Label::new(Some(&game.title));
             title.set_wrap(true);
@@ -1528,10 +1514,10 @@ impl App {
         all_games: &Rc<RefCell<Vec<Game>>>,
         games: &Rc<RefCell<Vec<Game>>>,
         grid: &gtk4::FlowBox,
-        stack: &gtk4::Stack,
+        _stack: &gtk4::Stack,
         detail: &gtk4::Box,
         selected: &Rc<RefCell<Option<usize>>>,
-        search: &gtk4::SearchEntry,
+        _search: &gtk4::SearchEntry,
     ) {
         if *running.borrow() {
             Self::show_status(status, "A scrape is already running.");
@@ -1548,72 +1534,103 @@ impl App {
         let all_games = all_games.clone();
         let games = games.clone();
         let grid = grid.clone();
-        let stack = stack.clone();
         let detail = detail.clone();
         let selected = selected.clone();
-        let search = search.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-            loop {
-                match rx.try_recv() {
-                    Ok(scraper::ScrapeUpdate::Status(text)) => Self::show_status(&status, &text),
-                    Ok(scraper::ScrapeUpdate::Saved { game_id, media }) => {
-                        if database::set_game_media(&conn.borrow(), &game_id, &media).is_ok() {
-                            Self::reload_visible_games(&conn, &config, &all_games, &games, &grid, &stack, &detail, &selected, &search);
-                        }
-                    }
-                    Ok(scraper::ScrapeUpdate::Done(text)) => {
-                        Self::show_status(&status, &text);
-                        Self::reload_visible_games(&conn, &config, &all_games, &games, &grid, &stack, &detail, &selected, &search);
-                        *running.borrow_mut() = false;
-                        return glib::ControlFlow::Break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        *running.borrow_mut() = false;
-                        return glib::ControlFlow::Break;
-                    }
+            // One update per tick. A long scrape can queue many saves; draining
+            // them here would decode images and stall input on the main loop.
+            match rx.try_recv() {
+                Ok(scraper::ScrapeUpdate::Status(text)) => {
+                    Self::show_status(&status, &text);
+                    glib::ControlFlow::Continue
+                }
+                Ok(scraper::ScrapeUpdate::Saved { game_id, media }) => {
+                    Self::apply_saved_media(&conn, &config, &all_games, &games, &grid, &detail, &selected, &game_id, &media);
+                    glib::ControlFlow::Continue
+                }
+                Ok(scraper::ScrapeUpdate::Done(text)) => {
+                    Self::show_status(&status, &text);
+                    *running.borrow_mut() = false;
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    *running.borrow_mut() = false;
+                    glib::ControlFlow::Break
                 }
             }
         });
     }
 
-    fn reload_visible_games(
+    /// Persist one scraped file and patch that game's tile. The grid is not rebuilt,
+    /// so FlowBox selection and scroll stay where the user left them.
+    fn apply_saved_media(
         conn: &Rc<RefCell<rusqlite::Connection>>,
         config: &Rc<RefCell<crate::config::Config>>,
         all_games: &Rc<RefCell<Vec<Game>>>,
         games: &Rc<RefCell<Vec<Game>>>,
         grid: &gtk4::FlowBox,
-        stack: &gtk4::Stack,
         detail: &gtk4::Box,
         selected: &Rc<RefCell<Option<usize>>>,
-        search: &gtk4::SearchEntry,
+        game_id: &str,
+        media: &Media,
     ) {
-        let console_id = all_games.borrow().first().map(|game| game.console.clone());
-        let Some(console_id) = console_id else { return };
-        let Ok(loaded) = database::load_games(&conn.borrow(), Some(&console_id)) else { return };
-        let selected_id = selected.borrow().and_then(|idx| games.borrow().get(idx).map(|game| game.id.clone()));
-        *all_games.borrow_mut() = loaded;
-        let text = search.text().to_string().to_lowercase();
-        let filtered: Vec<Game> = if text.is_empty() {
-            all_games.borrow().clone()
-        } else {
-            all_games
-                .borrow()
-                .iter()
-                .filter(|game| game.title.to_lowercase().contains(&text))
-                .cloned()
-                .collect()
-        };
-        *games.borrow_mut() = filtered;
-        Self::update_game_grid(grid, stack, &games.borrow(), &config.borrow());
-        if let Some(id) = selected_id {
-            if let Some(idx) = games.borrow().iter().position(|game| game.id == id) {
-                *selected.borrow_mut() = Some(idx);
-                if let Some(game) = games.borrow().get(idx) {
-                    Self::update_game_details(detail, game, &config.borrow(), conn);
+        let id = game_id.to_string();
+        if database::set_game_media(&conn.borrow(), &id, media).is_err() {
+            return;
+        }
+        Self::remember_media(&mut all_games.borrow_mut(), game_id, media);
+        Self::remember_media(&mut games.borrow_mut(), game_id, media);
+        let selected_id = selected
+            .borrow()
+            .and_then(|idx| games.borrow().get(idx).map(|game| game.id.clone()));
+        if let Some(index) = games.borrow().iter().position(|game| game.id == game_id) {
+            let game = games.borrow()[index].clone();
+            Self::refresh_grid_tile(grid, index, &game, &config.borrow());
+        }
+        if selected_id.as_deref() == Some(game_id) {
+            if let Some(idx) = *selected.borrow() {
+                if let Some(game) = games.borrow().get(idx).cloned() {
+                    Self::update_game_details(detail, &game, &config.borrow(), conn);
                 }
             }
         }
+    }
+
+    fn remember_media(games: &mut [Game], game_id: &str, media: &Media) {
+        let Some(game) = games.iter_mut().find(|game| game.id == game_id) else {
+            return;
+        };
+        if let Some(slot) = game.media.iter_mut().find(|item| item.kind == media.kind) {
+            *slot = media.clone();
+        } else {
+            game.media.push(media.clone());
+        }
+    }
+
+    fn set_tile_art(frame: &gtk4::Frame, game: &Game, config: &crate::config::Config) {
+        if let Some(media) = Self::grid_tile_media(game, config) {
+            if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&media.path, 150, 150, true) {
+                frame.set_child(Some(&gtk4::Picture::for_pixbuf(&pixbuf)));
+                return;
+            }
+        }
+        let label = gtk4::Label::new(Some("No Art"));
+        label.add_css_class("title-4");
+        frame.set_child(Some(&label));
+    }
+
+    fn refresh_grid_tile(grid: &gtk4::FlowBox, index: usize, game: &Game, config: &crate::config::Config) {
+        let Some(flow_child) = grid.child_at_index(index as i32) else {
+            return;
+        };
+        let Some(tile) = flow_child.child().and_downcast::<gtk4::Box>() else {
+            return;
+        };
+        let Some(frame) = tile.first_child().and_downcast::<gtk4::Frame>() else {
+            return;
+        };
+        Self::set_tile_art(&frame, game, config);
     }
 
     fn show_status(status: &gtk4::Label, text: &str) {
