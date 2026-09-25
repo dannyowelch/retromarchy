@@ -83,8 +83,6 @@ enabled = true
 [scraper.credentials]
 screenscraper_user = ""
 screenscraper_password = ""
-screenscraper_dev_id = ""
-screenscraper_dev_password = ""
 thegamesdb_api_key = ""
 
 # Per console, grid_art is box_art, title_screen, or screenshot (default box_art).

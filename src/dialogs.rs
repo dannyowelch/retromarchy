@@ -1006,7 +1006,7 @@ pub fn open_scraper(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config>>
     page.append(&creds_label);
 
     let creds_note = Label::new(Some(
-        "Stored in the scraper.credentials table of config.toml. ScreenScraper’s API also requires the developer id and password from your ScreenScraper application registration.",
+        "Stored in config.toml. ScreenScraper needs your free member username and password. The application Softname is built in. TheGamesDB needs an API key.",
     ));
     creds_note.set_wrap(true);
     creds_note.set_halign(Align::Start);
@@ -1022,15 +1022,6 @@ pub fn open_scraper(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config>>
         .text(&scraper.credentials.screenscraper_password)
         .visibility(false)
         .build();
-    let dev_id = Entry::builder()
-        .placeholder_text("ScreenScraper developer id")
-        .text(&scraper.credentials.screenscraper_dev_id)
-        .build();
-    let dev_password = Entry::builder()
-        .placeholder_text("ScreenScraper developer password")
-        .text(&scraper.credentials.screenscraper_dev_password)
-        .visibility(false)
-        .build();
     let api_key = Entry::builder()
         .placeholder_text("TheGamesDB API key")
         .text(&scraper.credentials.thegamesdb_api_key)
@@ -1038,8 +1029,6 @@ pub fn open_scraper(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config>>
         .build();
     page.append(&user);
     page.append(&password);
-    page.append(&dev_id);
-    page.append(&dev_password);
     page.append(&api_key);
 
     let save = Button::with_label("Save");
@@ -1056,8 +1045,6 @@ pub fn open_scraper(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config>>
             credentials: ScraperCredentials {
                 screenscraper_user: user.text().to_string(),
                 screenscraper_password: password.text().to_string(),
-                screenscraper_dev_id: dev_id.text().to_string(),
-                screenscraper_dev_password: dev_password.text().to_string(),
                 thegamesdb_api_key: api_key.text().to_string(),
             },
         };

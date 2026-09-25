@@ -203,9 +203,9 @@ impl ArtworkQuery {
 
 pub fn screenscraper_params(creds: &ScraperCredentials, query: &ArtworkQuery) -> Vec<(String, String)> {
     let mut params = vec![
-        ("devid".to_string(), creds.screenscraper_dev_id.clone()),
-        ("devpassword".to_string(), creds.screenscraper_dev_password.clone()),
-        ("softname".to_string(), "retromarchy".to_string()),
+        ("devid".to_string(), crate::softname::DEVID.to_string()),
+        ("devpassword".to_string(), crate::softname::DEVPASSWORD.to_string()),
+        ("softname".to_string(), crate::softname::SOFTNAME.to_string()),
         ("output".to_string(), "json".to_string()),
         ("ssid".to_string(), creds.screenscraper_user.clone()),
         ("sspassword".to_string(), creds.screenscraper_password.clone()),
@@ -1066,10 +1066,24 @@ mod tests {
         assert!(blocked[1].contains("TheGamesDB"));
         assert!(ready_providers(&creds, &providers).is_empty());
 
+        assert!(!blocked[0].to_ascii_lowercase().contains("developer"));
+        assert!(blocked[0].contains("username"));
+        assert!(blocked[0].contains("password"));
+
         let mut creds = ScraperCredentials::default();
+        creds.screenscraper_user = "member".into();
+        creds.screenscraper_password = "secret".into();
+        assert!(creds.block_reason(ScrapeProvider::ScreenScraper).is_none());
+        assert_eq!(
+            ready_providers(&creds, &providers),
+            vec![ScrapeProvider::ScreenScraper]
+        );
+
         creds.thegamesdb_api_key = "secret-key".into();
-        let ready = ready_providers(&creds, &providers);
-        assert_eq!(ready, vec![ScrapeProvider::TheGamesDb]);
+        assert_eq!(
+            ready_providers(&creds, &providers),
+            vec![ScrapeProvider::ScreenScraper, ScrapeProvider::TheGamesDb]
+        );
     }
 
     #[test]
@@ -1091,8 +1105,6 @@ mod tests {
         let creds = ScraperCredentials {
             screenscraper_user: "user".into(),
             screenscraper_password: "secret-pass".into(),
-            screenscraper_dev_id: "dev".into(),
-            screenscraper_dev_password: "dev-secret".into(),
             thegamesdb_api_key: String::new(),
         };
         let query = ArtworkQuery {
@@ -1103,6 +1115,19 @@ mod tests {
             rom_bytes: Some(1024),
         };
         let params = screenscraper_params(&creds, &query);
+        let value = |key: &str| {
+            params
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, item)| item.as_str())
+                .unwrap()
+        };
+        assert_eq!(value("softname"), crate::softname::SOFTNAME);
+        assert_eq!(crate::softname::SOFTNAME, "retromarchy");
+        assert_eq!(value("devid"), crate::softname::DEVID);
+        assert_eq!(value("devpassword"), crate::softname::DEVPASSWORD);
+        assert_eq!(value("ssid"), "user");
+        assert_eq!(value("sspassword"), "secret-pass");
         let romtype = params.iter().find(|(key, _)| key == "romtype").unwrap();
         assert_eq!(romtype.1, "rom");
         assert!(params.iter().all(|(key, _)| key != "bios"));
