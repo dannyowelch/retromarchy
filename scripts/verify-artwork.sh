@@ -98,8 +98,6 @@ enabled = true
 [scraper.credentials]
 screenscraper_user = ""
 screenscraper_password = ""
-screenscraper_dev_id = ""
-screenscraper_dev_password = ""
 thegamesdb_api_key = ""
 EOF
 

@@ -141,12 +141,10 @@ enabled = true
 [scraper.credentials]
 screenscraper_user = ""
 screenscraper_password = ""
-screenscraper_dev_id = ""
-screenscraper_dev_password = ""
 thegamesdb_api_key = ""
 ```
 
-ScreenScraper calls need all four ScreenScraper fields: username, password, developer id (`devid`), and developer password (`devpassword`). TheGamesDB needs only `thegamesdb_api_key`, so it works without ScreenScraper developer credentials. Credentials stay in this file; they are not built into the binary.
+ScreenScraper needs a free member username and password. The application Softname is built into the binary; it is not something you paste. TheGamesDB needs `thegamesdb_api_key`. Member credentials stay in this file. Older configs may still contain `screenscraper_dev_id` and `screenscraper_dev_password`; those keys are ignored and are not written back.
 
 Images are written to `~/.local/share/retromarchy/media/<console>/<game-id>/<kind>.<ext>` (`box_art`, `title_screen`, or `screenshot`; png, jpg, gif, or webp). One file per kind. The `media` table in the library database records the path. Archive, ROM, BIOS, manual, and video URLs are rejected.
 

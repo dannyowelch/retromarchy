@@ -7,6 +7,7 @@ mod importer;
 mod launcher;
 mod scanner;
 mod scraper;
+mod softname;
 mod types;
 mod ui;
 

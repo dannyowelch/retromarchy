@@ -104,6 +104,30 @@ mod tests {
         assert_eq!(back.consoles[0].grid_art, GridArt::TitleScreen);
         assert_eq!(back.scraper.providers.len(), 2);
     }
+
+    #[test]
+    fn old_softname_fields_are_ignored_and_not_written() {
+        let raw = r#"
+theme = "system"
+[scraper.credentials]
+screenscraper_user = "member"
+screenscraper_password = "secret"
+screenscraper_dev_id = "leftover"
+screenscraper_dev_password = "leftover-pass"
+thegamesdb_api_key = "key"
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+        assert_eq!(config.scraper.credentials.screenscraper_user, "member");
+        assert!(config
+            .scraper
+            .credentials
+            .block_reason(crate::types::ScrapeProvider::ScreenScraper)
+            .is_none());
+        let text = toml::to_string(&config).unwrap();
+        assert!(!text.contains("screenscraper_dev_id"));
+        assert!(!text.contains("screenscraper_dev_password"));
+        assert!(!text.contains("leftover"));
+    }
 }
 
 pub fn save_config(config: &Config) -> Result<()> {

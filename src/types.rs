@@ -191,11 +191,6 @@ pub struct ScraperCredentials {
     pub screenscraper_user: String,
     #[serde(default)]
     pub screenscraper_password: String,
-    /// Application id from a ScreenScraper developer account. The HTTP API requires it.
-    #[serde(default)]
-    pub screenscraper_dev_id: String,
-    #[serde(default)]
-    pub screenscraper_dev_password: String,
     #[serde(default)]
     pub thegamesdb_api_key: String,
 }
@@ -205,8 +200,6 @@ impl Default for ScraperCredentials {
         Self {
             screenscraper_user: String::new(),
             screenscraper_password: String::new(),
-            screenscraper_dev_id: String::new(),
-            screenscraper_dev_password: String::new(),
             thegamesdb_api_key: String::new(),
         }
     }
@@ -217,11 +210,9 @@ impl ScraperCredentials {
         match provider {
             ScrapeProvider::ScreenScraper => {
                 let missing = self.screenscraper_user.trim().is_empty()
-                    || self.screenscraper_password.is_empty()
-                    || self.screenscraper_dev_id.trim().is_empty()
-                    || self.screenscraper_dev_password.is_empty();
+                    || self.screenscraper_password.is_empty();
                 missing.then_some(
-                    "ScreenScraper needs a username, password, developer id, and developer password in Scraper settings.",
+                    "ScreenScraper needs a username and password in Scraper settings.",
                 )
             }
             ScrapeProvider::TheGamesDb => self.thegamesdb_api_key.trim().is_empty().then_some(
