@@ -12,7 +12,8 @@ pub struct Console {
     pub name: String,
     pub rom_dirs: Vec<PathBuf>,
     pub extensions: Vec<String>,
-    pub profile: ProfileId,
+    #[serde(default)]
+    pub profile: Option<ProfileId>,
     pub media: MediaToggles,
 }
 

@@ -1,5 +1,8 @@
+mod catalog;
 mod config;
 mod database;
+mod dialogs;
+mod importer;
 mod launcher;
 mod scanner;
 mod types;

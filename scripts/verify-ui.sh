@@ -1,178 +1,182 @@
 #!/bin/bash
-# UI Verification Script for Retromarchy PR #2
-# Tests details pane modes, play tracking, collapsible pane, theme, and keyboard shortcuts
+# Proves first-run config, empty-state body actions, ES-DE import grid, and restart.
+set -euo pipefail
 
-set -e
+DISPLAY_NUM="${DISPLAY_NUM:-:98}"
+export DISPLAY="$DISPLAY_NUM"
+export GDK_BACKEND=x11
+export GDK_CORE_DEVICE_EVENTS=1
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+WORK="$(mktemp -d /tmp/retro-verify.XXXXXX)"
+SHOTS="/opt/cursor/artifacts"
+mkdir -p "$SHOTS"
+rm -f "$SHOTS"/pr3-*.png
 
-DISPLAY="${DISPLAY:-:99}"
-SCREENSHOT_DIR="/opt/cursor/artifacts"
-APP_LOG="/tmp/retro-verify.log"
+export HOME="$WORK/home"
+export XDG_CONFIG_HOME="$WORK/config"
+export XDG_DATA_HOME="$WORK/data"
+export XDG_CACHE_HOME="$WORK/cache"
+mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
 
-echo "=== Retromarchy PR #2 Verification ==="
-echo "Display: $DISPLAY"
-echo "Screenshot dir: $SCREENSHOT_DIR"
+eval "$(dbus-launch --sh-syntax)"
 
-# Setup
-mkdir -p "$SCREENSHOT_DIR"
-rm -f "$APP_LOG"
+cleanup() {
+  pkill -f "target/debug/retromarchy" 2>/dev/null || true
+  if [ -n "${WM_PID:-}" ]; then kill "$WM_PID" 2>/dev/null || true; fi
+  if [ -n "${XVFB_PID:-}" ]; then kill "$XVFB_PID" 2>/dev/null || true; fi
+  if [ -n "${DBUS_SESSION_BUS_PID:-}" ]; then kill "$DBUS_SESSION_BUS_PID" 2>/dev/null || true; fi
+}
+trap cleanup EXIT
 
-# Set XDG paths and copy config
-export XDG_CONFIG_HOME="/tmp"
-export XDG_DATA_HOME="/tmp"
-export RETROMARCHY_DEBUG=1
-mkdir -p /tmp/retromarchy
-cp /tmp/retro-test/config.toml /tmp/retromarchy/config.toml
-rm -f /tmp/retromarchy/library.db
+Xvfb "$DISPLAY" -screen 0 1280x800x24 >/tmp/xvfb-pr3.log 2>&1 &
+XVFB_PID=$!
+sleep 0.5
+xfwm4 --daemon >/tmp/xfwm-pr3.log 2>&1 &
+WM_PID=$!
+sleep 0.5
 
-echo "Config path: /tmp/retromarchy/config.toml"
-echo "Database path: /tmp/retromarchy/library.db"
-echo "Initial config:"
-grep details_visible /tmp/retromarchy/config.toml
+cd "$ROOT"
+cargo build --offline >/tmp/retro-build.log
 
-# Helper to wait for UI to settle
-wait_ui() {
-    sleep "${1:-1.5}"
+"$ROOT/target/debug/retromarchy" >/tmp/retro-app.log 2>&1 &
+APP_PID=$!
+sleep 2
+
+window_id() {
+  xdotool search --onlyvisible --name "$1" 2>/dev/null | head -1 || true
 }
 
-# Ensure window manager is running
-if ! pgrep -x xfwm4 > /dev/null; then
-    echo "Starting xfwm4 window manager..."
-    DISPLAY=$DISPLAY xfwm4 --daemon 2>&1 &
-    sleep 2
-fi
+shot() {
+  local name="$1"
+  local wid
+  wid="$(window_id Retromarchy)"
+  sleep 0.3
+  import -window "$wid" "$SHOTS/$name"
+  echo "saved $name $(wc -c < "$SHOTS/$name") $(md5sum "$SHOTS/$name" | awk '{print $1}')"
+}
 
-# Kill any existing instances
-pkill -9 retromarchy || true
+click_pct() {
+  local wid="$1" xp="$2" yp="$3"
+  local geo
+  geo="$(xdotool getwindowgeometry --shell "$wid")"
+  eval "$geo"
+  local x=$((X + WIDTH * xp / 100))
+  local y=$((Y + HEIGHT * yp / 100))
+  echo "click $wid abs $x,$y window ${X},${Y} ${WIDTH}x${HEIGHT}"
+  xdotool mousemove "$x" "$y"
+  sleep 0.1
+  xdotool click 1
+  sleep 0.6
+}
+
+MAIN="$(window_id Retromarchy)"
+xdotool windowsize "$MAIN" 1200 720
+xdotool windowmove "$MAIN" 40 40
+sleep 0.4
+shot "pr3-empty-state.png"
+
+test -f "$XDG_CONFIG_HOME/retromarchy/config.toml"
+echo "config after first launch:"
+cat "$XDG_CONFIG_HOME/retromarchy/config.toml"
+
+ROMS="$HOME/ROMs"
+mkdir -p "$ROMS/nes" "$ROMS/snes" "$ROMS/unknownsys"
+echo dummy > "$ROMS/nes/Super Mario Bros.nes"
+echo dummy > "$ROMS/nes/Zelda.nes"
+echo dummy > "$ROMS/snes/Super Metroid.sfc"
+echo dummy > "$ROMS/snes/Chrono Trigger.sfc"
+echo dummy > "$ROMS/unknownsys/x.rom"
+
+xdotool key --window "$MAIN" ctrl+i
+sleep 0.8
+IMP="$(window_id "Import ROMs")"
+import -window "$IMP" /tmp/pr3-import-chooser.png
+xdotool key --window "$IMP" Return
+sleep 0.6
+echo "step esde: $(rg -c 'esde clicked' /tmp/retro-app.log || true)"
+xdotool key --window "$IMP" Return
+sleep 0.6
+echo "step scan: $(rg -c 'scan clicked' /tmp/retro-app.log || true)"
+import -window "$IMP" /tmp/pr3-import-list.png
+xdotool key --window "$IMP" Return
+sleep 1.0
+echo "step confirm: $(rg -c 'confirm clicked' /tmp/retro-app.log || true)"
+
+shot "pr3-grid-after-import.png"
+
+STUB="$WORK/stub.sh"
+cat > "$STUB" << EOF
+#!/bin/sh
+echo "launched \$1" > "$WORK/launched.txt"
+EOF
+chmod +x "$STUB"
+
+MAIN="$(window_id Retromarchy)"
+echo "main before emu: ${MAIN:-missing}"
+xdotool getwindowname "$MAIN" || true
+xdotool mousemove 400 400
+xdotool click 1
+sleep 0.2
+xdotool key ctrl+m
+sleep 0.3
+echo "after xtest ctrl+m"
+sleep 0.8
+sleep 0.4
+EMU="$(window_id "Manage Emulators")"
+echo "emu window: ${EMU:-missing}"
+xwininfo -id "$EMU" || true
+xdotool windowmove "$MAIN" 900 20 || true
+xdotool windowsize "$MAIN" 300 200 || true
+sleep 0.2
+import -window "$EMU" /tmp/pr3-emu.png || echo "emu shot failed"
+# The id entry grabs focus when the dialog opens.
+xdotool type --delay 20 "stub"
+xdotool key Tab
+xdotool type --delay 12 "$STUB {rom}"
+xdotool key Tab Return
+sleep 0.4
+import -window "$EMU" /tmp/pr3-emu-filled.png || true
+sleep 0.5
+import -window "$EMU" /tmp/pr3-emu-filled.png || true
+xdotool key Down || true
+sleep 0.3
+xdotool key Escape || true
+sleep 0.4
+
+xdotool windowmove "$MAIN" 40 40 || true
+xdotool windowsize "$MAIN" 1200 720 || true
+sleep 0.3
+xdotool mousemove 400 280 click 1
+sleep 0.2
+xdotool key Return
 sleep 1
-
-# Start the app
-echo "Starting retromarchy..."
-cd /workspace
-DISPLAY=$DISPLAY cargo run > "$APP_LOG" 2>&1 &
-APP_PID=$!
-sleep 4
-
-# Wait for window to appear
-echo "Waiting for window..."
-WINDOW=$(DISPLAY=$DISPLAY xdotool search --sync --onlyvisible --name "Retromarchy" 2>/dev/null | head -1)
-if [ -z "$WINDOW" ]; then
-    echo "ERROR: Window not found"
-    cat "$APP_LOG"
-    exit 1
+if [ -f "$WORK/launched.txt" ]; then
+  echo "LAUNCHED: $(cat "$WORK/launched.txt")"
+else
+  echo "LAUNCH MISSING"
+  echo "---- config so far ----"
+  cat "$XDG_CONFIG_HOME/retromarchy/config.toml"
 fi
-echo "Found window: $WINDOW"
 
-# Helper function to send keys with focus
-send_keys() {
-    DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 640 360 click 1
-    sleep 0.2
-    DISPLAY=$DISPLAY xdotool key $@
-    wait_ui 0.8
-}
-
-# Helper function to take screenshot
-screenshot() {
-    local name="$1"
-    echo "  Screenshot: $name"
-    DISPLAY=$DISPLAY scrot "$SCREENSHOT_DIR/${name}.png"
-}
-
-echo ""
-echo "=== Test Sequence ==="
-
-# 1. Click sidebar to select console and trigger scan
-echo "1. Select SNES console and scan"
-DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 55 52 click 1
-wait_ui 1.5
-send_keys r
-wait_ui 2
-
-# (a) Console mode with stats - no game selected
-echo "2. Capture console mode with stats"
-screenshot "a-console-mode-stats"
-
-# (b) Select a game
-echo "3. Tab to grid and select a game"
-send_keys Tab Right Right
-wait_ui 0.5
-screenshot "b-game-selected"
-
-# (c) Escape back to console mode
-echo "4. Press Escape to return to console mode"
-send_keys Escape
-wait_ui 0.5
-screenshot "c-escape-console-mode"
-
-# (d) Test filter without collapsing pane
-echo "5. Open filter and type 'dr' to filter to Dragon"
-send_keys slash
-wait_ui 0.5
-DISPLAY=$DISPLAY xdotool type "dr"
-wait_ui 1
-screenshot "d-filter-d-pane-visible"
-
-# Close search
-send_keys Escape
-wait_ui 0.5
-
-# (e) Collapse the pane
-echo "6. Press 'd' to collapse details pane"
-send_keys d
-wait_ui 0.8
-echo "Config after collapse:"
-grep details_visible /tmp/retromarchy/config.toml
-screenshot "e-pane-collapsed"
-
-# (f) Restart and verify pane stays collapsed
-echo "7. Restart to verify collapsed state persists"
-kill $APP_PID
-wait_ui 2
-echo "Config before restart:"
-grep details_visible /tmp/retromarchy/config.toml
-DISPLAY=$DISPLAY cargo run > "$APP_LOG" 2>&1 &
+kill "$APP_PID" || true
+sleep 1
+"$ROOT/target/debug/retromarchy" >/tmp/retro-app2.log 2>&1 &
 APP_PID=$!
-sleep 4
-WINDOW=$(DISPLAY=$DISPLAY xdotool search --sync --onlyvisible --name "Retromarchy" 2>/dev/null | head -1)
-DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 55 52 click 1
-wait_ui 1.5
-screenshot "e2-pane-collapsed-after-restart"
-echo "Config after restart:"
-grep details_visible /tmp/retromarchy/config.toml
+sleep 2
+sleep 1
+MAIN="$(window_id Retromarchy)"
+echo "restart window: $MAIN $(xdotool getwindowname "$MAIN" 2>/dev/null || true)"
+xdotool windowsize "$MAIN" 1200 720 || true
+xdotool windowmove "$MAIN" 40 40 || true
+sleep 0.6
+xdotool mousemove 90 150 click 1
+sleep 0.5
+shot "pr3-grid-after-restart.png"
 
-# Re-open pane for theme test
-echo "8. Press 'd' to re-open pane"
-send_keys d
-wait_ui 0.8
-
-# (g) Toggle to LaunchBox theme
-echo "9. Toggle to LaunchBox theme"
-send_keys t
-wait_ui 1
-screenshot "f-launchbox-theme"
-
-# (h) Launch game and verify play tracking
-echo "10. Select and launch game for play tracking"
-send_keys Tab Right
-wait_ui 0.5
-# Click on the grid area to ensure focus
-DISPLAY=$DISPLAY xdotool mousemove --window "$WINDOW" 300 200 click 1
-wait_ui 0.2
-DISPLAY=$DISPLAY xdotool key Return
-echo "  Waiting for stub emulator (3 seconds)..."
-sleep 5
-wait_ui 2
-screenshot "g-play-count-incremented"
-
-echo ""
-echo "=== Verification Complete ==="
-echo "Screenshots saved to: $SCREENSHOT_DIR"
-echo ""
-echo "Generated screenshots:"
-ls -1 $SCREENSHOT_DIR/*.png 2>/dev/null || echo "No screenshots found"
-
-# Cleanup
-kill $APP_PID 2>/dev/null || true
-
-echo ""
-echo "Check app log at: $APP_LOG"
-echo "Verification script completed!"
+echo "---- config ----"
+cat "$XDG_CONFIG_HOME/retromarchy/config.toml"
+echo "---- db ----"
+sqlite3 "$XDG_DATA_HOME/retromarchy/library.db" "SELECT title, console FROM games ORDER BY console, title;"
+echo "---- shots ----"
+md5sum "$SHOTS"/pr3-*.png
+wc -c "$SHOTS"/pr3-*.png

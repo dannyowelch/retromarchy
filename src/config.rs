@@ -5,7 +5,6 @@ use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct ConsoleMetadata {
     pub id: String,
     pub manufacturer: String,
@@ -45,12 +44,10 @@ impl Default for Config {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct ConsoleMetadataFile {
     console: Vec<ConsoleMetadata>,
 }
 
-#[allow(dead_code)]
 pub fn load_console_metadata() -> Result<Vec<ConsoleMetadata>> {
     let metadata_content = include_str!("../console_metadata.toml");
     let file: ConsoleMetadataFile = toml::from_str(metadata_content)?;
@@ -65,7 +62,9 @@ pub fn config_path() -> Result<PathBuf> {
 pub fn load_config() -> Result<Config> {
     let path = config_path()?;
     if !path.exists() {
-        return Ok(Config::default());
+        let config = Config::default();
+        save_config(&config)?;
+        return Ok(config);
     }
     let content = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read config from {}", path.display()))?;
@@ -74,7 +73,6 @@ pub fn load_config() -> Result<Config> {
     Ok(config)
 }
 
-#[allow(dead_code)]
 pub fn save_config(config: &Config) -> Result<()> {
     let path = config_path()?;
     let content = toml::to_string_pretty(config)?;

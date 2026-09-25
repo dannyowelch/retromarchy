@@ -30,6 +30,7 @@ pub struct App {
     selected_game: Rc<RefCell<Option<usize>>>,
     details_visible: Rc<RefCell<bool>>,
     theme_css_provider: gtk4::CssProvider,
+    center_stack: gtk4::Stack,
 }
 
 impl App {
@@ -43,7 +44,10 @@ impl App {
              }
              .navigation-sidebar row:selected { background: @accent_bg_color; }
              flowboxchild:focus { outline: 2px solid @accent_color; outline-offset: 2px; }
-             .console-subtitle { opacity: 0.65; font-size: 0.9em; }"
+             .console-subtitle { opacity: 0.65; font-size: 0.9em; }
+             .rom-tile { background: #2c2c2c; border-radius: 8px; padding: 8px; }
+             .rom-art { background: #444444; color: #f2f2f2; }
+             .empty-state { background: transparent; }"
         );
         gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().expect("Could not get default display"),
@@ -54,7 +58,15 @@ impl App {
         let theme_css_provider = gtk4::CssProvider::new();
 
         let header_bar = adw::HeaderBar::new();
-        
+
+        let import_button = gtk4::Button::with_label("Import ROMs");
+        import_button.add_css_class("flat");
+        header_bar.pack_start(&import_button);
+
+        let emulator_button = gtk4::Button::with_label("Manage Emulators");
+        emulator_button.add_css_class("flat");
+        header_bar.pack_start(&emulator_button);
+
         let details_toggle = gtk4::ToggleButton::builder()
             .icon_name("sidebar-show-right-symbolic")
             .tooltip_text("Toggle Details Panel")
@@ -117,7 +129,38 @@ impl App {
         game_grid.set_margin_end(12);
         scrolled.set_child(Some(&game_grid));
 
-        center_box.append(&scrolled);
+        let center_stack = gtk4::Stack::new();
+        center_stack.set_vexpand(true);
+        center_stack.add_named(&scrolled, Some("grid"));
+
+        let empty = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
+        empty.set_valign(gtk4::Align::Center);
+        empty.set_halign(gtk4::Align::Center);
+        empty.set_vexpand(true);
+        empty.set_margin_start(24);
+        empty.set_margin_end(24);
+        empty.add_css_class("empty-state");
+        let empty_title = gtk4::Label::new(Some("No games found"));
+        empty_title.add_css_class("title-1");
+        let empty_copy = gtk4::Label::new(Some(
+            "Import a ROM folder to add systems to the sidebar and scan games. Only paths are stored.",
+        ));
+        empty_copy.set_wrap(true);
+        empty_copy.set_max_width_chars(42);
+        empty_copy.set_justify(gtk4::Justification::Center);
+        empty_copy.add_css_class("dim-label");
+        let empty_import = gtk4::Button::with_label("Import ROMs");
+        empty_import.add_css_class("suggested-action");
+        empty_import.add_css_class("pill");
+        let empty_emulators = gtk4::Button::with_label("Manage Emulators");
+        empty_emulators.add_css_class("pill");
+        empty.append(&empty_title);
+        empty.append(&empty_copy);
+        empty.append(&empty_import);
+        empty.append(&empty_emulators);
+        center_stack.add_named(&empty, Some("empty"));
+        center_stack.set_visible_child_name("empty");
+        center_box.append(&center_stack);
 
         let detail_pane = gtk4::ScrolledWindow::builder()
             .width_request(280)
@@ -158,6 +201,7 @@ impl App {
             selected_game: Rc::new(RefCell::new(None)),
             details_visible,
             theme_css_provider: theme_css_provider.clone(),
+            center_stack: center_stack.clone(),
         };
 
         app_instance.apply_theme(&config.theme);
@@ -167,6 +211,7 @@ impl App {
         app_instance.setup_game_selection();
         app_instance.setup_details_toggle(details_toggle);
         app_instance.setup_theme_toggle(theme_toggle);
+        app_instance.wire_library_actions(&import_button, &emulator_button, &empty_import, &empty_emulators);
 
         Ok(app_instance)
     }
@@ -176,8 +221,9 @@ impl App {
         let games = self.games.clone();
         let all_games = self.all_games.clone();
         let game_grid = self.game_grid.clone();
+        let center_stack = self.center_stack.clone();
         let config = self.config.clone();
-        
+
         search_entry.connect_search_changed(move |entry| {
             let text = entry.text().to_string().to_lowercase();
             let all = all_games.borrow();
@@ -190,7 +236,7 @@ impl App {
                     .collect()
             };
             *games.borrow_mut() = filtered;
-            Self::update_game_grid(&game_grid, &games.borrow(), &config.borrow());
+            Self::update_game_grid(&game_grid, &center_stack, &games.borrow(), &config.borrow());
         });
     }
 
@@ -376,6 +422,7 @@ impl App {
         let config = self.config.clone();
         let conn = self.conn.clone();
         let game_grid = self.game_grid.clone();
+        let center_stack = self.center_stack.clone();
         let selected_game = self.selected_game.clone();
         let detail_content = self.detail_content.clone();
 
@@ -390,7 +437,7 @@ impl App {
                     if let Ok(loaded_games) = database::load_games(&conn.borrow(), Some(&console.id)) {
                         *all_games.borrow_mut() = loaded_games.clone();
                         *games.borrow_mut() = loaded_games;
-                        Self::update_game_grid(&game_grid, &games.borrow(), &config.borrow());
+                        Self::update_game_grid(&game_grid, &center_stack, &games.borrow(), &config.borrow());
                     }
 
                     Self::update_console_details(&detail_content, &console.id, &conn.borrow(), &config.borrow());
@@ -403,15 +450,113 @@ impl App {
         }
     }
 
-    fn update_game_grid(grid: &gtk4::FlowBox, games: &[Game], config: &Config) {
+    fn wire_library_actions(
+        &self,
+        import_button: &gtk4::Button,
+        emulator_button: &gtk4::Button,
+        empty_import: &gtk4::Button,
+        empty_emulators: &gtk4::Button,
+    ) {
+        let open_import = {
+            let window = self.window.clone();
+            let config = self.config.clone();
+            let conn = self.conn.clone();
+            let done = Self::refresh_action(
+                self.console_list.clone(),
+                self.config.clone(),
+                self.conn.clone(),
+                self.games.clone(),
+                self.all_games.clone(),
+                self.game_grid.clone(),
+                self.center_stack.clone(),
+                self.current_console.clone(),
+                self.detail_content.clone(),
+            );
+            move || {
+                crate::dialogs::open_import(&window, config.clone(), conn.clone(), done.clone());
+            }
+        };
+        let open_emulators = {
+            let window = self.window.clone();
+            let config = self.config.clone();
+            let done = Self::refresh_action(
+                self.console_list.clone(),
+                self.config.clone(),
+                self.conn.clone(),
+                self.games.clone(),
+                self.all_games.clone(),
+                self.game_grid.clone(),
+                self.center_stack.clone(),
+                self.current_console.clone(),
+                self.detail_content.clone(),
+            );
+            move || {
+                crate::dialogs::open_emulators(&window, config.clone(), done.clone());
+            }
+        };
+
+        let open_import = Rc::new(open_import);
+        let open_emulators = Rc::new(open_emulators);
+
+        let import_action = open_import.clone();
+        import_button.connect_clicked(move |_| import_action());
+        let empty_action = open_import;
+        empty_import.connect_clicked(move |_| empty_action());
+
+        let emulator_action = open_emulators.clone();
+        emulator_button.connect_clicked(move |_| emulator_action());
+        empty_emulators.connect_clicked(move |_| open_emulators());
+    }
+
+    fn refresh_action(
+        console_list: gtk4::ListBox,
+        config: Rc<RefCell<Config>>,
+        _conn: Rc<RefCell<Connection>>,
+        games: Rc<RefCell<Vec<Game>>>,
+        all_games: Rc<RefCell<Vec<Game>>>,
+        game_grid: gtk4::FlowBox,
+        center_stack: gtk4::Stack,
+        current_console: Rc<RefCell<Option<String>>>,
+        detail_content: gtk4::Box,
+    ) -> Rc<dyn Fn()> {
+        Rc::new(move || {
+            while let Some(child) = console_list.first_child() {
+                console_list.remove(&child);
+            }
+            for console in &config.borrow().consoles {
+                let row = gtk4::Label::new(Some(&console.name));
+                row.set_halign(gtk4::Align::Start);
+                row.set_margin_top(8);
+                row.set_margin_bottom(8);
+                row.set_margin_start(12);
+                row.set_margin_end(12);
+                console_list.append(&row);
+            }
+            if let Some(row) = console_list.row_at_index(0) {
+                console_list.select_row(Some(&row));
+            } else {
+                *current_console.borrow_mut() = None;
+                *games.borrow_mut() = Vec::new();
+                *all_games.borrow_mut() = Vec::new();
+                Self::update_game_grid(&game_grid, &center_stack, &[], &config.borrow());
+                while let Some(child) = detail_content.first_child() {
+                    detail_content.remove(&child);
+                }
+            }
+        })
+    }
+
+    fn update_game_grid(grid: &gtk4::FlowBox, stack: &gtk4::Stack, games: &[Game], config: &Config) {
         while let Some(child) = grid.first_child() {
             grid.remove(&child);
         }
 
         for game in games {
             let game_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+            game_box.add_css_class("rom-tile");
 
             let frame = gtk4::Frame::new(None);
+            frame.add_css_class("rom-art");
             frame.set_size_request(150, 150);
 
             if let Some(media) = game.media.iter().find(|m| m.kind == MediaKind::BoxArt) {
@@ -420,12 +565,12 @@ impl App {
                     frame.set_child(Some(&picture));
                 } else {
                     let label = gtk4::Label::new(Some("No Art"));
-                    label.add_css_class("dim-label");
+                    label.add_css_class("title-4");
                     frame.set_child(Some(&label));
                 }
             } else {
                 let label = gtk4::Label::new(Some("No Art"));
-                label.add_css_class("dim-label");
+                label.add_css_class("title-4");
                 frame.set_child(Some(&label));
             }
 
@@ -452,6 +597,12 @@ impl App {
             }
 
             grid.insert(&game_box, -1);
+        }
+
+        if games.is_empty() {
+            stack.set_visible_child_name("empty");
+        } else {
+            stack.set_visible_child_name("grid");
         }
     }
 
@@ -610,10 +761,17 @@ impl App {
         let config_clone = config.clone();
         let conn_clone = conn.clone();
         let detail_content_clone = detail_content.clone();
-        
-        play_button.connect_clicked(move |_| {
-            if let Some(profile) = Self::resolve_profile(&config_clone, &game_clone) {
-                if let Ok(mut child) = launcher::launch_game_tracked(&profile, &game_clone.rom) {
+
+        play_button.connect_clicked(move |btn| {
+            let Some(profile) = Self::resolve_profile(&config_clone, &game_clone) else {
+                if let Some(root) = btn.root() {
+                    if let Some(win) = root.downcast_ref::<adw::ApplicationWindow>() {
+                        Self::alert_missing_profile(win);
+                    }
+                }
+                return;
+            };
+            if let Ok(mut child) = launcher::launch_game_tracked(&profile, &game_clone.rom) {
                     let game_id = game_clone.id.clone();
                     let game_console = game_clone.console.clone();
                     let conn_for_update = conn_clone.clone();
@@ -645,7 +803,6 @@ impl App {
                         let _ = sender.send((game_id, game_console, elapsed));
                     });
                 }
-            }
         });
         
         detail_content.append(&play_button);
@@ -738,14 +895,29 @@ impl App {
         let details_visible = self.details_visible.clone();
         let detail_content = self.detail_content.clone();
         let theme_css_provider = self.theme_css_provider.clone();
+        let center_stack = self.center_stack.clone();
+        let console_list = self.console_list.clone();
 
-        key_controller.connect_key_pressed(move |_, key, _, _| {
+        key_controller.connect_key_pressed(move |_, key, _, mods| {
             let focused = gtk4::prelude::RootExt::focus(&window);
             let search_has_focus = focused.as_ref().map_or(false, |w| {
                 w.upcast_ref::<gtk4::Widget>() == search_entry.upcast_ref::<gtk4::Widget>() ||
                 search_entry.is_ancestor(w)
             });
             
+            if mods.contains(gdk::ModifierType::CONTROL_MASK) && !search_has_focus {
+                if key == gdk::Key::i || key == gdk::Key::I {
+                    let done = Self::refresh_action(console_list.clone(), config.clone(), conn.clone(), games.clone(), all_games.clone(), game_grid.clone(), center_stack.clone(), current_console.clone(), detail_content.clone());
+                    crate::dialogs::open_import(&window, config.clone(), conn.clone(), done);
+                    return glib::Propagation::Stop;
+                }
+                if key == gdk::Key::e || key == gdk::Key::E || key == gdk::Key::m || key == gdk::Key::M {
+                    let done = Self::refresh_action(console_list.clone(), config.clone(), conn.clone(), games.clone(), all_games.clone(), game_grid.clone(), center_stack.clone(), current_console.clone(), detail_content.clone());
+                    crate::dialogs::open_emulators(&window, config.clone(), done);
+                    return glib::Propagation::Stop;
+                }
+            }
+
             let update_details = |idx: usize| {
                 let games = games.borrow();
                 if let Some(game) = games.get(idx) {
@@ -760,7 +932,7 @@ impl App {
                         search_entry.set_text("");
                         let all = all_games.borrow();
                         *games.borrow_mut() = all.clone();
-                        Self::update_game_grid(&game_grid, &games.borrow(), &config.borrow());
+                        Self::update_game_grid(&game_grid, &center_stack, &games.borrow(), &config.borrow());
                     } else {
                         *selected_game.borrow_mut() = None;
                         game_grid.unselect_all();
@@ -775,8 +947,11 @@ impl App {
                         if let Some(idx) = *selected_game.borrow() {
                             let games = games.borrow();
                             if let Some(game) = games.get(idx) {
-                                if let Some(profile) = Self::resolve_profile(&config.borrow(), game) {
-                                    if let Ok(mut child) = launcher::launch_game_tracked(&profile, &game.rom) {
+                                let Some(profile) = Self::resolve_profile(&config.borrow(), game) else {
+                                    Self::alert_missing_profile(&window);
+                                    return glib::Propagation::Stop;
+                                };
+                                if let Ok(mut child) = launcher::launch_game_tracked(&profile, &game.rom) {
                                         let game_id = game.id.clone();
                                         let game_console = game.console.clone();
                                         let conn_for_update = conn.clone();
@@ -810,7 +985,6 @@ impl App {
                                     }
                                 }
                             }
-                        }
                         glib::Propagation::Stop
                     } else {
                         glib::Propagation::Proceed
@@ -826,12 +1000,12 @@ impl App {
                                     for game in &scanned {
                                         let _ = database::upsert_game(&conn.borrow(), game);
                                     }
-                                    let _ = database::remove_missing_games(&conn.borrow(), &ids);
+                                    let _ = database::remove_missing_games(&conn.borrow(), &console_id, &ids);
 
                                     if let Ok(loaded) = database::load_games(&conn.borrow(), Some(&console_id)) {
                                         *all_games.borrow_mut() = loaded.clone();
                                         *games.borrow_mut() = loaded;
-                                        Self::update_game_grid(&game_grid, &games.borrow(), &config.borrow());
+                                        Self::update_game_grid(&game_grid, &center_stack, &games.borrow(), &config.borrow());
                                     }
 
                                     Self::update_console_details(&detail_content, &console_id, &conn.borrow(), &config.borrow());
@@ -1050,12 +1224,26 @@ impl App {
     }
 
     fn resolve_profile(config: &Config, game: &Game) -> Option<crate::types::EmulatorProfile> {
-        if let Some(profile_id) = &game.profile {
-            config.profiles.iter().find(|p| p.id() == profile_id).cloned()
-        } else {
-            let console = config.consoles.iter().find(|c| c.id == game.console)?;
-            config.profiles.iter().find(|p| p.id() == &console.profile).cloned()
+        let from_game = game.profile.as_deref().filter(|id| !id.is_empty());
+        if let Some(profile_id) = from_game {
+            return config.profiles.iter().find(|p| p.id() == profile_id).cloned();
         }
+        let console = config.consoles.iter().find(|c| c.id == game.console)?;
+        let profile_id = console.profile.as_deref().filter(|id| !id.is_empty())?;
+        config.profiles.iter().find(|p| p.id() == profile_id).cloned()
+    }
+
+    fn alert_missing_profile(window: &adw::ApplicationWindow) {
+        let dialog = gtk4::MessageDialog::new(
+            Some(window),
+            gtk4::DialogFlags::MODAL,
+            gtk4::MessageType::Info,
+            gtk4::ButtonsType::Ok,
+            "This system has no emulator profile. Use Manage Emulators to add one and assign it.",
+        );
+        dialog.set_title(Some("Configure an emulator"));
+        dialog.connect_response(|dialog, _| dialog.close());
+        dialog.present();
     }
 
     pub fn show(&self) {
