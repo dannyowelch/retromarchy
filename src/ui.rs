@@ -23,6 +23,10 @@ enum FocusPane {
     Games,
 }
 
+/// Shared width of the details column. Console info and a selected game
+/// both use it, so picking a game does not take columns from the grid.
+const DETAIL_PANE_WIDTH: i32 = 280;
+
 pub struct App {
     config: Rc<RefCell<Config>>,
     conn: Rc<RefCell<Connection>>,
@@ -257,10 +261,7 @@ impl App {
         center_stack.set_visible_child_name("empty");
         center_box.append(&center_stack);
 
-        let detail_pane = gtk4::ScrolledWindow::builder()
-            .width_request(280)
-            .hscrollbar_policy(gtk4::PolicyType::Never)
-            .build();
+        let detail_pane = Self::detail_column();
 
         let detail_content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
         detail_content.set_margin_top(12);
@@ -966,6 +967,17 @@ impl App {
         }
     }
 
+    /// Right-hand column. `hexpand` is set explicitly so a descendant
+    /// (the Play button) cannot make the column absorb spare window width.
+    fn detail_column() -> gtk4::ScrolledWindow {
+        let pane = gtk4::ScrolledWindow::builder()
+            .width_request(DETAIL_PANE_WIDTH)
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .build();
+        pane.set_hexpand(false);
+        pane
+    }
+
     fn update_game_details(
         detail_content: &gtk4::Box,
         game: &Game,
@@ -1113,6 +1125,9 @@ impl App {
 
         let rom_label = gtk4::Label::new(Some(&format!("ROM: {}", game.rom.display())));
         rom_label.set_wrap(true);
+        // Paths are one long token. Break inside it so the line cannot
+        // set the column's minimum width.
+        rom_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         rom_label.set_halign(gtk4::Align::Start);
         rom_label.add_css_class("caption");
         detail_content.append(&rom_label);
@@ -2846,6 +2861,7 @@ mod tests {
         flow_columns_follows_the_allocated_line();
         favorite_badge_toggles_on_the_card_overlay();
         detail_pane_puts_play_above_stats_and_rom_at_the_bottom();
+        detail_column_stays_fixed_when_play_expands();
         favorite_toggle_updates_badge_and_detail_heart();
     }
 
@@ -3043,6 +3059,14 @@ mod tests {
                 "CRC32: 8678f408",
             ]
         );
+        let rom = detail
+            .last_child()
+            .unwrap()
+            .prev_sibling()
+            .and_downcast::<gtk4::Label>()
+            .unwrap();
+        assert!(rom.wraps());
+        assert_eq!(rom.wrap_mode(), gtk4::pango::WrapMode::WordChar);
 
         App::set_detail_favorite(&detail, true);
         assert_eq!(heart.label().as_deref(), Some("♥"));
@@ -3059,6 +3083,29 @@ mod tests {
         App::update_console_details(&detail, "atari2600", &conn.borrow(), &config);
         assert!(App::find_widget_name(detail.upcast_ref(), "favorite-toggle").is_none());
         assert!(detail_texts(&detail).iter().all(|text| text != "play-row"));
+    }
+
+    fn detail_column_stays_fixed_when_play_expands() {
+        let pane = App::detail_column();
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let play = gtk4::Button::with_label("Play");
+        play.set_hexpand(true);
+        row.append(&play);
+        row.append(&gtk4::Button::with_label("♡"));
+        content.append(&row);
+        let rom = gtk4::Label::new(Some(
+            "ROM: /home/dwelch/Games/roms/Emulation/roms/atari2600/Airlock (USA).zip",
+        ));
+        rom.set_wrap(true);
+        rom.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        content.append(&rom);
+        pane.set_child(Some(&content));
+
+        assert!(!pane.compute_expand(gtk4::Orientation::Horizontal));
+        let (min, nat, _, _) = pane.measure(gtk4::Orientation::Horizontal, -1);
+        assert_eq!(min, DETAIL_PANE_WIDTH);
+        assert_eq!(nat, DETAIL_PANE_WIDTH);
     }
 
     fn favorite_toggle_updates_badge_and_detail_heart() {
