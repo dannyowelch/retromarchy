@@ -72,7 +72,7 @@ pub enum Source {
     Local,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum EmulatorProfile {
     RetroArch {
