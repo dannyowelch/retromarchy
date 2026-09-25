@@ -1,6 +1,10 @@
 //! SDL / Xbox layout via gilrs. South confirms, East goes back, North (Y) toggles a favorite.
-//! The left stick fires one step per deflection and must return near center before the next.
+//!
+//! Directions are holds, not edges. The d-pad and the left stick stay "down" until
+//! released or returned near center. [`crate::input_repeat::DirectionRepeat`] decides
+//! how many steps that hold emits. Confirm, Back, and Favorite stay one-shot.
 
+use crate::input_repeat::{AxisHold, AxisSide};
 use gilrs::{Axis, Button, EventType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,7 +17,6 @@ pub enum NavDir {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PadAction {
-    Move(NavDir),
     Confirm,
     Back,
     Favorite,
@@ -25,6 +28,13 @@ pub enum StickAxis {
     Y,
 }
 
+/// Which way the left stick is held.
+///
+/// A deflection past [`STICK_ON`] engages that direction and stays engaged until
+/// the axis falls inside [`STICK_OFF`] (near center). Values between the two
+/// thresholds are hysteresis: they do not start a hold and they do not cancel
+/// one. X and Y are independent, so a diagonal can repeat on both axes.
+/// This latch does not emit steps; the repeat driver does.
 #[derive(Debug, Default)]
 pub struct StickLatch {
     x: Option<i8>,
@@ -34,69 +44,129 @@ pub struct StickLatch {
 const STICK_ON: f32 = 0.55;
 const STICK_OFF: f32 = 0.35;
 
-pub fn stick_move(latch: &mut StickLatch, axis: StickAxis, value: f32) -> Option<NavDir> {
-    let (slot, negative, positive) = match axis {
-        StickAxis::X => (&mut latch.x, NavDir::Left, NavDir::Right),
+impl StickLatch {
+    pub fn horizontal(&self) -> Option<NavDir> {
+        signed_dir(self.x, NavDir::Left, NavDir::Right)
+    }
+
+    pub fn vertical(&self) -> Option<NavDir> {
         // gilrs uses the SDL sign: positive left-stick Y is up.
-        StickAxis::Y => (&mut latch.y, NavDir::Down, NavDir::Up),
-    };
-    axis_step(slot, value, negative, positive)
+        signed_dir(self.y, NavDir::Down, NavDir::Up)
+    }
 }
 
-fn axis_step(
-    fired: &mut Option<i8>,
-    value: f32,
-    negative: NavDir,
-    positive: NavDir,
-) -> Option<NavDir> {
+fn signed_dir(sign: Option<i8>, negative: NavDir, positive: NavDir) -> Option<NavDir> {
+    match sign {
+        Some(value) if value < 0 => Some(negative),
+        Some(value) if value > 0 => Some(positive),
+        _ => None,
+    }
+}
+
+pub fn update_stick(latch: &mut StickLatch, axis: StickAxis, value: f32) {
+    let slot = match axis {
+        StickAxis::X => &mut latch.x,
+        StickAxis::Y => &mut latch.y,
+    };
     if !value.is_finite() {
-        return None;
+        return;
     }
-    let dir = if value >= STICK_ON {
-        1
+    if value >= STICK_ON {
+        *slot = Some(1);
     } else if value <= -STICK_ON {
-        -1
-    } else {
-        0
-    };
-    if dir == 0 {
-        if value.abs() < STICK_OFF {
-            *fired = None;
-        }
-        return None;
-    }
-    if *fired == Some(dir) {
-        return None;
-    }
-    *fired = Some(dir);
-    Some(if dir < 0 { negative } else { positive })
-}
-
-pub fn button_action(button: Button) -> Option<PadAction> {
-    match button {
-        Button::South => Some(PadAction::Confirm),
-        Button::East => Some(PadAction::Back),
-        Button::North => Some(PadAction::Favorite),
-        Button::DPadLeft => Some(PadAction::Move(NavDir::Left)),
-        Button::DPadRight => Some(PadAction::Move(NavDir::Right)),
-        Button::DPadUp => Some(PadAction::Move(NavDir::Up)),
-        Button::DPadDown => Some(PadAction::Move(NavDir::Down)),
-        _ => None,
+        *slot = Some(-1);
+    } else if value.abs() < STICK_OFF {
+        *slot = None;
     }
 }
 
-pub fn event_action(event: &EventType, latch: &mut StickLatch) -> Option<PadAction> {
-    match event {
-        EventType::ButtonPressed(button, _) => button_action(*button),
-        EventType::AxisChanged(axis, value, _) => {
-            let stick_axis = match axis {
-                Axis::LeftStickX => StickAxis::X,
-                Axis::LeftStickY => StickAxis::Y,
-                _ => return None,
-            };
-            stick_move(latch, stick_axis, *value).map(PadAction::Move)
+/// D-pad buttons and the left stick. Face buttons are edges; directions are holds.
+/// On an axis, a held d-pad button wins over the stick.
+#[derive(Debug, Default)]
+pub struct PadHeld {
+    stick: StickLatch,
+    x: AxisHold,
+    y: AxisHold,
+}
+
+impl PadHeld {
+    /// `down` is a press. Releases clear d-pad holds and return nothing.
+    /// South, East, and North return an action only on press.
+    pub fn apply_button(&mut self, button: Button, down: bool) -> Option<PadAction> {
+        if !down {
+            match button {
+                Button::DPadLeft => self.x.set(AxisSide::Negative, false),
+                Button::DPadRight => self.x.set(AxisSide::Positive, false),
+                Button::DPadDown => self.y.set(AxisSide::Negative, false),
+                Button::DPadUp => self.y.set(AxisSide::Positive, false),
+                _ => {}
+            }
+            return None;
         }
-        _ => None,
+        match button {
+            Button::South => Some(PadAction::Confirm),
+            Button::East => Some(PadAction::Back),
+            Button::North => Some(PadAction::Favorite),
+            Button::DPadLeft => {
+                self.x.set(AxisSide::Negative, true);
+                None
+            }
+            Button::DPadRight => {
+                self.x.set(AxisSide::Positive, true);
+                None
+            }
+            Button::DPadDown => {
+                self.y.set(AxisSide::Negative, true);
+                None
+            }
+            Button::DPadUp => {
+                self.y.set(AxisSide::Positive, true);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Updates held directions. Directional events do not return [`PadAction::Move`];
+    /// read [`Self::horizontal`] and [`Self::vertical`] and run them through the repeater.
+    /// A gilrs `ButtonRepeated` keeps the button down without firing Confirm, Back, or Favorite.
+    pub fn apply(&mut self, event: &EventType) -> Option<PadAction> {
+        match event {
+            EventType::ButtonPressed(button, _) => self.apply_button(*button, true),
+            EventType::ButtonRepeated(button, _) => {
+                let _ = self.apply_button(*button, true);
+                None
+            }
+            EventType::ButtonReleased(button, _) => self.apply_button(*button, false),
+            EventType::AxisChanged(axis, value, _) => {
+                let stick_axis = match axis {
+                    Axis::LeftStickX => Some(StickAxis::X),
+                    Axis::LeftStickY => Some(StickAxis::Y),
+                    _ => None,
+                };
+                if let Some(stick_axis) = stick_axis {
+                    update_stick(&mut self.stick, stick_axis, *value);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub fn horizontal(&self) -> Option<NavDir> {
+        match self.x.held() {
+            Some(AxisSide::Negative) => Some(NavDir::Left),
+            Some(AxisSide::Positive) => Some(NavDir::Right),
+            None => self.stick.horizontal(),
+        }
+    }
+
+    pub fn vertical(&self) -> Option<NavDir> {
+        match self.y.held() {
+            Some(AxisSide::Negative) => Some(NavDir::Down),
+            Some(AxisSide::Positive) => Some(NavDir::Up),
+            None => self.stick.vertical(),
+        }
     }
 }
 
@@ -169,43 +239,95 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stick_fires_once_until_it_returns() {
+    fn stick_stays_held_until_it_returns_near_center() {
         let mut latch = StickLatch::default();
-        assert_eq!(stick_move(&mut latch, StickAxis::X, 0.9), Some(NavDir::Right));
-        assert_eq!(stick_move(&mut latch, StickAxis::X, 1.0), None);
-        assert_eq!(stick_move(&mut latch, StickAxis::X, 0.4), None);
-        assert_eq!(stick_move(&mut latch, StickAxis::X, 0.2), None);
-        assert_eq!(stick_move(&mut latch, StickAxis::X, 0.9), Some(NavDir::Right));
+        update_stick(&mut latch, StickAxis::X, 0.9);
+        assert_eq!(latch.horizontal(), Some(NavDir::Right));
+        update_stick(&mut latch, StickAxis::X, 1.0);
+        assert_eq!(latch.horizontal(), Some(NavDir::Right));
+        // Between OFF and ON the previous hold remains.
+        update_stick(&mut latch, StickAxis::X, 0.4);
+        assert_eq!(latch.horizontal(), Some(NavDir::Right));
+        update_stick(&mut latch, StickAxis::X, 0.2);
+        assert_eq!(latch.horizontal(), None);
+        update_stick(&mut latch, StickAxis::X, 0.9);
+        assert_eq!(latch.horizontal(), Some(NavDir::Right));
     }
 
     #[test]
     fn stick_y_positive_is_up() {
         let mut latch = StickLatch::default();
-        assert_eq!(stick_move(&mut latch, StickAxis::Y, 0.8), Some(NavDir::Up));
-        assert_eq!(stick_move(&mut latch, StickAxis::Y, 0.0), None);
-        assert_eq!(stick_move(&mut latch, StickAxis::Y, -0.8), Some(NavDir::Down));
+        update_stick(&mut latch, StickAxis::Y, 0.8);
+        assert_eq!(latch.vertical(), Some(NavDir::Up));
+        update_stick(&mut latch, StickAxis::Y, 0.0);
+        assert_eq!(latch.vertical(), None);
+        update_stick(&mut latch, StickAxis::Y, -0.8);
+        assert_eq!(latch.vertical(), Some(NavDir::Down));
     }
 
     #[test]
     fn axes_are_independent() {
         let mut latch = StickLatch::default();
-        assert_eq!(stick_move(&mut latch, StickAxis::X, -0.9), Some(NavDir::Left));
-        assert_eq!(stick_move(&mut latch, StickAxis::Y, 0.9), Some(NavDir::Up));
-        assert_eq!(stick_move(&mut latch, StickAxis::X, -0.9), None);
+        update_stick(&mut latch, StickAxis::X, -0.9);
+        update_stick(&mut latch, StickAxis::Y, 0.9);
+        assert_eq!(latch.horizontal(), Some(NavDir::Left));
+        assert_eq!(latch.vertical(), Some(NavDir::Up));
+        update_stick(&mut latch, StickAxis::X, -0.9);
+        assert_eq!(latch.horizontal(), Some(NavDir::Left));
+    }
+
+    #[test]
+    fn dpad_hold_does_not_repeat_confirm() {
+        let mut pad = PadHeld::default();
+        assert_eq!(pad.apply_button(Button::DPadRight, true), None);
+        assert_eq!(pad.horizontal(), Some(NavDir::Right));
+        assert_eq!(pad.apply_button(Button::DPadRight, false), None);
+        assert_eq!(pad.horizontal(), None);
+        assert_eq!(
+            pad.apply_button(Button::South, true),
+            Some(PadAction::Confirm)
+        );
+        assert_eq!(pad.apply_button(Button::South, false), None);
+        assert_eq!(pad.apply_button(Button::DPadUp, true), None);
+        assert_eq!(pad.vertical(), Some(NavDir::Up));
+    }
+
+    #[test]
+    fn held_stick_repeats_only_through_the_driver() {
+        use crate::config::InputSettings;
+        use crate::input_repeat::DirectionRepeat;
+
+        let mut latch = StickLatch::default();
+        update_stick(&mut latch, StickAxis::X, 0.9);
+        let mut repeat = DirectionRepeat::default();
+        let settings = InputSettings::default();
+        assert_eq!(repeat.poll(&settings, latch.horizontal(), 0), 1);
+        assert_eq!(repeat.poll(&settings, latch.horizontal(), 100), 0);
+        update_stick(&mut latch, StickAxis::X, 0.95);
+        assert_eq!(repeat.poll(&settings, latch.horizontal(), 400), 1);
+        update_stick(&mut latch, StickAxis::X, 0.0);
+        assert_eq!(repeat.poll(&settings, latch.horizontal(), 500), 0);
+        update_stick(&mut latch, StickAxis::X, 0.9);
+        assert_eq!(repeat.poll(&settings, latch.horizontal(), 500), 1);
     }
 
     #[test]
     fn face_and_dpad_mapping() {
-        assert_eq!(button_action(Button::South), Some(PadAction::Confirm));
-        assert_eq!(button_action(Button::East), Some(PadAction::Back));
-        assert_eq!(button_action(Button::North), Some(PadAction::Favorite));
-        assert_eq!(button_action(Button::West), None);
-        assert_eq!(button_action(Button::Start), None);
-        assert_eq!(button_action(Button::Select), None);
+        let mut pad = PadHeld::default();
         assert_eq!(
-            button_action(Button::DPadLeft),
-            Some(PadAction::Move(NavDir::Left))
+            pad.apply_button(Button::South, true),
+            Some(PadAction::Confirm)
         );
+        assert_eq!(pad.apply_button(Button::East, true), Some(PadAction::Back));
+        assert_eq!(
+            pad.apply_button(Button::North, true),
+            Some(PadAction::Favorite)
+        );
+        assert_eq!(pad.apply_button(Button::West, true), None);
+        assert_eq!(pad.apply_button(Button::Start, true), None);
+        assert_eq!(pad.apply_button(Button::Select, true), None);
+        assert_eq!(pad.apply_button(Button::DPadLeft, true), None);
+        assert_eq!(pad.horizontal(), Some(NavDir::Left));
     }
 
     #[test]
@@ -233,7 +355,15 @@ mod tests {
         let tile = |y| FlowTile { y, height: 80 };
         let four = [tile(12), tile(12), tile(12), tile(12), tile(104)];
         assert_eq!(line_columns(&four, 6), 4);
-        let six = [tile(12), tile(12), tile(12), tile(12), tile(12), tile(12), tile(104)];
+        let six = [
+            tile(12),
+            tile(12),
+            tile(12),
+            tile(12),
+            tile(12),
+            tile(12),
+            tile(104),
+        ];
         assert_eq!(line_columns(&six, 6), 6);
         assert_eq!(line_columns(&[], 6), 6);
         assert_eq!(line_columns(&[FlowTile { y: 0, height: 0 }], 6), 6);

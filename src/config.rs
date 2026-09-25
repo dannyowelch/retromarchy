@@ -4,6 +4,78 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+const INPUT_MS_MAX: u32 = 60_000;
+
+fn default_initial_delay_ms() -> u32 {
+    400
+}
+
+fn default_slow_interval_ms() -> u32 {
+    180
+}
+
+fn default_fast_interval_ms() -> u32 {
+    50
+}
+
+fn default_ramp_ms() -> u32 {
+    2000
+}
+
+/// How long a direction repeats while it is held. Serialized as `[input]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputSettings {
+    /// ms held before the first repeat (after the initial press step)
+    #[serde(default = "default_initial_delay_ms")]
+    pub initial_delay_ms: u32,
+    /// ms between steps during the slow phase
+    #[serde(default = "default_slow_interval_ms")]
+    pub slow_interval_ms: u32,
+    /// ms between steps after ramp completes
+    #[serde(default = "default_fast_interval_ms")]
+    pub fast_interval_ms: u32,
+    /// ms from first repeat until fast rate is reached (interpolate interval)
+    #[serde(default = "default_ramp_ms")]
+    pub ramp_ms: u32,
+}
+
+impl Default for InputSettings {
+    fn default() -> Self {
+        Self {
+            initial_delay_ms: default_initial_delay_ms(),
+            slow_interval_ms: default_slow_interval_ms(),
+            fast_interval_ms: default_fast_interval_ms(),
+            ramp_ms: default_ramp_ms(),
+        }
+    }
+}
+
+impl InputSettings {
+    /// Copy with intervals that cannot stall or spin navigation.
+    pub fn sanitized(self) -> Self {
+        let mut settings = self;
+        settings.sanitize();
+        settings
+    }
+
+    /// Repeat intervals are at least 1 ms, the fast interval is not longer than the slow one, and every field is capped.
+    pub fn sanitize(&mut self) {
+        self.initial_delay_ms = self.initial_delay_ms.min(INPUT_MS_MAX);
+        self.ramp_ms = self.ramp_ms.min(INPUT_MS_MAX);
+        if self.slow_interval_ms == 0 {
+            self.slow_interval_ms = default_slow_interval_ms();
+        }
+        if self.fast_interval_ms == 0 {
+            self.fast_interval_ms = default_fast_interval_ms();
+        }
+        self.slow_interval_ms = self.slow_interval_ms.clamp(1, INPUT_MS_MAX);
+        self.fast_interval_ms = self.fast_interval_ms.clamp(1, INPUT_MS_MAX);
+        if self.fast_interval_ms > self.slow_interval_ms {
+            self.fast_interval_ms = self.slow_interval_ms;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsoleMetadata {
     pub id: String,
@@ -24,6 +96,8 @@ pub struct Config {
     pub consoles: Vec<Console>,
     #[serde(default)]
     pub scraper: ScraperConfig,
+    #[serde(default)]
+    pub input: InputSettings,
 }
 
 fn default_theme() -> String {
@@ -42,6 +116,7 @@ impl Default for Config {
             profiles: Vec::new(),
             consoles: Vec::new(),
             scraper: ScraperConfig::default(),
+            input: InputSettings::default(),
         }
     }
 }
@@ -71,8 +146,14 @@ pub fn load_config() -> Result<Config> {
     }
     let content = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read config from {}", path.display()))?;
-    let config: Config = toml::from_str(&content)
-        .with_context(|| format!("Failed to parse config from {}", path.display()))?;
+    config_from_toml(&content)
+        .with_context(|| format!("Failed to parse config from {}", path.display()))
+}
+
+/// Parse config text and clamp `[input]` so bad values cannot stall navigation.
+pub fn config_from_toml(content: &str) -> Result<Config> {
+    let mut config: Config = toml::from_str(content)?;
+    config.input.sanitize();
     Ok(config)
 }
 
@@ -157,6 +238,69 @@ screenshot = false
         let text = toml::to_string(&config).unwrap();
         assert!(!text.contains("title_screen"));
     }
+
+    #[test]
+    fn missing_input_section_loads_defaults() {
+        let config = config_from_toml("theme = \"system\"\n").unwrap();
+        assert_eq!(config.input, InputSettings::default());
+        assert_eq!(config.input.initial_delay_ms, 400);
+        assert_eq!(config.input.slow_interval_ms, 180);
+        assert_eq!(config.input.fast_interval_ms, 50);
+        assert_eq!(config.input.ramp_ms, 2000);
+    }
+
+    #[test]
+    fn input_settings_round_trip() {
+        let mut config = Config::default();
+        config.input.initial_delay_ms = 250;
+        config.input.slow_interval_ms = 120;
+        config.input.fast_interval_ms = 40;
+        config.input.ramp_ms = 1500;
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("[input]"), "{text}");
+        assert!(text.contains("initial_delay_ms = 250"), "{text}");
+        assert!(text.contains("slow_interval_ms = 120"), "{text}");
+        assert!(text.contains("fast_interval_ms = 40"), "{text}");
+        assert!(text.contains("ramp_ms = 1500"), "{text}");
+        let back = config_from_toml(&text).unwrap();
+        assert_eq!(back.input, config.input);
+    }
+
+    #[test]
+    fn partial_input_table_fills_the_other_fields() {
+        let config = config_from_toml("[input]\ninitial_delay_ms = 100\n").unwrap();
+        assert_eq!(config.input.initial_delay_ms, 100);
+        assert_eq!(config.input.slow_interval_ms, 180);
+        assert_eq!(config.input.fast_interval_ms, 50);
+        assert_eq!(config.input.ramp_ms, 2000);
+    }
+
+    #[test]
+    fn illegal_input_values_cannot_stall_repeat() {
+        let raw = r#"
+[input]
+initial_delay_ms = 999999
+slow_interval_ms = 0
+fast_interval_ms = 400
+ramp_ms = 800000
+"#;
+        let config = config_from_toml(raw).unwrap();
+        assert_eq!(config.input.initial_delay_ms, 60_000);
+        assert_eq!(config.input.ramp_ms, 60_000);
+        assert!(config.input.slow_interval_ms >= 1);
+        assert!(config.input.fast_interval_ms >= 1);
+        assert!(config.input.fast_interval_ms <= config.input.slow_interval_ms);
+
+        let swapped = InputSettings {
+            initial_delay_ms: 10,
+            slow_interval_ms: 40,
+            fast_interval_ms: 90,
+            ramp_ms: 0,
+        }
+        .sanitized();
+        assert_eq!(swapped.fast_interval_ms, 40);
+        assert_eq!(swapped.slow_interval_ms, 40);
+    }
 }
 
 pub fn save_config(config: &Config) -> Result<()> {
@@ -166,4 +310,3 @@ pub fn save_config(config: &Config) -> Result<()> {
         .with_context(|| format!("Failed to write config to {}", path.display()))?;
     Ok(())
 }
-

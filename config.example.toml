@@ -64,6 +64,14 @@ screenshot = false
 manual = false
 video = false
 
+# Hold-repeat for arrow keys, the d-pad, and the left stick.
+# Options → Input in the app edits this. Confirm, Back, and Favorite do not repeat.
+[input]
+initial_delay_ms = 400
+slow_interval_ms = 180
+fast_interval_ms = 50
+ramp_ms = 2000
+
 # Artwork scraper. Hand-edit this, or use Scraper in the app.
 # Images are cached under ~/.local/share/retromarchy/media/.
 # The scraper never downloads ROMs or BIOS.

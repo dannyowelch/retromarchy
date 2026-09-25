@@ -1,5 +1,5 @@
 use crate::catalog;
-use crate::config::{self, Config};
+use crate::config::{self, Config, InputSettings};
 use crate::cores::{self, CoreProfile, DiscoveredCore};
 use crate::importer::{self, FoundFolder, ImportChoice};
 use crate::types::{EmulatorProfile, ProviderEntry, ScraperConfig, ScraperCredentials};
@@ -10,7 +10,7 @@ use gtk4::{
 };
 use libadwaita as adw;
 use rusqlite::Connection;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -1114,6 +1114,121 @@ fn refill_providers(list: &ListBox, providers: &Rc<RefCell<Vec<ProviderEntry>>>)
         row.append(&down);
         list.append(&row);
     }
+}
+
+pub fn open_options(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config>>) {
+    use libadwaita::prelude::*;
+
+    let window = adw::PreferencesWindow::builder()
+        .title("Options")
+        .modal(true)
+        .transient_for(parent)
+        .default_width(520)
+        .default_height(420)
+        .search_enabled(false)
+        .build();
+
+    let page = adw::PreferencesPage::builder()
+        .title("Input")
+        .icon_name("input-keyboard-symbolic")
+        .build();
+    let group = adw::PreferencesGroup::builder()
+        .title("Input")
+        .description("Arrow keys, d-pad, and left stick. Saved to config.toml as you edit. Confirm, Back, and Favorite do not repeat.")
+        .build();
+
+    let current = config.borrow().input.sanitized();
+    let (starting_row, starting) = input_row(
+        "Starting pause",
+        "Milliseconds before the first repeat",
+        0.0,
+        current.initial_delay_ms,
+    );
+    let (slow_row, slow) = input_row(
+        "Slow repeat",
+        "Milliseconds between steps at first",
+        1.0,
+        current.slow_interval_ms,
+    );
+    let (fast_row, fast) = input_row(
+        "Fast repeat",
+        "Milliseconds between steps after the transition",
+        1.0,
+        current.fast_interval_ms,
+    );
+    let (ramp_row, ramp) = input_row(
+        "Slow-to-fast transition",
+        "Milliseconds to ease from the slow repeat to the fast one",
+        0.0,
+        current.ramp_ms,
+    );
+
+    let writing = Rc::new(Cell::new(false));
+    let save: Rc<dyn Fn()> = {
+        let config = config.clone();
+        let writing = writing.clone();
+        let starting = starting.clone();
+        let slow = slow.clone();
+        let fast = fast.clone();
+        let ramp = ramp.clone();
+        Rc::new(move || {
+            if writing.get() {
+                return;
+            }
+            writing.set(true);
+            let mut input = InputSettings {
+                initial_delay_ms: starting.value() as u32,
+                slow_interval_ms: slow.value() as u32,
+                fast_interval_ms: fast.value() as u32,
+                ramp_ms: ramp.value() as u32,
+            };
+            input.sanitize();
+            starting.set_value(f64::from(input.initial_delay_ms));
+            slow.set_value(f64::from(input.slow_interval_ms));
+            fast.set_value(f64::from(input.fast_interval_ms));
+            ramp.set_value(f64::from(input.ramp_ms));
+            config.borrow_mut().input = input;
+            let _ = config::save_config(&config.borrow());
+            writing.set(false);
+        })
+    };
+
+    for (row, spin) in [
+        (&starting_row, &starting),
+        (&slow_row, &slow),
+        (&fast_row, &fast),
+        (&ramp_row, &ramp),
+    ] {
+        let save = save.clone();
+        spin.connect_value_changed(move |_| save());
+        group.add(row);
+    }
+    page.add(&group);
+    window.add(&page);
+    close_on_escape(window.upcast_ref::<gtk4::Window>());
+    window.present();
+    starting.grab_focus();
+}
+
+fn input_row(
+    title: &str,
+    subtitle: &str,
+    min: f64,
+    value: u32,
+) -> (adw::ActionRow, gtk4::SpinButton) {
+    use libadwaita::prelude::*;
+
+    let row = adw::ActionRow::builder()
+        .title(title)
+        .subtitle(subtitle)
+        .build();
+    let spin = gtk4::SpinButton::with_range(min, 60_000.0, 10.0);
+    spin.set_digits(0);
+    spin.set_value(f64::from(value));
+    spin.set_valign(Align::Center);
+    row.add_suffix(&spin);
+    row.set_activatable_widget(Some(&spin));
+    (row, spin)
 }
 
 fn close_on_escape(window: &Window) {
