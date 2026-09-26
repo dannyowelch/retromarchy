@@ -101,7 +101,6 @@ pub fn upsert_game(conn: &Connection, game: &Game) -> Result<()> {
          ON CONFLICT(id) DO UPDATE SET
             console = excluded.console,
             rom = excluded.rom,
-            -- A renamed library title (title_custom) survives rescan. The ROM path is unchanged.
             title = CASE WHEN games.title_custom != 0 THEN games.title ELSE excluded.title END,
             crc32 = COALESCE(games.crc32, excluded.crc32),
             profile = COALESCE(games.profile, excluded.profile),
@@ -238,7 +237,6 @@ fn load_media(conn: &Connection, game_id: &GameId) -> Result<Vec<Media>> {
     Ok(media)
 }
 
-/// One file per kind. Replaces any previous row for this game and kind.
 pub fn set_game_media(conn: &Connection, game_id: &GameId, media: &Media) -> Result<()> {
     conn.execute(
         "DELETE FROM media WHERE game_id = ?1 AND kind = ?2",
@@ -302,6 +300,7 @@ pub fn increment_play_stats(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryStats {
     pub total_games: u32,
     pub last_played_date: Option<DateTime<Utc>>,
