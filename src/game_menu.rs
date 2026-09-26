@@ -1,5 +1,6 @@
 //! Per-game menu. GTK opens it with a right-click, the Menu key, Shift+F10,
 //! or Select (Back / View). Scrape, rename, and delete then follow that window.
+//! The header Scrape button and `s` open this same scrape dialog.
 
 use crate::browse::{stats_of, Browse, LibraryKind};
 use crate::database;
@@ -555,6 +556,15 @@ impl Browse {
         });
     }
 
+    /// GTK Scrape button and the `s` key. Same dialog as the menu's Scrape row.
+    pub fn scrape_selected(&mut self) -> OverlayCommand {
+        let Some(game) = self.selected_game().cloned() else {
+            self.status = "Select a game to scrape.".into();
+            return OverlayCommand::None;
+        };
+        self.begin_scrape(&game)
+    }
+
     fn begin_scrape(&mut self, game: &Game) -> OverlayCommand {
         let query = scrape_query(game);
         let demo = self.library.kind == LibraryKind::Demo;
@@ -1049,5 +1059,67 @@ mod tests {
         assert_eq!(candidate.remote_id, "9");
         assert_eq!(candidate.provider.source(), Source::ScreenScraper);
         assert!(!browse.overlay_open());
+    }
+
+    #[test]
+    fn scrape_selected_opens_the_menu_dialog_and_keeps_the_game() {
+        let mut browse = Browse::new(demo_library("Demo library."));
+        assert_eq!(browse.scrape_selected(), OverlayCommand::None);
+        assert_eq!(browse.status, "Select a game to scrape.");
+        assert!(!browse.overlay_open());
+
+        let mut browse = entered();
+        browse.library.kind = LibraryKind::Disk;
+        let id = browse.selected_game().unwrap().id.clone();
+        assert_eq!(
+            browse.scrape_selected(),
+            OverlayCommand::Search {
+                query: "Super Mario World".into(),
+                console_id: "snes".into(),
+            }
+        );
+        match &browse.overlay {
+            Overlay::Scrape(prompt) => {
+                assert_eq!(prompt.game_id, id);
+                assert!(prompt.searching);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(browse.game, Some(0));
+
+        browse.close_overlay();
+        browse.back();
+        assert_eq!(browse.pane, Pane::Sidebar);
+        assert!(matches!(
+            browse.scrape_selected(),
+            OverlayCommand::Search { .. }
+        ));
+        assert_eq!(browse.game, Some(0));
+    }
+
+    #[test]
+    fn saved_artwork_lands_on_the_game_without_moving_the_selection() {
+        use crate::types::{Media, MediaKind};
+
+        let mut browse = entered();
+        let id = browse.selected_game().unwrap().id.clone();
+        let index = browse.game;
+        browse.remember_media(
+            &id,
+            &Media {
+                kind: MediaKind::Screenshot,
+                path: std::path::PathBuf::from("/tmp/retromarchy-shot.png"),
+                source: Source::ScreenScraper,
+            },
+        );
+        assert_eq!(browse.game, index);
+        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        assert!(browse
+            .selected_game()
+            .unwrap()
+            .media
+            .iter()
+            .any(|media| media.kind == MediaKind::Screenshot
+                && media.source == Source::ScreenScraper));
     }
 }

@@ -1,8 +1,8 @@
 use crate::browse::{
     clamp_cover_width, columns_for, cover_path, file_for, format_play_time, image_aspect,
-    key_from_parts, resolve_profile, row_of, Browse, Confirm, Key, LibraryKind, Pane, TileFrame,
-    COVER_WIDTH_MAX, COVER_WIDTH_MIN, COVER_WIDTH_STEP, DETAILS_PAD, DETAILS_WIDTH, GRID_PAD,
-    SIDEBAR_WIDTH, TILE_GAP,
+    key_from_parts, resolve_profile, row_of, scrape_chord, Browse, Confirm, Key, LibraryKind, Pane,
+    ScrapeChord, TileFrame, COVER_WIDTH_MAX, COVER_WIDTH_MIN, COVER_WIDTH_STEP, DETAILS_PAD,
+    DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH, TILE_GAP,
 };
 use crate::config::{self, InputSettings};
 use crate::database;
@@ -234,6 +234,26 @@ impl Shell {
             cx.stop_propagation();
             return;
         }
+        if !event.is_held {
+            let keystroke = &event.keystroke;
+            let modified = keystroke.modifiers.control
+                || keystroke.modifiers.alt
+                || keystroke.modifiers.platform;
+            if let Some(chord) = scrape_chord(
+                keystroke.key.as_str(),
+                keystroke.key_char.as_deref(),
+                keystroke.modifiers.shift,
+                modified,
+            ) {
+                match chord {
+                    ScrapeChord::Selected => self.scrape_selected(),
+                    ScrapeChord::Missing => self.scrape_missing(),
+                }
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+        }
         let keystroke = &event.keystroke;
         let modified =
             keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
@@ -401,6 +421,35 @@ impl Shell {
         ));
     }
 
+    fn scrape_selected(&mut self) {
+        if let OverlayCommand::Search { query, console_id } = self.browse.scrape_selected() {
+            self.start_search(query, console_id);
+        }
+    }
+
+    fn scrape_missing(&mut self) {
+        let Some(targets) = self.browse.missing_scrape_games() else {
+            return;
+        };
+        if self.apply.is_some() {
+            self.browse.status = "A scrape is already running.".into();
+            return;
+        }
+        let config = match config::load_config() {
+            Ok(config) => config,
+            Err(err) => {
+                self.browse.status = format!("Could not read scraper settings ({err}).");
+                return;
+            }
+        };
+        self.browse.status = "Scraping artwork…".into();
+        self.apply = Some(scraper::spawn_scrape(
+            targets,
+            config.scraper,
+            scraper::fixture_dir_from_env(),
+        ));
+    }
+
     fn start_apply(&mut self, game_id: String, candidate: crate::scraper::ScrapeCandidate) {
         self.search = None;
         if self.apply.is_some() {
@@ -433,6 +482,8 @@ impl Shell {
 
     fn poll_jobs(&mut self) -> bool {
         let mut changed = false;
+        // One update per tick. A scrape can queue many saves; draining them
+        // here would decode images on the UI thread.
         let search = self.search.as_ref().and_then(|rx| match rx.try_recv() {
             Ok(outcome) => Some(Ok(outcome)),
             Err(std::sync::mpsc::TryRecvError::Empty) => None,
@@ -652,27 +703,61 @@ fn header(browse: &Browse, theme_name: &str, cx: &Context<Shell>) -> impl IntoEl
     if browse.library.kind == LibraryKind::Demo {
         row = row.child(badge("Demo library", Status::Warning, cx));
     }
-    row.child(div().flex_1())
-        .child(filter_control(browse, cx))
-        .child(
-            div()
-                .flex()
-                .gap(px(6.))
-                .items_center()
-                .text_color(theme.secondary)
-                .text_size(px(12.))
-                .child(keycap("arrows", cx))
-                .child("move")
-                .child(keycap("d", cx))
-                .child("details")
-                .child(keycap("f", cx))
-                .child("favorite")
-                .child(keycap("menu", cx))
-                .child("game")
-                .child(keycap("esc", cx))
-                .child("clear")
-                .child(keycap("-/+", cx))
-                .child("size"),
+    row.child(
+        div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(4.))
+            .child(scrape_button(false, cx))
+            .child(scrape_button(true, cx)),
+    )
+    .child(div().flex_1())
+    .child(filter_control(browse, cx))
+    .child(
+        div()
+            .flex()
+            .gap(px(6.))
+            .items_center()
+            .text_color(theme.secondary)
+            .text_size(px(12.))
+            .child(keycap("arrows", cx))
+            .child("move")
+            .child(keycap("d", cx))
+            .child("details")
+            .child(keycap("f", cx))
+            .child("favorite")
+            .child(keycap("s", cx))
+            .child("scrape")
+            .child(keycap("S", cx))
+            .child("missing")
+            .child(keycap("menu", cx))
+            .child("game")
+            .child(keycap("esc", cx))
+            .child("clear")
+            .child(keycap("-/+", cx))
+            .child("size"),
+    )
+}
+
+fn scrape_button(missing: bool, cx: &Context<Shell>) -> impl IntoElement {
+    let (id, label) = if missing {
+        ("scrape-missing", "Scrape Missing")
+    } else {
+        ("scrape-selected", "Scrape")
+    };
+    button(id, label, ButtonVariant::Secondary, cx)
+        .flex_shrink_0()
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                if missing {
+                    this.scrape_missing();
+                } else {
+                    this.scrape_selected();
+                }
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
         )
 }
 
@@ -1264,7 +1349,7 @@ fn status_line(
 ) -> impl IntoElement {
     let theme = cx.omarchy();
     let text = if browse.status.is_empty() {
-        "Import, bulk scrape, and emulator setup stay on the GTK app."
+        "Import and emulator setup stay on the GTK app."
     } else {
         browse.status.as_str()
     };

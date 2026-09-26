@@ -585,6 +585,26 @@ impl Browse {
         self.visible_games().count()
     }
 
+    /// Games GTK sends to the background scraper for the system on screen.
+    /// Favorites do not narrow the list. The worker fetches only enabled kinds
+    /// that are not already files. A demo library, an empty shelf, or no system
+    /// sets the status and returns none. The selection is left alone.
+    pub fn missing_scrape_games(&mut self) -> Option<Vec<Game>> {
+        let Some(shelf) = self.shelf() else {
+            self.status = "Select a system before scraping missing artwork.".into();
+            return None;
+        };
+        if shelf.games.is_empty() {
+            self.status = "This system has no games to scrape.".into();
+            return None;
+        }
+        if self.library.kind == LibraryKind::Demo {
+            self.status = "Demo library. Scrape needs a library on disk.".into();
+            return None;
+        }
+        Some(shelf.games.clone())
+    }
+
     /// South (A). An empty grid leaves the system list focused.
     /// On the grid, this does not move; the shell launches when it returns [`Confirm::Launch`].
     pub fn confirm(&mut self) -> Option<Confirm> {
@@ -799,8 +819,41 @@ pub fn columns_for(width: f32, details_open: bool, tile_width: f32) -> usize {
     columns.clamp(1, 8)
 }
 
+/// GTK `s` scrapes the selected game. Shift+S, or an uppercase S, scrapes
+/// missing artwork for the current system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrapeChord {
+    Selected,
+    Missing,
+}
+
 pub fn key_from_name(name: &str, modified: bool) -> Option<Key> {
     key_from_parts(name, None, modified)
+}
+
+/// `modified` is Ctrl, Alt, or the platform key. Shift is separate: it picks
+/// missing artwork, the same way GTK treats `GDK_KEY_S`.
+pub fn scrape_chord(
+    key: &str,
+    key_char: Option<&str>,
+    shift: bool,
+    modified: bool,
+) -> Option<ScrapeChord> {
+    if modified {
+        return None;
+    }
+    let s =
+        key.eq_ignore_ascii_case("s") || key_char.is_some_and(|ch| ch.eq_ignore_ascii_case("s"));
+    if !s {
+        return None;
+    }
+    let upper = key.chars().any(|ch| ch.is_ascii_uppercase())
+        || key_char.is_some_and(|ch| ch.chars().any(|c| c.is_ascii_uppercase()));
+    if shift || upper {
+        Some(ScrapeChord::Missing)
+    } else {
+        Some(ScrapeChord::Selected)
+    }
 }
 
 /// `name` is the GPUI key. `key_char` is the typed character, used when a
@@ -1250,5 +1303,79 @@ mod tests {
         assert!((image_aspect(&webp).unwrap() - 216.0 / 288.0).abs() < 0.001);
 
         assert!(image_aspect(Path::new("/no/such/image.png")).is_none());
+    }
+
+    #[test]
+    fn scrape_chord_matches_gtk_s_and_shift_s() {
+        assert_eq!(
+            scrape_chord("s", Some("s"), false, false),
+            Some(ScrapeChord::Selected)
+        );
+        assert_eq!(
+            scrape_chord("s", Some("S"), true, false),
+            Some(ScrapeChord::Missing)
+        );
+        assert_eq!(
+            scrape_chord("S", None, false, false),
+            Some(ScrapeChord::Missing)
+        );
+        assert_eq!(scrape_chord("s", Some("s"), false, true), None);
+        assert_eq!(scrape_chord("f", Some("f"), false, false), None);
+    }
+
+    #[test]
+    fn missing_scrape_is_the_current_system_and_skips_files_on_disk() {
+        use crate::scraper::{kinds_to_fetch, present_kinds};
+        use crate::types::ScraperConfig;
+
+        let mut browse = sample();
+        browse.confirm();
+        let selected = browse.game;
+        assert!(browse.missing_scrape_games().is_none());
+        assert_eq!(browse.game, selected);
+        assert_eq!(
+            browse.status,
+            "Demo library. Scrape needs a library on disk."
+        );
+
+        browse.library.kind = LibraryKind::Disk;
+        browse.set_filter(GridFilter::Favorites);
+        let selected = browse.game;
+        let games = browse.missing_scrape_games().unwrap();
+        assert_eq!(browse.game, selected);
+        assert_eq!(games.len(), 4);
+        assert!(games.iter().all(|game| game.console == "snes"));
+        assert_eq!(browse.visible_len(), 0);
+
+        let enabled = ScraperConfig::default().enabled_kinds();
+        let mario = games
+            .iter()
+            .find(|game| game.title == "Super Mario World")
+            .unwrap();
+        let chrono = games
+            .iter()
+            .find(|game| game.title == "Chrono Trigger")
+            .unwrap();
+        assert!(kinds_to_fetch(&present_kinds(&mario.media), &enabled).is_empty());
+        assert_eq!(
+            kinds_to_fetch(&present_kinds(&chrono.media), &enabled),
+            enabled
+        );
+
+        browse.select_console(1);
+        let genesis = browse.missing_scrape_games().unwrap();
+        assert_eq!(genesis.len(), 3);
+        assert!(genesis.iter().all(|game| game.console == "genesis"));
+
+        browse.library.shelves[1].games.clear();
+        assert!(browse.missing_scrape_games().is_none());
+        assert_eq!(browse.status, "This system has no games to scrape.");
+
+        browse.library.shelves.clear();
+        assert!(browse.missing_scrape_games().is_none());
+        assert_eq!(
+            browse.status,
+            "Select a system before scraping missing artwork."
+        );
     }
 }
