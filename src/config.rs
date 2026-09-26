@@ -206,6 +206,14 @@ pub fn save_input_settings(input: InputSettings) -> Result<()> {
     save_config(&config)
 }
 
+/// Load config, replace `[scraper]`, and write the file back.
+/// Theme, input, consoles, and profiles stay as they were.
+pub fn save_scraper_settings(scraper: ScraperConfig) -> Result<()> {
+    let mut config = load_config()?;
+    config.scraper = scraper;
+    save_config(&config)
+}
+
 /// Load config, store `theme`, and write the file back.
 pub fn save_theme_name(theme: &str) -> Result<()> {
     let mut config = load_config()?;
