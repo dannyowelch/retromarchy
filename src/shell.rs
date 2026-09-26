@@ -420,6 +420,9 @@ fn initials(title: &str) -> String {
     }
 }
 
+const DETAILS_PAD: f32 = 8.0;
+const DETAILS_GAP: f32 = 6.0;
+
 fn details(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
     let theme = cx.omarchy();
     let mut pane = div()
@@ -430,8 +433,9 @@ fn details(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
         .overflow_y_scroll()
         .flex()
         .flex_col()
-        .gap(px(8.))
-        .p(px(16.))
+        .justify_start()
+        .gap(px(DETAILS_GAP))
+        .p(px(DETAILS_PAD))
         .bg(theme.surface)
         .border_l_1()
         .border_color(theme.border);
@@ -439,18 +443,22 @@ fn details(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
         return pane;
     };
     if let Some(game) = browse.selected_game() {
+        pane = pane.child(
+            button("play", "Play", ButtonVariant::Primary, cx)
+                .flex_shrink_0()
+                .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
+                    this.launch_selected();
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                })),
+        );
+        if let Some(path) = file_for(game, MediaKind::BoxArt) {
+            pane = pane.child(art_block(path));
+        }
+        if let Some(path) = file_for(game, MediaKind::Screenshot) {
+            pane = pane.child(art_block(path));
+        }
         pane = pane
-            .child(
-                button("play", "Play", ButtonVariant::Primary, cx).on_click(cx.listener(
-                    |this: &mut Shell, _: &ClickEvent, window, cx| {
-                        this.launch_selected();
-                        this.focus_handle.focus(window, cx);
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(art_block(file_for(game, MediaKind::BoxArt)))
-            .child(art_block(file_for(game, MediaKind::Screenshot)))
             .child(heading(&game.title))
             .child(meta(format!("Console: {}", shelf.console.name), cx));
         if let Some(played) = game.last_played {
@@ -533,21 +541,22 @@ fn details(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
         }))
 }
 
-fn art_block(path: Option<std::path::PathBuf>) -> impl IntoElement {
-    let mut block = div().w_full().flex_shrink_0();
-    if let Some(path) = path {
-        block = block.child(
-            img(path)
-                .w_full()
-                .flex_shrink_0()
-                .object_fit(ObjectFit::Contain),
-        );
-    }
-    block
+/// Details art at the pane's content width and the file's aspect.
+/// A percent width makes GPUI lock the height to the file's pixel height,
+/// so Contain letterboxes the picture inside a tall empty slot.
+fn art_block(path: std::path::PathBuf) -> impl IntoElement {
+    let width = DETAILS_WIDTH - DETAILS_PAD * 2.0 - 1.0;
+    div().w_full().flex_shrink_0().child(
+        img(path)
+            .w(px(width))
+            .flex_shrink_0()
+            .object_fit(ObjectFit::Contain),
+    )
 }
 
 fn heading(text: &str) -> impl IntoElement {
     div()
+        .flex_shrink_0()
         .font_weight(gpui_kit::FontWeight::BOLD)
         .text_size(px(16.))
         .child(text.to_string())
@@ -555,6 +564,7 @@ fn heading(text: &str) -> impl IntoElement {
 
 fn meta(text: String, cx: &App) -> impl IntoElement {
     div()
+        .flex_shrink_0()
         .text_size(px(12.))
         .text_color(cx.omarchy().secondary)
         .child(text)
