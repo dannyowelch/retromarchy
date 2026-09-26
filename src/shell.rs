@@ -5,19 +5,22 @@ use crate::browse::{
     SIDEBAR_WIDTH, TILE_GAP,
 };
 use crate::config;
+use crate::database;
+use crate::gamepad::{PadAction, PadHeld};
 use crate::launcher;
-use crate::types::{Game, GridArt, MediaKind};
+use crate::types::{Game, GridArt, GridFilter, MediaKind};
 use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::{
-    div, img, point, px, App, AppContext, ClickEvent, Context, Entity, FocusHandle,
+    div, img, point, px, rgb, App, AppContext, ClickEvent, Context, Entity, FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, ObjectFit, ParentElement, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, StyledImage, Subscription, Window, WindowBounds,
+    StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, Window, WindowBounds,
     WindowDecorations, WindowOptions,
 };
 use gpui_omarchy::{
     badge, button, empty_state, focus_scope, keycap, separator, slider, vertical_separator,
     ActiveTheme, ButtonVariant, Status,
 };
+use std::time::Duration;
 
 pub struct Shell {
     browse: Browse,
@@ -30,7 +33,13 @@ pub struct Shell {
     revealed_columns: usize,
     cover_slider: Entity<SliderState>,
     _cover_slider_sub: Subscription,
+    gilrs: Option<gilrs::Gilrs>,
+    pad: PadHeld,
+    _pad_poll: Task<()>,
 }
+
+/// GTK favorite red (`#e01b24`).
+const FAVORITE_RED: u32 = 0xe01b24;
 
 impl Shell {
     pub fn new(browse: Browse, cx: &mut Context<Self>) -> Self {
@@ -49,6 +58,30 @@ impl Shell {
                 };
                 this.apply_cover_width(value, cx);
             });
+        let gilrs = match gilrs::Gilrs::new() {
+            Ok(gilrs) => Some(gilrs),
+            Err(err) => {
+                eprintln!("Gamepad unavailable: {err}");
+                None
+            }
+        };
+        let pad_poll = if gilrs.is_some() {
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.poll_gamepad(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            })
+        } else {
+            Task::ready(())
+        };
         Self {
             browse,
             focus_handle: cx.focus_handle(),
@@ -60,7 +93,50 @@ impl Shell {
             revealed_columns: 0,
             cover_slider,
             _cover_slider_sub: cover_slider_sub,
+            gilrs,
+            pad: PadHeld::default(),
+            _pad_poll: pad_poll,
         }
+    }
+
+    /// North (Y) toggles the selected game. Directions stay on the keyboard path.
+    fn poll_gamepad(&mut self, cx: &mut Context<Self>) {
+        let events = self.drain_pad_events();
+        let mut changed = false;
+        for event in &events {
+            if self.pad.apply(event) == Some(PadAction::Favorite) {
+                changed |= self.toggle_favorite();
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn drain_pad_events(&mut self) -> Vec<gilrs::EventType> {
+        let Some(gilrs) = self.gilrs.as_mut() else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn toggle_favorite(&mut self) -> bool {
+        let conn = if self.browse.library.kind == LibraryKind::Disk {
+            match database::init_db() {
+                Ok(conn) => Some(conn),
+                Err(err) => {
+                    self.browse.status = format!("Could not save favorite ({err}).");
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+        self.browse.toggle_favorite(conn.as_ref())
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -77,6 +153,8 @@ impl Shell {
         let before = self.browse.cover_width;
         if key == Key::Launch {
             self.launch_selected();
+        } else if key == Key::ToggleFavorite {
+            self.toggle_favorite();
         } else {
             self.browse.apply(key);
         }
@@ -204,7 +282,7 @@ impl Render for Shell {
     }
 }
 
-fn header(browse: &Browse, theme_name: &str, cx: &App) -> impl IntoElement {
+fn header(browse: &Browse, theme_name: &str, cx: &Context<Shell>) -> impl IntoElement {
     let theme = cx.omarchy();
     let mut row = div()
         .flex()
@@ -224,22 +302,76 @@ fn header(browse: &Browse, theme_name: &str, cx: &App) -> impl IntoElement {
     if browse.library.kind == LibraryKind::Demo {
         row = row.child(badge("Demo library", Status::Warning, cx));
     }
-    row.child(div().flex_1()).child(
-        div()
-            .flex()
-            .gap(px(6.))
-            .items_center()
-            .text_color(theme.secondary)
-            .text_size(px(12.))
-            .child(keycap("arrows", cx))
-            .child("move")
-            .child(keycap("d", cx))
-            .child("details")
-            .child(keycap("esc", cx))
-            .child("clear")
-            .child(keycap("-/+", cx))
-            .child("size"),
-    )
+    row.child(div().flex_1())
+        .child(filter_control(browse, cx))
+        .child(
+            div()
+                .flex()
+                .gap(px(6.))
+                .items_center()
+                .text_color(theme.secondary)
+                .text_size(px(12.))
+                .child(keycap("arrows", cx))
+                .child("move")
+                .child(keycap("d", cx))
+                .child("details")
+                .child(keycap("f", cx))
+                .child("favorite")
+                .child(keycap("esc", cx))
+                .child("clear")
+                .child(keycap("-/+", cx))
+                .child("size"),
+        )
+}
+
+fn filter_control(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .id("grid-filter")
+        .flex()
+        .flex_shrink_0()
+        .border_1()
+        .border_color(theme.border)
+        .child(filter_segment(browse, GridFilter::All, false, cx))
+        .child(filter_segment(browse, GridFilter::Favorites, true, cx))
+}
+
+fn filter_segment(
+    browse: &Browse,
+    filter: GridFilter,
+    divider: bool,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let on = browse.filter == filter;
+    let mut segment = div()
+        .id(match filter {
+            GridFilter::All => "filter-all",
+            GridFilter::Favorites => "filter-favorites",
+        })
+        .px(px(10.))
+        .py(px(4.))
+        .text_size(px(12.))
+        .cursor_pointer()
+        .bg(if on {
+            theme.selected_fill()
+        } else {
+            theme.background
+        })
+        .text_color(if on { theme.accent } else { theme.foreground })
+        .hover(|style| style.bg(theme.hover_fill()))
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                this.browse.set_filter(filter);
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+        .child(filter.label());
+    if divider {
+        segment = segment.border_l_1().border_color(theme.border);
+    }
+    segment
 }
 
 fn note_bar(note: &str, cx: &App) -> Option<impl IntoElement> {
@@ -376,25 +508,36 @@ fn grid(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl Int
             cx,
         ));
     };
-    if shelf.games.is_empty() {
+    let visible: Vec<&Game> = shelf
+        .games
+        .iter()
+        .filter(|game| browse.filter.matches(game))
+        .collect();
+    if visible.is_empty() {
+        if shelf.games.is_empty() {
+            return pane.child(empty_state(
+                "No games found",
+                "This console has no scanned games.",
+                cx,
+            ));
+        }
         return pane.child(empty_state(
-            "No games found",
-            "This console has no scanned games.",
+            "No favorites",
+            "Show All, select a game, and press f.",
             cx,
         ));
     }
     let columns = browse.columns.max(1);
     let art = shelf.console.grid_art;
     let demo = browse.library.kind == LibraryKind::Demo;
-    let count = shelf.games.len();
+    let count = visible.len();
     for start in (0..count).step_by(columns) {
         let end = (start + columns).min(count);
         let mut row = div().flex().flex_row().flex_shrink_0().gap(px(TILE_GAP));
         for index in start..end {
-            let game = &shelf.games[index];
             row = row.child(tile(
                 index,
-                game,
+                visible[index],
                 art,
                 browse.cover_width,
                 browse.game == Some(index),
@@ -447,6 +590,7 @@ fn tile(
     };
     let mut caption = div()
         .p(px(8.))
+        .min_h(px(40.))
         .w(px(frame.width))
         .text_size(px(12.))
         .line_clamp(2)
@@ -454,8 +598,10 @@ fn tile(
     if demo {
         caption = caption.child(div().text_color(theme.secondary).child("Placeholder"));
     }
-    div()
+    // The heart is a card overlay, in the title band, so the cover does not crop it.
+    let mut card = div()
         .id(("game", index))
+        .relative()
         .w(px(frame.width))
         .flex_shrink_0()
         .bg(theme.inset)
@@ -471,7 +617,40 @@ fn tile(
             }),
         )
         .child(image)
-        .child(caption)
+        .child(caption);
+    if game.favorite {
+        card = card.child(favorite_badge());
+    }
+    card
+}
+
+fn favorite_badge() -> impl IntoElement {
+    div()
+        .absolute()
+        .bottom(px(6.))
+        .right(px(6.))
+        .font_family("DejaVu Sans")
+        .font_weight(gpui_kit::FontWeight::BOLD)
+        .text_size(px(18.))
+        .text_color(rgb(FAVORITE_RED))
+        .child("♥")
+}
+
+fn favorite_toggle(favorite: bool, cx: &Context<Shell>) -> impl IntoElement {
+    let label = if favorite { "♥" } else { "♡" };
+    let mut button = button("favorite", label, ButtonVariant::Secondary, cx)
+        .flex_none()
+        .font_family("DejaVu Sans")
+        .text_size(px(18.))
+        .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
+            this.toggle_favorite();
+            this.focus_handle.focus(window, cx);
+            cx.notify();
+        }));
+    if favorite {
+        button = button.text_color(rgb(FAVORITE_RED));
+    }
+    button
 }
 
 fn initials(title: &str) -> String {
@@ -511,14 +690,23 @@ fn details(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
         return pane;
     };
     if let Some(game) = browse.selected_game() {
+        let favorite = game.favorite;
         pane = pane.child(
-            button("play", "Play", ButtonVariant::Primary, cx)
+            div()
+                .flex()
                 .flex_none()
-                .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-                    this.launch_selected();
-                    this.focus_handle.focus(window, cx);
-                    cx.notify();
-                })),
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    button("play", "Play", ButtonVariant::Primary, cx)
+                        .flex_1()
+                        .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
+                            this.launch_selected();
+                            this.focus_handle.focus(window, cx);
+                            cx.notify();
+                        })),
+                )
+                .child(favorite_toggle(favorite, cx)),
         );
         if let Some(path) = file_for(game, MediaKind::BoxArt) {
             pane = pane.child(detail_art(path, MediaKind::BoxArt));

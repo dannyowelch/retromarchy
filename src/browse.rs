@@ -1,7 +1,7 @@
 use crate::config::{self, ConsoleMetadata};
 use crate::database::{self, LibraryStats};
 use crate::gamepad::{grid_step, list_step, NavDir};
-use crate::types::{Console, EmulatorProfile, Game, GridArt, Media, MediaKind, Source};
+use crate::types::{Console, EmulatorProfile, Game, GridArt, GridFilter, Media, MediaKind, Source};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::fs::File;
@@ -50,6 +50,8 @@ pub struct Browse {
     pub columns: usize,
     /// One cover width for every system, in pixels.
     pub cover_width: f32,
+    /// All games, or favorites only, for the console on screen.
+    pub filter: GridFilter,
     pub status: String,
 }
 
@@ -61,6 +63,8 @@ pub enum Key {
     Clear,
     ToggleDetails,
     Launch,
+    /// Keyboard `f`. Gamepad North (Y) uses the same toggle.
+    ToggleFavorite,
     CoverSmaller,
     CoverLarger,
 }
@@ -532,6 +536,7 @@ impl Browse {
             details_open,
             columns: 4,
             cover_width: clamp_cover_width(cover_width),
+            filter: GridFilter::All,
             status: String::new(),
         }
     }
@@ -549,7 +554,22 @@ impl Browse {
 
     pub fn selected_game(&self) -> Option<&Game> {
         let index = self.game?;
-        self.shelf()?.games.get(index)
+        self.visible_games().nth(index)
+    }
+
+    /// Games the grid shows for the current console. Same rule as GTK
+    /// `visible_games` with an empty title query: [`GridFilter`] only.
+    pub fn visible_games(&self) -> impl Iterator<Item = &Game> {
+        let filter = self.filter;
+        let games = self
+            .shelf()
+            .map(|shelf| shelf.games.as_slice())
+            .unwrap_or(&[]);
+        games.iter().filter(move |game| filter.matches(game))
+    }
+
+    pub fn visible_len(&self) -> usize {
+        self.visible_games().count()
     }
 
     pub fn apply(&mut self, key: Key) {
@@ -563,9 +583,70 @@ impl Browse {
             }
             Key::EnterGrid => self.enter_grid(),
             Key::Launch => {}
+            Key::ToggleFavorite => {
+                self.toggle_favorite(None);
+            }
             Key::Arrow(dir) => self.move_arrow(dir),
             Key::Grid(dir) => self.step_grid(dir),
         }
+    }
+
+    pub fn set_filter(&mut self, filter: GridFilter) {
+        if self.filter == filter {
+            return;
+        }
+        let keep = self.selected_game().map(|game| game.id.clone());
+        self.filter = filter;
+        self.game = keep.and_then(|id| self.visible_position(&id));
+    }
+
+    /// Flip the selected game. `conn` is the open library database for a disk
+    /// library; demo libraries ignore it and stay in memory. A disk write that
+    /// fails leaves the flag unchanged.
+    pub fn toggle_favorite(&mut self, conn: Option<&rusqlite::Connection>) -> bool {
+        let Some(id) = self.selected_game().map(|game| game.id.clone()) else {
+            return false;
+        };
+        let next = !self
+            .selected_game()
+            .map(|game| game.favorite)
+            .unwrap_or(false);
+        if self.library.kind == LibraryKind::Disk {
+            let Some(conn) = conn else {
+                self.status = "Could not save favorite.".into();
+                return false;
+            };
+            if database::set_favorite(conn, &id, next).is_err() {
+                self.status = "Could not save favorite.".into();
+                return false;
+            }
+        }
+        self.write_favorite(&id, next);
+        if self.library.kind == LibraryKind::Demo {
+            self.status = "Demo favorite stays in memory until you quit.".into();
+        } else if self.status.starts_with("Could not save favorite") {
+            self.status.clear();
+        }
+        true
+    }
+
+    fn write_favorite(&mut self, id: &str, favorite: bool) {
+        let console = self.console;
+        if let Some(game) = self
+            .library
+            .shelves
+            .get_mut(console)
+            .and_then(|shelf| shelf.games.iter_mut().find(|game| game.id == id))
+        {
+            game.favorite = favorite;
+        }
+        if self.filter == GridFilter::Favorites && !favorite {
+            self.game = None;
+        }
+    }
+
+    fn visible_position(&self, id: &str) -> Option<usize> {
+        self.visible_games().position(|game| game.id == id)
     }
 
     pub fn set_columns(&mut self, columns: usize) {
@@ -588,8 +669,7 @@ impl Browse {
     }
 
     pub fn select_game(&mut self, index: usize) {
-        let len = self.shelf().map(|shelf| shelf.games.len()).unwrap_or(0);
-        if index >= len {
+        if index >= self.visible_len() {
             return;
         }
         self.game = Some(index);
@@ -627,7 +707,7 @@ impl Browse {
 
     fn enter_grid(&mut self) {
         self.pane = Pane::Grid;
-        let len = self.shelf().map(|shelf| shelf.games.len()).unwrap_or(0);
+        let len = self.visible_len();
         if len == 0 {
             self.game = None;
             return;
@@ -638,7 +718,7 @@ impl Browse {
     }
 
     fn step_grid(&mut self, dir: NavDir) {
-        let len = self.shelf().map(|shelf| shelf.games.len()).unwrap_or(0) as i32;
+        let len = self.visible_len() as i32;
         let columns = self.columns.max(1) as i32;
         let index = self.game.map(|index| index as i32);
         if let Some(next) = grid_step(index, dir, len, columns) {
@@ -707,6 +787,7 @@ fn map_key(name: &str) -> Option<Key> {
         "tab" => Key::EnterGrid,
         "escape" => Key::Clear,
         "d" => Key::ToggleDetails,
+        "f" => Key::ToggleFavorite,
         "enter" => Key::Launch,
         "-" | "minus" | "subtract" | "kp_subtract" | "numpadsubtract" => Key::CoverSmaller,
         "+" | "plus" | "=" | "equal" | "equals" | "add" | "kp_add" | "numpadadd" => {
@@ -920,6 +1001,103 @@ mod tests {
         );
         assert_eq!(key_from_name("-", true), None);
         assert_eq!(key_from_name("d", false), Some(Key::ToggleDetails));
+        assert_eq!(key_from_name("f", false), Some(Key::ToggleFavorite));
+        assert_eq!(key_from_name("f", true), None);
+    }
+
+    #[test]
+    fn favorites_filter_and_toggle_follow_the_gtk_rules() {
+        let mut browse = sample();
+        browse.apply(Key::ToggleFavorite);
+        assert!(browse.selected_game().is_none());
+
+        browse.select_game(0);
+        browse.apply(Key::ToggleFavorite);
+        assert!(browse.selected_game().unwrap().favorite);
+        assert_eq!(
+            browse.status,
+            "Demo favorite stays in memory until you quit."
+        );
+        browse.select_game(2);
+        assert!(browse.toggle_favorite(None));
+        assert_eq!(browse.selected_game().unwrap().title, "Super Metroid");
+        assert!(browse.selected_game().unwrap().favorite);
+
+        browse.set_filter(GridFilter::Favorites);
+        assert_eq!(browse.visible_len(), 2);
+        assert_eq!(browse.selected_game().unwrap().title, "Super Metroid");
+        browse.set_columns(4);
+        browse.apply(Key::Arrow(NavDir::Left));
+        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        browse.apply(Key::Arrow(NavDir::Right));
+        assert_eq!(browse.selected_game().unwrap().title, "Super Metroid");
+
+        assert!(browse.toggle_favorite(None));
+        assert!(browse.selected_game().is_none());
+        assert_eq!(browse.visible_len(), 1);
+        assert!(!browse.library.shelves[0].games[2].favorite);
+        assert!(browse.library.shelves[0].games[0].favorite);
+
+        browse.set_filter(GridFilter::All);
+        assert_eq!(browse.visible_len(), 4);
+        assert!(browse.selected_game().is_none());
+        browse.select_game(1);
+        browse.set_filter(GridFilter::Favorites);
+        assert!(browse.selected_game().is_none());
+        assert_eq!(browse.pane, Pane::Grid);
+    }
+
+    #[test]
+    fn disk_favorite_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+        let conn = database::open_db(&path).unwrap();
+        let mut alpha = demo_game("snes", "Alpha", 0, 0, None);
+        alpha.rom = PathBuf::from("/roms/snes/alpha.sfc");
+        let mut beta = demo_game("snes", "Beta", 0, 0, None);
+        beta.rom = PathBuf::from("/roms/snes/beta.sfc");
+        database::upsert_game(&conn, &alpha).unwrap();
+        database::upsert_game(&conn, &beta).unwrap();
+        let config = config::Config {
+            consoles: vec![Console {
+                id: "snes".into(),
+                name: "Super Nintendo".into(),
+                rom_dirs: Vec::new(),
+                extensions: vec!["sfc".into()],
+                profile: None,
+                grid_art: GridArt::BoxArt,
+                media: MediaToggles::default(),
+            }],
+            ..config::Config::default()
+        };
+        let mut browse = Browse::new(from_config(&config, &conn));
+        assert_eq!(browse.library.kind, LibraryKind::Disk);
+        browse.select_game(1);
+        assert!(!browse.toggle_favorite(None));
+        assert!(!browse.selected_game().unwrap().favorite);
+        assert!(browse.status.starts_with("Could not save favorite"));
+
+        assert!(browse.toggle_favorite(Some(&conn)));
+        assert!(browse.selected_game().unwrap().favorite);
+        assert!(browse.status.is_empty());
+        drop(conn);
+        let conn = database::open_db(&path).unwrap();
+        let saved = database::load_games(&conn, Some(&"snes".to_string())).unwrap();
+        assert!(saved
+            .iter()
+            .any(|game| game.title == "Beta" && game.favorite));
+        assert!(saved
+            .iter()
+            .any(|game| game.title == "Alpha" && !game.favorite));
+
+        browse.set_filter(GridFilter::Favorites);
+        assert_eq!(browse.visible_len(), 1);
+        assert_eq!(browse.selected_game().unwrap().title, "Beta");
+        assert!(browse.toggle_favorite(Some(&conn)));
+        assert!(browse.selected_game().is_none());
+        assert_eq!(browse.visible_len(), 0);
+        let saved = database::load_games(&conn, Some(&"snes".to_string())).unwrap();
+        assert!(saved.iter().all(|game| !game.favorite));
     }
 
     #[test]
