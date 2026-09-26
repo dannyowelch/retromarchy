@@ -1,5 +1,6 @@
 use crate::config::{self, ConsoleMetadata};
 use crate::database::{self, LibraryStats};
+use crate::game_menu::Overlay;
 use crate::gamepad::{grid_step, list_step, NavDir};
 use crate::types::{Console, EmulatorProfile, Game, GridArt, GridFilter, Media, MediaKind, Source};
 use chrono::{DateTime, Utc};
@@ -53,6 +54,8 @@ pub struct Browse {
     /// All games, or favorites only, for the console on screen.
     pub filter: GridFilter,
     pub status: String,
+    /// Per-game menu, or the rename, delete, or scrape dialog in front of it.
+    pub overlay: Overlay,
 }
 
 /// South (A) on the browse shell.
@@ -547,6 +550,7 @@ impl Browse {
             cover_width: clamp_cover_width(cover_width),
             filter: GridFilter::All,
             status: String::new(),
+            overlay: Overlay::None,
         }
     }
 
