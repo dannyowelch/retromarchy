@@ -1,6 +1,7 @@
 use crate::browse::{
-    columns_for, cover_path, file_for, format_play_time, key_from_name, resolve_profile, row_of,
-    Browse, Key, LibraryKind, Pane, TileFrame, DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH, TILE_GAP,
+    columns_for, cover_path, file_for, format_play_time, image_aspect, key_from_name,
+    resolve_profile, row_of, Browse, Key, LibraryKind, Pane, TileFrame, DETAILS_PAD, DETAILS_WIDTH,
+    GRID_PAD, SIDEBAR_WIDTH, TILE_GAP,
 };
 use crate::launcher;
 use crate::types::{Game, GridArt, MediaKind};
@@ -430,8 +431,9 @@ fn details(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
         .overflow_y_scroll()
         .flex()
         .flex_col()
+        .justify_start()
         .gap(px(8.))
-        .p(px(16.))
+        .p(px(DETAILS_PAD))
         .bg(theme.surface)
         .border_l_1()
         .border_color(theme.border);
@@ -439,18 +441,22 @@ fn details(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
         return pane;
     };
     if let Some(game) = browse.selected_game() {
+        pane = pane.child(
+            button("play", "Play", ButtonVariant::Primary, cx)
+                .flex_none()
+                .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
+                    this.launch_selected();
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                })),
+        );
+        if let Some(path) = file_for(game, MediaKind::BoxArt) {
+            pane = pane.child(detail_art(path, MediaKind::BoxArt));
+        }
+        if let Some(path) = file_for(game, MediaKind::Screenshot) {
+            pane = pane.child(detail_art(path, MediaKind::Screenshot));
+        }
         pane = pane
-            .child(
-                button("play", "Play", ButtonVariant::Primary, cx).on_click(cx.listener(
-                    |this: &mut Shell, _: &ClickEvent, window, cx| {
-                        this.launch_selected();
-                        this.focus_handle.focus(window, cx);
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(art_block(file_for(game, MediaKind::BoxArt)))
-            .child(art_block(file_for(game, MediaKind::Screenshot)))
             .child(heading(&game.title))
             .child(meta(format!("Console: {}", shelf.console.name), cx));
         if let Some(played) = game.last_played {
@@ -533,21 +539,26 @@ fn details(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
         }))
 }
 
-fn art_block(path: Option<std::path::PathBuf>) -> impl IntoElement {
-    let mut block = div().w_full().flex_shrink_0();
-    if let Some(path) = path {
-        block = block.child(
-            img(path)
-                .w_full()
-                .flex_shrink_0()
-                .object_fit(ObjectFit::Contain),
-        );
-    }
-    block
+fn detail_art(path: std::path::PathBuf, kind: MediaKind) -> impl IntoElement {
+    let ratio = image_aspect(&path).unwrap_or(match kind {
+        MediaKind::Screenshot => 4.0 / 3.0,
+        _ => 3.0 / 4.0,
+    });
+    // Border box includes padding and the 1px left border. Height follows the
+    // file so Contain fills the slot instead of a tall letterbox.
+    let width = (DETAILS_WIDTH - DETAILS_PAD * 2.0 - 1.0).max(1.0);
+    let height = (width / ratio.max(0.05)).max(1.0);
+    img(path)
+        .w_full()
+        .h(px(height))
+        .flex_none()
+        .aspect_ratio(ratio)
+        .object_fit(ObjectFit::Contain)
 }
 
 fn heading(text: &str) -> impl IntoElement {
     div()
+        .flex_none()
         .font_weight(gpui_kit::FontWeight::BOLD)
         .text_size(px(16.))
         .child(text.to_string())
@@ -555,6 +566,7 @@ fn heading(text: &str) -> impl IntoElement {
 
 fn meta(text: String, cx: &App) -> impl IntoElement {
     div()
+        .flex_none()
         .text_size(px(12.))
         .text_color(cx.omarchy().secondary)
         .child(text)

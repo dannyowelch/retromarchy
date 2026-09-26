@@ -3,7 +3,11 @@ use crate::database::{self, LibraryStats};
 use crate::gamepad::{grid_step, list_step, NavDir};
 use crate::types::{Console, EmulatorProfile, Game, GridArt, Media, MediaKind, Source};
 use chrono::{DateTime, Utc};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LibraryKind {
@@ -98,25 +102,25 @@ fn shelf_from_disk(
 
 pub fn demo_library(note: &str) -> Library {
     let metadata = config::load_console_metadata().unwrap_or_default();
-    let mut mario = demo_game("snes", "Super Mario World", 12, 5400, Some(demo_played()));
     let demo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/demo");
-    mario.media = vec![
-        Media {
-            kind: MediaKind::BoxArt,
-            path: demo_dir.join("snes-box.png"),
-            source: Source::Local,
-        },
-        Media {
-            kind: MediaKind::Screenshot,
-            path: demo_dir.join("snes-shot.png"),
-            source: Source::Local,
-        },
-    ];
+    let box_art = demo_dir.join("snes-box.png");
+    let shot = demo_dir.join("snes-shot.png");
+    let mario = with_art(
+        demo_game("snes", "Super Mario World", 12, 5400, Some(demo_played())),
+        &box_art,
+        &shot,
+    );
+    let sonic = with_art(
+        demo_game("genesis", "Sonic the Hedgehog", 7, 2400, None),
+        &box_art,
+        &shot,
+    );
     let shelves = vec![
         demo_shelf(
             "snes",
             "Super Nintendo",
             &metadata,
+            GridArt::BoxArt,
             vec![
                 mario,
                 demo_game(
@@ -134,8 +138,9 @@ pub fn demo_library(note: &str) -> Library {
             "genesis",
             "Sega Genesis",
             &metadata,
+            GridArt::Screenshot,
             vec![
-                demo_game("genesis", "Sonic the Hedgehog", 7, 2400, None),
+                sonic,
                 demo_game("genesis", "Streets of Rage 2", 1, 300, None),
                 demo_game("genesis", "Gunstar Heroes", 0, 0, None),
             ],
@@ -144,6 +149,7 @@ pub fn demo_library(note: &str) -> Library {
             "nes",
             "NES",
             &metadata,
+            GridArt::BoxArt,
             vec![
                 demo_game("nes", "Super Mario Bros.", 3, 600, None),
                 demo_game("nes", "The Legend of Zelda", 0, 0, None),
@@ -160,7 +166,13 @@ pub fn demo_library(note: &str) -> Library {
     }
 }
 
-fn demo_shelf(id: &str, name: &str, metadata: &[ConsoleMetadata], games: Vec<Game>) -> Shelf {
+fn demo_shelf(
+    id: &str,
+    name: &str,
+    metadata: &[ConsoleMetadata],
+    grid_art: GridArt,
+    games: Vec<Game>,
+) -> Shelf {
     let stats = stats_of(&games);
     shelf(
         Console {
@@ -169,13 +181,29 @@ fn demo_shelf(id: &str, name: &str, metadata: &[ConsoleMetadata], games: Vec<Gam
             rom_dirs: Vec::new(),
             extensions: Vec::new(),
             profile: None,
-            grid_art: GridArt::BoxArt,
+            grid_art,
             media: Default::default(),
         },
         metadata,
         games,
         stats,
     )
+}
+
+fn with_art(mut game: Game, box_art: &Path, shot: &Path) -> Game {
+    game.media = vec![
+        Media {
+            kind: MediaKind::BoxArt,
+            path: box_art.to_path_buf(),
+            source: Source::Local,
+        },
+        Media {
+            kind: MediaKind::Screenshot,
+            path: shot.to_path_buf(),
+            source: Source::Local,
+        },
+    ];
+    game
 }
 
 fn shelf(
@@ -292,10 +320,154 @@ pub fn cover_path(game: &Game, art: GridArt) -> Option<PathBuf> {
     None
 }
 
-pub const SIDEBAR_WIDTH: f32 = 220.0;
+/// Width / height from a png, jpeg, gif, or webp header. Missing and unknown
+/// files return none so the details pane can fall back to a fixed ratio.
+/// Cached because the details pane asks again on every frame.
+pub fn image_aspect(path: &Path) -> Option<f32> {
+    static CACHE: Mutex<Option<HashMap<PathBuf, Option<f32>>>> = Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some(ratio) = cache.get(path) {
+        return *ratio;
+    }
+    let ratio = read_image_aspect(path);
+    cache.insert(path.to_path_buf(), ratio);
+    ratio
+}
+
+fn read_image_aspect(path: &Path) -> Option<f32> {
+    let file = File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(512 * 1024).read_to_end(&mut bytes).ok()?;
+    let (width, height) = image_pixel_size(&bytes)?;
+    if width == 0 || height == 0 {
+        None
+    } else {
+        Some(width as f32 / height as f32)
+    }
+}
+
+fn image_pixel_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    png_size(bytes)
+        .or_else(|| gif_size(bytes))
+        .or_else(|| webp_size(bytes))
+        .or_else(|| jpeg_size(bytes))
+}
+
+fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[0..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((width, height))
+}
+
+fn gif_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 10 || !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        return None;
+    }
+    let width = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32;
+    let height = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32;
+    Some((width, height))
+}
+
+fn webp_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 30 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return None;
+    }
+    match &bytes[12..16] {
+        b"VP8X" => {
+            let width = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]).saturating_add(1);
+            let height = u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]).saturating_add(1);
+            Some((width, height))
+        }
+        b"VP8 " => {
+            if bytes.get(23..26) != Some(&[0x9d, 0x01, 0x2a]) {
+                return None;
+            }
+            let width = u16::from_le_bytes(bytes[26..28].try_into().ok()?) as u32 & 0x3fff;
+            let height = u16::from_le_bytes(bytes[28..30].try_into().ok()?) as u32 & 0x3fff;
+            Some((width, height))
+        }
+        b"VP8L" => {
+            if bytes.get(20) != Some(&0x2f) {
+                return None;
+            }
+            let bits = u32::from_le_bytes(bytes[21..25].try_into().ok()?);
+            let width = (bits & 0x3fff) + 1;
+            let height = ((bits >> 14) & 0x3fff) + 1;
+            Some((width, height))
+        }
+        _ => None,
+    }
+}
+
+fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
+        return None;
+    }
+    let mut index = 2;
+    while index + 3 < bytes.len() {
+        if bytes[index] != 0xff {
+            return None;
+        }
+        while index < bytes.len() && bytes[index] == 0xff {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return None;
+        }
+        let marker = bytes[index];
+        index += 1;
+        if marker == 0xd8 || marker == 0xd9 || marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        if index + 1 >= bytes.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([bytes[index], bytes[index + 1]]) as usize;
+        if len < 2 || index + len > bytes.len() {
+            return None;
+        }
+        let sof = matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        );
+        if sof {
+            if len < 7 {
+                return None;
+            }
+            let height = u16::from_be_bytes([bytes[index + 3], bytes[index + 4]]) as u32;
+            let width = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u32;
+            return Some((width, height));
+        }
+        index += len;
+    }
+    None
+}
+
+/// Systems list. Wide enough for a name like "Nintendo Entertainment System".
+pub const SIDEBAR_WIDTH: f32 = 280.0;
 pub const DETAILS_WIDTH: f32 = 280.0;
+pub const DETAILS_PAD: f32 = 16.0;
 pub const GRID_PAD: f32 = 16.0;
 pub const TILE_GAP: f32 = 12.0;
+
+/// Shared cover width. Screenshot and box-art cards use it, so a 1280px window
+/// with both panes open shows about three columns.
+pub const COVER_WIDTH: f32 = 216.0;
 
 /// Fixed cover slot for one console grid. Every card in that grid uses the same
 /// size so keyboard columns and painted rows stay the same grid.
@@ -310,13 +482,13 @@ impl TileFrame {
         match art {
             // 4:3. A screenshot fills the slot. Anything else is letterboxed inside it.
             GridArt::Screenshot => Self {
-                width: 236.0,
-                height: 177.0,
+                width: COVER_WIDTH,
+                height: COVER_WIDTH * 3.0 / 4.0,
             },
-            // 3:4. A box fills the slot. A landscape fallback is letterboxed.
+            // Same width, 3:4. A box fills the taller slot. Contain does not crop it.
             GridArt::BoxArt => Self {
-                width: 168.0,
-                height: 224.0,
+                width: COVER_WIDTH,
+                height: COVER_WIDTH * 4.0 / 3.0,
             },
         }
     }
@@ -621,11 +793,13 @@ mod tests {
         assert_eq!(format_play_time(5400), "1h 30m");
         let shot = TileFrame::for_art(GridArt::Screenshot);
         let box_art = TileFrame::for_art(GridArt::BoxArt);
+        assert_eq!(shot.width, box_art.width);
+        assert_eq!(shot.width, COVER_WIDTH);
+        assert!(box_art.height > shot.height);
         assert!((shot.ratio() - 4.0 / 3.0).abs() < 0.001);
-        assert!((box_art.width / box_art.height - 3.0 / 4.0).abs() < 0.001);
-        assert!(shot.width > 148.0);
+        assert!((box_art.ratio() - 3.0 / 4.0).abs() < 0.001);
         assert_eq!(columns_for(1280.0, true, shot.width), 3);
-        assert_eq!(columns_for(1280.0, true, box_art.width), 4);
+        assert_eq!(columns_for(1280.0, true, box_art.width), 3);
         assert!(columns_for(1600.0, false, shot.width) > columns_for(1280.0, true, shot.width));
         assert_eq!(row_of(0, 3), 0);
         assert_eq!(row_of(5, 3), 1);
@@ -647,5 +821,46 @@ mod tests {
         assert_eq!(browse.console, 0);
         assert_eq!(browse.game, None);
         assert_eq!(browse.pane, Pane::Sidebar);
+    }
+
+    #[test]
+    fn image_aspect_reads_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("box.png");
+        let mut bytes = vec![
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+        ];
+        bytes.extend(150u32.to_be_bytes());
+        bytes.extend(200u32.to_be_bytes());
+        fs::write(&png, &bytes).unwrap();
+        assert!((image_aspect(&png).unwrap() - 0.75).abs() < 0.001);
+
+        let gif = dir.path().join("shot.gif");
+        let mut gif_bytes = b"GIF89a".to_vec();
+        gif_bytes.extend(320u16.to_le_bytes());
+        gif_bytes.extend(240u16.to_le_bytes());
+        fs::write(&gif, gif_bytes).unwrap();
+        assert!((image_aspect(&gif).unwrap() - 320.0 / 240.0).abs() < 0.001);
+
+        let jpeg = dir.path().join("shot.jpg");
+        let jpeg_bytes = [
+            0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x64, 0x00, 0xc8, 0x01, 0x01, 0x11,
+            0x00,
+        ];
+        fs::write(&jpeg, jpeg_bytes).unwrap();
+        assert!((image_aspect(&jpeg).unwrap() - 2.0).abs() < 0.001);
+
+        let webp = dir.path().join("box.webp");
+        let mut webp_bytes = b"RIFF".to_vec();
+        webp_bytes.extend(0u32.to_le_bytes());
+        webp_bytes.extend(b"WEBPVP8X");
+        webp_bytes.extend(10u32.to_le_bytes());
+        webp_bytes.extend([0, 0, 0, 0]);
+        webp_bytes.extend((216u32 - 1).to_le_bytes()[..3].to_vec());
+        webp_bytes.extend((288u32 - 1).to_le_bytes()[..3].to_vec());
+        fs::write(&webp, webp_bytes).unwrap();
+        assert!((image_aspect(&webp).unwrap() - 216.0 / 288.0).abs() < 0.001);
+
+        assert!(image_aspect(Path::new("/no/such/image.png")).is_none());
     }
 }
