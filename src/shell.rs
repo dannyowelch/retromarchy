@@ -1,3 +1,4 @@
+use crate::appearance::{self, launchbox_theme, theme_key};
 use crate::browse::{
     clamp_cover_width, columns_for, cover_path, file_for, format_play_time, image_aspect,
     key_from_parts, resolve_profile, row_of, scrape_chord, Browse, Confirm, Key, LibraryKind, Pane,
@@ -19,6 +20,7 @@ use crate::import_wizard::{
 use crate::importer::{self, ImportUpdate};
 use crate::input_repeat::HoldRepeat;
 use crate::launcher;
+use crate::options::{self, InputOptions};
 use crate::scraper::{self, NameSearch, ScrapeUpdate};
 use crate::types::{DeleteOptions, Game, GridArt, GridFilter, Media, MediaKind};
 use gpui_kit::base::slider::{SliderEvent, SliderState};
@@ -50,9 +52,12 @@ pub struct Shell {
     _cover_slider_sub: Subscription,
     gilrs: Option<gilrs::Gilrs>,
     pad: PadHeld,
-    /// Arrow keys and the pad share this clock. Rates come from config `[input]`.
+    /// Arrow keys and the pad share this clock. Rates come from config `[input]`
+    /// and update when Options saves.
     hold: HoldRepeat,
     input: InputSettings,
+    /// Config `theme`: `system` follows Omarchy, `launchbox` is the built-in palette.
+    appearance: String,
     nav_started: Instant,
     _nav_poll: Task<()>,
     search: Option<std::sync::mpsc::Receiver<NameSearch>>,
@@ -65,6 +70,8 @@ pub struct Shell {
     pick_scroll: ScrollHandle,
     /// GTK Manage Emulators. Writes `config.toml` as each change is confirmed.
     emulators: Option<Emulators>,
+    /// GTK Options → Input. Writes `[input]` as each spin changes.
+    options: Option<InputOptions>,
     emulator_scroll: ScrollHandle,
     picking_core: bool,
     /// Closing the dialog drops whatever control had focus. The next frame
@@ -99,6 +106,10 @@ impl Shell {
                 None
             }
         };
+        let appearance = load_appearance();
+        if appearance::is_launchbox(&appearance) {
+            launchbox_theme().apply(cx);
+        }
         let nav_started = Instant::now();
         let nav_poll = cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -128,6 +139,7 @@ impl Shell {
             pad: PadHeld::default(),
             hold: HoldRepeat::default(),
             input: load_input(),
+            appearance,
             nav_started,
             _nav_poll: nav_poll,
             search: None,
@@ -138,6 +150,7 @@ impl Shell {
             import_scroll: ScrollHandle::new(),
             pick_scroll: ScrollHandle::new(),
             emulators: None,
+            options: None,
             emulator_scroll: ScrollHandle::new(),
             picking_core: false,
             refocus: false,
@@ -150,6 +163,13 @@ impl Shell {
     fn poll_nav(&mut self, cx: &mut Context<Self>) {
         let events = self.drain_pad_events();
         let mut changed = self.poll_jobs();
+        if self.options.is_some() {
+            changed |= self.poll_options_pad(&events, cx);
+            if changed {
+                cx.notify();
+            }
+            return;
+        }
         if self.emulators.is_some() {
             changed |= self.poll_emulator_pad(&events, cx);
             if changed {
@@ -256,6 +276,10 @@ impl Shell {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.options.is_some() {
+            self.on_options_key(&event.keystroke, false, cx);
+            return;
+        }
         if self.emulators.is_some() {
             self.on_emulator_key(&event.keystroke, false, cx);
             return;
@@ -288,6 +312,21 @@ impl Shell {
             )
         {
             self.open_emulators();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if !event.is_held
+            && theme_key(
+                event.keystroke.key.as_str(),
+                event.keystroke.key_char.as_deref(),
+                event.keystroke.modifiers.shift,
+                event.keystroke.modifiers.control
+                    || event.keystroke.modifiers.alt
+                    || event.keystroke.modifiers.platform,
+            )
+        {
+            self.toggle_appearance(cx);
             cx.notify();
             cx.stop_propagation();
             return;
@@ -358,6 +397,10 @@ impl Shell {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+        if self.options.is_some() {
+            self.on_options_key(&event.keystroke, true, cx);
+            return;
+        }
         if self.emulators.is_some() {
             self.on_emulator_key(&event.keystroke, true, cx);
             return;
@@ -590,6 +633,150 @@ impl Shell {
         cx.stop_propagation();
     }
 
+    fn on_options_key(&mut self, keystroke: &Keystroke, release: bool, cx: &mut Context<Self>) {
+        if let Some(dir) = arrow_dir(keystroke) {
+            let modified = keystroke.modifiers.control
+                || keystroke.modifiers.alt
+                || keystroke.modifiers.platform;
+            if !(modified && !release) {
+                let now = monotonic_ms(self.nav_started);
+                if release {
+                    self.hold.release(&self.input, dir, now);
+                } else if self.hold.press(&self.input, dir, now) > 0 {
+                    let changed = self
+                        .options
+                        .as_mut()
+                        .is_some_and(|dialog| dialog.move_dir(dir));
+                    if changed {
+                        self.commit_input();
+                    }
+                    cx.notify();
+                }
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if release {
+            if keystroke.key == "tab" {
+                if let Some(dialog) = &mut self.options {
+                    dialog.tab(keystroke.modifiers.shift);
+                }
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+        let key = keystroke.key.as_str();
+        let modified =
+            keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
+        if key == "escape" {
+            self.close_options();
+            cx.notify();
+        } else if key == "enter" || (key == "space" && !modified) {
+            self.confirm_options();
+            cx.notify();
+        }
+        cx.stop_propagation();
+    }
+
+    fn poll_options_pad(&mut self, events: &[gilrs::EventType], _cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        for event in events {
+            match self.pad.apply(event) {
+                Some(PadAction::Confirm) => {
+                    self.confirm_options();
+                    changed = true;
+                }
+                Some(PadAction::Back) => {
+                    self.close_options();
+                    changed = true;
+                }
+                Some(PadAction::Favorite | PadAction::Menu) | None => {}
+            }
+        }
+        let now = monotonic_ms(self.nav_started);
+        let (step_x, step_y) =
+            self.hold
+                .poll(&self.input, self.pad.horizontal(), self.pad.vertical(), now);
+        for dir in [step_x, step_y].into_iter().flatten() {
+            let write = self
+                .options
+                .as_mut()
+                .is_some_and(|dialog| dialog.move_dir(dir));
+            if write {
+                self.commit_input();
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    fn open_options(&mut self) {
+        if self.import_rx.is_some()
+            || self.wizard.is_some()
+            || self.emulators.is_some()
+            || self.options.is_some()
+        {
+            return;
+        }
+        let input = match config::load_config() {
+            Ok(config) => config.input,
+            Err(err) => {
+                self.browse.status = format!("Could not read config ({err}).");
+                return;
+            }
+        };
+        self.browse.close_overlay();
+        self.search = None;
+        self.input = input.sanitized();
+        self.options = Some(InputOptions::open(self.input));
+    }
+
+    fn close_options(&mut self) {
+        self.options = None;
+        self.refocus = true;
+    }
+
+    fn confirm_options(&mut self) {
+        if self
+            .options
+            .as_ref()
+            .is_some_and(|dialog| dialog.close_aimed())
+        {
+            self.close_options();
+        }
+    }
+
+    fn commit_input(&mut self) {
+        let Some(input) = self.options.as_ref().map(|dialog| dialog.input()) else {
+            return;
+        };
+        self.input = input;
+        if let Err(err) = config::save_input_settings(input) {
+            self.browse.status = format!("Could not save input ({err}).");
+        }
+    }
+
+    fn toggle_appearance(&mut self, cx: &mut Context<Self>) {
+        let next = appearance::next_theme(&self.appearance);
+        let previous = self.appearance.clone();
+        self.appearance = next.to_string();
+        self.apply_appearance(cx);
+        if let Err(err) = config::save_theme_name(&self.appearance) {
+            self.appearance = previous;
+            self.apply_appearance(cx);
+            self.browse.status = format!("Could not save theme ({err}).");
+        }
+    }
+
+    fn apply_appearance(&self, cx: &mut Context<Self>) {
+        if appearance::is_launchbox(&self.appearance) {
+            launchbox_theme().apply(cx);
+        } else {
+            gpui_omarchy::Theme::follow_system(cx);
+        }
+    }
+
     fn close_emulators(&mut self) {
         self.emulators = None;
         self.picking_core = false;
@@ -597,7 +784,11 @@ impl Shell {
     }
 
     fn open_emulators(&mut self) {
-        if self.import_rx.is_some() || self.wizard.is_some() || self.emulators.is_some() {
+        if self.import_rx.is_some()
+            || self.wizard.is_some()
+            || self.emulators.is_some()
+            || self.options.is_some()
+        {
             return;
         }
         let config = match config::load_config() {
@@ -663,7 +854,11 @@ impl Shell {
     }
 
     fn open_import(&mut self) {
-        if self.import_rx.is_some() || self.wizard.is_some() || self.emulators.is_some() {
+        if self.import_rx.is_some()
+            || self.wizard.is_some()
+            || self.emulators.is_some()
+            || self.options.is_some()
+        {
             return;
         }
         self.browse.close_overlay();
@@ -1285,7 +1480,7 @@ impl Render for Shell {
             .capture_key_up(cx.listener(|this, event: &KeyUpEvent, _window, cx| {
                 this.on_key_up(event, cx);
             }))
-            .child(header(&self.browse, &theme_name, cx))
+            .child(header(&self.browse, &self.appearance, &theme_name, cx))
             .children(note_bar(&self.browse.library.note, cx))
             .child(body(
                 &self.browse,
@@ -1306,11 +1501,22 @@ impl Render for Shell {
                 &self.emulator_scroll,
                 cx,
             ))
+            .children(options_dialog(self.options.as_ref(), cx))
     }
 }
 
-fn header(browse: &Browse, theme_name: &str, cx: &Context<Shell>) -> impl IntoElement {
+fn header(
+    browse: &Browse,
+    appearance: &str,
+    omarchy_name: &str,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
     let theme = cx.omarchy();
+    let theme_name = if appearance::is_launchbox(appearance) {
+        "LaunchBox"
+    } else {
+        omarchy_name
+    };
     let mut row = div()
         .flex()
         .items_center()
@@ -1337,11 +1543,13 @@ fn header(browse: &Browse, theme_name: &str, cx: &Context<Shell>) -> impl IntoEl
             .gap(px(4.))
             .child(import_button(cx))
             .child(emulators_button(cx))
+            .child(options_button(cx))
             .child(scrape_button(false, cx))
             .child(scrape_button(true, cx)),
     )
     .child(div().flex_1())
     .child(filter_control(browse, cx))
+    .child(theme_button(appearance, cx))
     .child(
         div()
             .flex()
@@ -1355,6 +1563,8 @@ fn header(browse: &Browse, theme_name: &str, cx: &Context<Shell>) -> impl IntoEl
             .child("details")
             .child(keycap("f", cx))
             .child("favorite")
+            .child(keycap("t", cx))
+            .child("theme")
             .child(keycap("s", cx))
             .child("scrape")
             .child(keycap("S", cx))
@@ -1366,6 +1576,34 @@ fn header(browse: &Browse, theme_name: &str, cx: &Context<Shell>) -> impl IntoEl
             .child(keycap("-/+", cx))
             .child("size"),
     )
+}
+
+fn options_button(cx: &Context<Shell>) -> impl IntoElement {
+    button("options", "Options", ButtonVariant::Secondary, cx)
+        .flex_shrink_0()
+        .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
+            this.open_options();
+            this.focus_handle.focus(window, cx);
+            cx.notify();
+        }))
+}
+
+fn theme_button(appearance: &str, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let on = appearance::is_launchbox(appearance);
+    div()
+        .flex_shrink_0()
+        .border_1()
+        .border_color(if on { theme.accent } else { theme.background })
+        .child(
+            button("theme-toggle", "Theme", ButtonVariant::Secondary, cx).on_click(cx.listener(
+                |this: &mut Shell, _: &ClickEvent, window, cx| {
+                    this.toggle_appearance(cx);
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                },
+            )),
+        )
 }
 
 fn emulators_button(cx: &Context<Shell>) -> impl IntoElement {
@@ -1975,6 +2213,7 @@ fn heading(text: &str) -> impl IntoElement {
         .flex_none()
         .font_weight(gpui_kit::FontWeight::BOLD)
         .text_size(px(16.))
+        .line_height(px(24.))
         .child(text.to_string())
 }
 
@@ -2104,15 +2343,19 @@ fn dialog_page(
         })
         .child(
             div()
+                .flex_none()
                 .font_weight(gpui_kit::FontWeight::BOLD)
                 .text_size(px(16.))
+                .line_height(px(24.))
                 .child(title.to_string()),
         )
 }
 
 fn hint(text: &str, cx: &Context<Shell>) -> impl IntoElement {
     div()
+        .flex_none()
         .text_size(px(12.))
+        .line_height(px(18.))
         .text_color(cx.omarchy().secondary)
         .whitespace_normal()
         .child(text.to_string())
@@ -2444,6 +2687,12 @@ fn load_input() -> InputSettings {
         .map(|config| config.input)
         .unwrap_or_default()
         .sanitized()
+}
+
+fn load_appearance() -> String {
+    config::load_config()
+        .map(|config| config.theme)
+        .unwrap_or_else(|_| appearance::SYSTEM.to_string())
 }
 
 fn monotonic_ms(started: Instant) -> u64 {
@@ -3003,13 +3252,14 @@ fn emulator_dialog(
     let mut list = div()
         .id("emulator-list")
         .w_full()
-        .h(px(520.))
+        .h(px(440.))
         .overflow_y_scroll()
         .track_scroll(scroll)
         .flex()
         .flex_col()
-        .gap(px(8.));
-    for block in dialog.blocks() {
+        .gap(px(8.))
+        .pt(px(4.));
+    for block in dialog.scroll_blocks() {
         list = list.child(emulator_block(block, cx));
     }
     Some(
@@ -3019,10 +3269,139 @@ fn emulator_dialog(
                     "Arrows move. Left and right change a choice. Enter confirms. Esc closes.",
                     cx,
                 ))
+                .child(heading(crate::emulators::PROFILES_HEADING))
                 .child(list),
         )
         .into_any_element(),
     )
+}
+
+fn options_dialog(
+    dialog: Option<&InputOptions>,
+    cx: &Context<Shell>,
+) -> Option<gpui_kit::AnyElement> {
+    let dialog = dialog?;
+    let mut page = dialog_page("options-dialog", "Options", 520., cx)
+        .child(heading(options::SECTION))
+        .child(hint(options::INTRO, cx))
+        .child(hint("Left and right step by 10. Esc closes.", cx));
+    for row in dialog.rows() {
+        page = page.child(input_row(row, cx));
+    }
+    page = page.child(
+        div()
+            .flex()
+            .justify_end()
+            .flex_none()
+            .child(options_close(dialog.close_aimed(), cx)),
+    );
+    Some(modal(page).into_any_element())
+}
+
+fn input_row(row: options::Row, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let slot = row.slot;
+    div()
+        .id(input_row_id(slot))
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .px(px(8.))
+        .py(px(6.))
+        .border_1()
+        .border_color(if row.aimed {
+            theme.accent
+        } else {
+            theme.border
+        })
+        .bg(theme.surface)
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                if let Some(dialog) = &mut this.options {
+                    dialog.aim(slot);
+                }
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().flex_1().child(row.title))
+                .child(input_step(slot, -1, cx))
+                .child(
+                    div()
+                        .w(px(64.))
+                        .flex()
+                        .justify_end()
+                        .child(row.value.to_string()),
+                )
+                .child(input_step(slot, 1, cx)),
+        )
+        .child(
+            div()
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(theme.secondary)
+                .child(row.subtitle),
+        )
+}
+
+fn input_row_id(slot: options::Slot) -> &'static str {
+    match slot {
+        options::Slot::Starting => "input-starting",
+        options::Slot::Slow => "input-slow",
+        options::Slot::Fast => "input-fast",
+        options::Slot::Ramp => "input-ramp",
+        options::Slot::Close => "input-close",
+    }
+}
+
+fn input_step(slot: options::Slot, steps: i32, cx: &Context<Shell>) -> impl IntoElement {
+    let label = if steps < 0 { "−" } else { "+" };
+    let id = format!(
+        "{}-{}",
+        input_row_id(slot),
+        if steps < 0 { "dec" } else { "inc" }
+    );
+    button(id, label, ButtonVariant::Secondary, cx).on_click(cx.listener(
+        move |this: &mut Shell, _: &ClickEvent, window, cx| {
+            let changed = this
+                .options
+                .as_mut()
+                .is_some_and(|dialog| dialog.step(slot, steps));
+            if changed {
+                this.commit_input();
+            }
+            this.focus_handle.focus(window, cx);
+            cx.notify();
+        },
+    ))
+}
+
+fn options_close(aimed: bool, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .border_1()
+        .border_color(if aimed {
+            theme.accent
+        } else {
+            theme.background
+        })
+        .child(
+            button("options-close", "Close", ButtonVariant::Secondary, cx).on_click(cx.listener(
+                |this: &mut Shell, _: &ClickEvent, window, cx| {
+                    if let Some(dialog) = &mut this.options {
+                        dialog.aim(options::Slot::Close);
+                    }
+                    this.confirm_options();
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                },
+            )),
+        )
 }
 
 fn emulator_block(block: Block, cx: &Context<Shell>) -> gpui_kit::AnyElement {

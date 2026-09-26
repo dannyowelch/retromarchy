@@ -1,3 +1,4 @@
+pub mod appearance;
 pub mod browse;
 pub mod catalog;
 pub mod config;
@@ -10,6 +11,7 @@ pub mod import_wizard;
 pub mod importer;
 pub mod input_repeat;
 pub mod launcher;
+pub mod options;
 pub mod scanner;
 pub mod scraper;
 pub mod shell;

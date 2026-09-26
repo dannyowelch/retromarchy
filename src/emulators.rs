@@ -124,6 +124,10 @@ pub struct ConsoleLine {
     pub aimed: bool,
 }
 
+/// Painted above the scroller. The dialog title sits on top of a scrollport,
+/// and this heading was clipped under that title when it was the first row.
+pub const PROFILES_HEADING: &str = "Emulator profiles";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
     Heading(&'static str),
@@ -394,7 +398,7 @@ impl Emulators {
     }
 
     pub fn blocks(&self) -> Vec<Block> {
-        let mut blocks = vec![Block::Heading("Emulator profiles")];
+        let mut blocks = vec![Block::Heading(PROFILES_HEADING)];
         if self.show_cores {
             blocks.push(Block::Note(
                 "retroarch is on PATH. Pick a discovered core or a core file to make a RetroArch profile. Cores are not downloaded.",
@@ -453,8 +457,17 @@ impl Emulators {
         blocks
     }
 
+    /// Rows inside the scroller. [`PROFILES_HEADING`] is painted above it.
+    pub fn scroll_blocks(&self) -> Vec<Block> {
+        let mut blocks = self.blocks();
+        if matches!(blocks.first(), Some(Block::Heading(PROFILES_HEADING))) {
+            blocks.remove(0);
+        }
+        blocks
+    }
+
     pub fn scroll_index(&self) -> usize {
-        self.blocks()
+        self.scroll_blocks()
             .iter()
             .position(|block| block_has_focus(block, self.focus))
             .unwrap_or(0)
@@ -784,6 +797,22 @@ mod tests {
         let mut config = Config::default();
         config.consoles.push(snes());
         Emulators::open(&config, vec![snes9x()], true)
+    }
+
+    #[test]
+    fn profiles_heading_is_not_inside_the_scroller() {
+        let dialog = dialog();
+        assert_eq!(dialog.blocks()[0], Block::Heading(PROFILES_HEADING));
+        assert!(dialog
+            .scroll_blocks()
+            .iter()
+            .all(|block| block != &Block::Heading(PROFILES_HEADING)));
+        let id = dialog
+            .scroll_blocks()
+            .iter()
+            .position(|block| matches!(block, Block::Id { aimed: true, .. }))
+            .unwrap();
+        assert_eq!(dialog.scroll_index(), id);
     }
 
     #[test]
