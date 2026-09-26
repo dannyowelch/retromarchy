@@ -5,6 +5,7 @@ pub mod cores;
 pub mod database;
 pub mod game_menu;
 pub mod gamepad;
+pub mod import_wizard;
 pub mod importer;
 pub mod input_repeat;
 pub mod launcher;

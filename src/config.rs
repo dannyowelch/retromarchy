@@ -204,9 +204,7 @@ mod tests {
     use super::*;
     use crate::types::{Console, GridArt, MediaToggles};
     use std::path::Path;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use std::sync::MutexGuard;
 
     struct EnvLock {
         key: &'static str,
@@ -216,7 +214,7 @@ mod tests {
 
     impl EnvLock {
         fn set(key: &'static str, value: &Path) -> Self {
-            let guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            let guard = super::XDG_LOCK.lock().unwrap_or_else(|err| err.into_inner());
             let prev = std::env::var(key).ok();
             std::env::set_var(key, value);
             Self {
@@ -434,6 +432,63 @@ ramp_ms = 800000
         .sanitized();
         assert_eq!(swapped.fast_interval_ms, 40);
         assert_eq!(swapped.slow_interval_ms, 40);
+    }
+}
+
+#[cfg(test)]
+pub(crate) static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Isolated HOME and XDG dirs for tests that read or write the real config paths.
+#[cfg(test)]
+pub(crate) struct XdgEnv {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl XdgEnv {
+    pub(crate) fn sandbox(root: &std::path::Path) -> Self {
+        let home = root.join("home");
+        let config = root.join("config");
+        let data = root.join("data");
+        let cache = root.join("cache");
+        for dir in [&home, &config, &data, &cache] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        Self::set(&[
+            ("HOME", &home),
+            ("XDG_CONFIG_HOME", &config),
+            ("XDG_DATA_HOME", &data),
+            ("XDG_CACHE_HOME", &cache),
+        ])
+    }
+
+    fn set(pairs: &[(&'static str, &std::path::Path)]) -> Self {
+        let guard = XDG_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let saved = pairs
+            .iter()
+            .map(|(key, value)| {
+                let prev = std::env::var_os(key);
+                std::env::set_var(key, value);
+                (*key, prev)
+            })
+            .collect();
+        Self {
+            saved,
+            _guard: guard,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for XdgEnv {
+    fn drop(&mut self) {
+        for (key, prev) in self.saved.drain(..) {
+            match prev {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }
 
