@@ -1,8 +1,9 @@
 //! SDL / Xbox layout via gilrs. South confirms, East goes back, North (Y) toggles a favorite.
+//! Select (Xbox Back / View) opens the game menu.
 //!
 //! Directions are holds, not edges. The d-pad and the left stick stay "down" until
 //! released or returned near center. [`crate::input_repeat::DirectionRepeat`] decides
-//! how many steps that hold emits. Confirm, Back, and Favorite stay one-shot.
+//! how many steps that hold emits. Confirm, Back, Favorite, and Menu stay one-shot.
 
 use crate::input_repeat::{AxisHold, AxisSide};
 use gilrs::{Axis, Button, EventType};
@@ -20,6 +21,8 @@ pub enum PadAction {
     Confirm,
     Back,
     Favorite,
+    /// gilrs [`Button::Select`]: Xbox Back / View. Not East (B) and not South (A).
+    Menu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +94,7 @@ pub struct PadHeld {
 
 impl PadHeld {
     /// `down` is a press. Releases clear d-pad holds and return nothing.
-    /// South, East, and North return an action only on press.
+    /// South, East, North, and Select return an action only on press.
     pub fn apply_button(&mut self, button: Button, down: bool) -> Option<PadAction> {
         if !down {
             match button {
@@ -107,6 +110,7 @@ impl PadHeld {
             Button::South => Some(PadAction::Confirm),
             Button::East => Some(PadAction::Back),
             Button::North => Some(PadAction::Favorite),
+            Button::Select => Some(PadAction::Menu),
             Button::DPadLeft => {
                 self.x.set(AxisSide::Negative, true);
                 None
@@ -129,7 +133,7 @@ impl PadHeld {
 
     /// Updates held directions. Directional events do not return [`PadAction::Move`];
     /// read [`Self::horizontal`] and [`Self::vertical`] and run them through the repeater.
-    /// A gilrs `ButtonRepeated` keeps the button down without firing Confirm, Back, or Favorite.
+    /// A gilrs `ButtonRepeated` keeps the button down without firing Confirm, Back, Favorite, or Menu.
     pub fn apply(&mut self, event: &EventType) -> Option<PadAction> {
         match event {
             EventType::ButtonPressed(button, _) => self.apply_button(*button, true),
@@ -325,9 +329,32 @@ mod tests {
         );
         assert_eq!(pad.apply_button(Button::West, true), None);
         assert_eq!(pad.apply_button(Button::Start, true), None);
-        assert_eq!(pad.apply_button(Button::Select, true), None);
+        assert_eq!(
+            pad.apply_button(Button::Select, true),
+            Some(PadAction::Menu)
+        );
         assert_eq!(pad.apply_button(Button::DPadLeft, true), None);
         assert_eq!(pad.horizontal(), Some(NavDir::Left));
+    }
+
+    #[test]
+    fn select_is_the_game_menu_not_confirm_or_back() {
+        let mut pad = PadHeld::default();
+        assert_eq!(
+            pad.apply_button(Button::Select, true),
+            Some(PadAction::Menu)
+        );
+        assert_eq!(pad.apply_button(Button::Select, false), None);
+        assert_eq!(pad.apply_button(Button::Start, true), None);
+        assert_eq!(
+            pad.apply_button(Button::South, true),
+            Some(PadAction::Confirm)
+        );
+        assert_eq!(pad.apply_button(Button::East, true), Some(PadAction::Back));
+        assert_eq!(
+            pad.apply_button(Button::North, true),
+            Some(PadAction::Favorite)
+        );
     }
 
     #[test]

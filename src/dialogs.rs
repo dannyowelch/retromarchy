@@ -2,7 +2,10 @@ use crate::catalog;
 use crate::config::{self, Config, InputSettings};
 use crate::cores::{self, CoreProfile, DiscoveredCore};
 use crate::importer::{self, FoundFolder, ImportChoice};
-use crate::types::{EmulatorProfile, ProviderEntry, ScraperConfig, ScraperCredentials};
+use crate::scraper::{self, NameSearch, ScrapeCandidate};
+use crate::types::{
+    DeleteOptions, EmulatorProfile, ProviderEntry, ScraperConfig, ScraperCredentials,
+};
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box, Button, CheckButton, ComboBoxText, Entry, FileChooserAction, FileChooserDialog,
@@ -1208,6 +1211,333 @@ pub fn open_options(parent: &adw::ApplicationWindow, config: Rc<RefCell<Config>>
     close_on_escape(window.upcast_ref::<gtk4::Window>());
     window.present();
     starting.grab_focus();
+}
+
+pub fn open_game_scrape(
+    parent: &adw::ApplicationWindow,
+    initial_query: &str,
+    console_id: &str,
+    config: Rc<RefCell<Config>>,
+    on_pick: Rc<dyn Fn(ScrapeCandidate)>,
+) {
+    let window = Window::builder()
+        .title("Scrape")
+        .modal(true)
+        .transient_for(parent)
+        .default_width(480)
+        .default_height(460)
+        .build();
+
+    let page = Box::new(Orientation::Vertical, 12);
+    page.set_margin_top(16);
+    page.set_margin_bottom(16);
+    page.set_margin_start(16);
+    page.set_margin_end(16);
+
+    let hint = Label::new(Some(
+        "Search by name, then pick a match. Box art and screenshot for this game are replaced.",
+    ));
+    hint.set_wrap(true);
+    hint.set_halign(Align::Start);
+    hint.add_css_class("dim-label");
+    page.append(&hint);
+
+    let query_row = Box::new(Orientation::Horizontal, 8);
+    let entry = Entry::new();
+    entry.set_hexpand(true);
+    entry.set_text(initial_query);
+    let search_button = Button::with_label("Search");
+    search_button.add_css_class("suggested-action");
+    query_row.append(&entry);
+    query_row.append(&search_button);
+    page.append(&query_row);
+
+    let status = Label::new(None);
+    status.set_wrap(true);
+    status.set_halign(Align::Start);
+    status.set_xalign(0.0);
+    status.add_css_class("dim-label");
+    page.append(&status);
+
+    let scrolled = ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(PolicyType::Never)
+        .min_content_height(240)
+        .build();
+    let list = ListBox::new();
+    list.add_css_class("boxed-list");
+    list.set_selection_mode(gtk4::SelectionMode::Single);
+    scrolled.set_child(Some(&list));
+    page.append(&scrolled);
+
+    window.set_child(Some(&page));
+
+    let results: Rc<RefCell<Vec<ScrapeCandidate>>> = Rc::new(RefCell::new(Vec::new()));
+    let generation = Rc::new(Cell::new(0u32));
+    let console_id = console_id.to_string();
+
+    let run_search: Rc<dyn Fn()> = {
+        let entry = entry.clone();
+        let status = status.clone();
+        let list = list.clone();
+        let results = results.clone();
+        let generation = generation.clone();
+        let config = config.clone();
+        let console_id = console_id.clone();
+        let window = window.clone();
+        Rc::new(move || {
+            let query = entry.text().trim().to_string();
+            clear_list(&list);
+            *results.borrow_mut() = Vec::new();
+            if query.is_empty() {
+                status.set_text("Enter a name to search.");
+                return;
+            }
+            generation.set(generation.get().wrapping_add(1));
+            let gen = generation.get();
+            status.set_text("Searching…");
+            let scraper_config = config.borrow().scraper.clone();
+            let rx = scraper::spawn_name_search(
+                query,
+                console_id.clone(),
+                scraper_config,
+                scraper::fixture_dir_from_env(),
+            );
+            let status = status.clone();
+            let list = list.clone();
+            let results = results.clone();
+            let generation = generation.clone();
+            let window = window.clone();
+            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                if generation.get() != gen || !window.is_visible() {
+                    return gtk4::glib::ControlFlow::Break;
+                }
+                match rx.try_recv() {
+                    Ok(outcome) => {
+                        *results.borrow_mut() = outcome.candidates.clone();
+                        fill_scrape_results(&list, &outcome.candidates);
+                        status.set_text(&search_status(&outcome));
+                        if let Some(row) = list.row_at_index(0) {
+                            list.select_row(Some(&row));
+                        }
+                        gtk4::glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        gtk4::glib::ControlFlow::Break
+                    }
+                }
+            });
+        })
+    };
+
+    let run = run_search.clone();
+    search_button.connect_clicked(move |_| run());
+    let run = run_search.clone();
+    entry.connect_activate(move |_| run());
+
+    let window_pick = window.clone();
+    let results_pick = results.clone();
+    list.connect_row_activated(move |_, row| {
+        let idx = row.index() as usize;
+        if let Some(candidate) = results_pick.borrow().get(idx).cloned() {
+            on_pick(candidate);
+            window_pick.close();
+        }
+    });
+
+    close_on_escape(&window);
+    window.present();
+    entry.grab_focus();
+    run_search();
+}
+
+fn search_status(outcome: &NameSearch) -> String {
+    if outcome.candidates.is_empty() {
+        if outcome.errors.is_empty() {
+            "No matches. Edit the name and search again.".into()
+        } else {
+            format!("No matches. {}", outcome.errors.join(" "))
+        }
+    } else if outcome.errors.is_empty() {
+        String::new()
+    } else {
+        outcome.errors.join(" ")
+    }
+}
+
+fn clear_list(list: &ListBox) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+}
+
+fn fill_scrape_results(list: &ListBox, candidates: &[ScrapeCandidate]) {
+    clear_list(list);
+    for candidate in candidates {
+        let subtitle = if candidate.system.is_empty() {
+            candidate.provider.label().to_string()
+        } else {
+            format!("{} · {}", candidate.provider.label(), candidate.system)
+        };
+        let row = adw::ActionRow::builder()
+            .title(&candidate.title)
+            .subtitle(&subtitle)
+            .activatable(true)
+            .build();
+        list.append(&row);
+    }
+}
+
+pub fn open_rename(
+    parent: &adw::ApplicationWindow,
+    title: &str,
+    on_save: impl Fn(String) + 'static,
+) {
+    let window = Window::builder()
+        .title("Rename")
+        .modal(true)
+        .transient_for(parent)
+        .default_width(420)
+        .build();
+
+    let page = Box::new(Orientation::Vertical, 12);
+    page.set_margin_top(16);
+    page.set_margin_bottom(16);
+    page.set_margin_start(16);
+    page.set_margin_end(16);
+
+    let hint = Label::new(Some("Library title. This does not rename the ROM file."));
+    hint.set_wrap(true);
+    hint.set_halign(Align::Start);
+    hint.add_css_class("dim-label");
+    page.append(&hint);
+
+    let entry = Entry::new();
+    entry.set_text(title);
+    entry.select_region(0, -1);
+    page.append(&entry);
+
+    let error = Label::new(None);
+    error.set_halign(Align::Start);
+    error.add_css_class("error");
+    error.set_visible(false);
+    page.append(&error);
+
+    let buttons = Box::new(Orientation::Horizontal, 8);
+    let spacer = Box::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    let cancel = Button::with_label("Cancel");
+    let save = Button::with_label("Save");
+    save.add_css_class("suggested-action");
+    save.set_receives_default(true);
+    buttons.append(&spacer);
+    buttons.append(&cancel);
+    buttons.append(&save);
+    page.append(&buttons);
+
+    window.set_child(Some(&page));
+    window.set_default_widget(Some(&save));
+
+    let window_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_cancel.close());
+
+    let save_title = {
+        let window = window.clone();
+        let entry = entry.clone();
+        let error = error.clone();
+        move || {
+            let title = entry.text().trim().to_string();
+            if title.is_empty() {
+                error.set_text("Enter a title.");
+                error.set_visible(true);
+                return;
+            }
+            on_save(title);
+            window.close();
+        }
+    };
+    let save_title = Rc::new(save_title);
+    let save_click = save_title.clone();
+    save.connect_clicked(move |_| save_click());
+    entry.connect_activate(move |_| save_title());
+
+    close_on_escape(&window);
+    window.present();
+    entry.grab_focus();
+}
+
+pub fn open_delete(
+    parent: &adw::ApplicationWindow,
+    title: &str,
+    on_confirm: impl Fn(DeleteOptions) + 'static,
+) {
+    let window = Window::builder()
+        .title("Delete")
+        .modal(true)
+        .transient_for(parent)
+        .default_width(440)
+        .build();
+
+    let page = Box::new(Orientation::Vertical, 12);
+    page.set_margin_top(16);
+    page.set_margin_bottom(16);
+    page.set_margin_start(16);
+    page.set_margin_end(16);
+
+    let heading = Label::new(Some(title));
+    heading.add_css_class("title-2");
+    heading.set_wrap(true);
+    heading.set_halign(Align::Start);
+    page.append(&heading);
+
+    let hint = Label::new(Some(
+        "Remove this game from the library. The ROM and scraped artwork stay on disk unless you check a box.",
+    ));
+    hint.set_wrap(true);
+    hint.set_halign(Align::Start);
+    hint.add_css_class("dim-label");
+    page.append(&hint);
+
+    let rom = CheckButton::with_label("Delete ROM file from disk");
+    rom.set_active(false);
+    page.append(&rom);
+
+    let assets = CheckButton::with_label("Delete scraped assets");
+    assets.set_active(false);
+    page.append(&assets);
+
+    let buttons = Box::new(Orientation::Horizontal, 8);
+    let spacer = Box::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    let cancel = Button::with_label("Cancel");
+    cancel.add_css_class("suggested-action");
+    cancel.set_receives_default(true);
+    let delete = Button::with_label("Delete");
+    delete.add_css_class("destructive-action");
+    buttons.append(&spacer);
+    buttons.append(&cancel);
+    buttons.append(&delete);
+    page.append(&buttons);
+
+    window.set_child(Some(&page));
+    window.set_default_widget(Some(&cancel));
+
+    let window_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_cancel.close());
+
+    let window_delete = window.clone();
+    delete.connect_clicked(move |_| {
+        on_confirm(DeleteOptions {
+            rom_file: rom.is_active(),
+            scraped_assets: assets.is_active(),
+        });
+        window_delete.close();
+    });
+
+    close_on_escape(&window);
+    window.present();
+    cancel.grab_focus();
 }
 
 fn input_row(

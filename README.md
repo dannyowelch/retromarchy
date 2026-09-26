@@ -15,7 +15,7 @@ The default look follows the Omarchy / libadwaita system theme. A header button 
 - When `retroarch` is on `PATH`, **Manage Emulators** lists local cores and can add a profile or add-and-assign it to a known system. You can still type a path or **Browse…** for a `.so`. Cores are not downloaded.
 - Launch uses the game’s profile, or the console’s default profile. After the process exits, last played, play count, and play time are updated.
 - ROM scan computes CRC32 and discovers local sidecars (box art, screenshot, manual, video) when those toggles are on.
-- Manual artwork scrape only: box art and screenshot (one file per kind). Providers are ScreenScraper, then TheGamesDB, in that order unless you change it. The scraper does not download ROMs or BIOS.
+- Manual artwork scrape only: box art and screenshot (one file per kind). Providers are ScreenScraper, then TheGamesDB, in that order unless you change it. **Scrape** on one game asks you to pick a name match. **Scrape Missing** still fills gaps automatically. The scraper does not download ROMs or BIOS.
 
 ## Build (Arch)
 
@@ -52,7 +52,7 @@ You do not need to copy `config.example.toml` first. Start the app; a missing co
    - Or add a profile by hand: **Standalone** with a command that contains `{rom}`, or **RetroArch** with a core path (**Browse…** filters to `*.so`).
    - **Default profile per system** assigns the profile used at launch. Without one, Play / Enter says to configure an emulator.
 3. Select a console in the sidebar, then a game. **Play** or Enter launches it.
-4. Artwork is optional and manual. **Scraper** (Ctrl+G) stores credentials. **Scrape** (`s`) fetches missing artwork for the selected game. **Scrape Missing** (Shift+S) does the same for every game on the current system. Kinds that already have a file are skipped.
+4. Artwork is optional and manual. **Scraper** (Ctrl+G) stores credentials. **Scrape** (`s`), or **Scrape…** on the game menu, searches by name and lets you pick a ScreenScraper or TheGamesDB match. That replaces box art and screenshot for the one game. **Scrape Missing** (Shift+S) still fetches only missing artwork for every game on the current system. Right-click a game, or press the Menu key or Shift+F10, for **Scrape…**, **Rename…**, and **Delete…**. Rename changes the library title only. Delete always removes the library row; the ROM file and scraped artwork stay unless you check those boxes.
 
 The header combo (tooltip **Grid artwork for this system**) chooses what the grid prefers for the current console: **Box art** or **Screenshot** (`1` / `2`). If that file is missing, the grid falls back to the other one. An older `grid_art = "title_screen"` value is read as box art. The combo beside it (tooltip **Show all games or favorites**) is **All** or **Favorites** and filters the current console. A favorited game shows a heart on its tile. `/` opens the filter (**Filter games...**). Escape closes the filter, or clears the game selection and returns the details pane to console info.
 
@@ -120,9 +120,9 @@ Manuals and videos are local only; the scraper does not fetch them. Title-screen
 
 ## Scraper
 
-Open **Scraper** in the header or press Ctrl+G (**Scraper settings**). It saves the `[scraper]` table. Scrapes run only from **Scrape** / `s` and **Scrape Missing** / Shift+S. Import and rescan do not call the network.
+Open **Scraper** in the header or press Ctrl+G (**Scraper settings**). It saves the `[scraper]` table. Scrapes run only from **Scrape** / `s` (one game, you pick the match) and **Scrape Missing** / Shift+S (every game on the system, first provider hit, missing files only). Import and rescan do not call the network.
 
-Enabled kinds are box art and screenshot. Each missing kind walks the provider list and stops at the first hit. Default order is ScreenScraper, then TheGamesDB. Reorder with **Up** / **Down**, or edit the list.
+Enabled kinds are box art and screenshot. **Scrape Missing** walks the provider list for each missing kind and stops at the first hit. A single-game scrape searches those same providers by name, in the same order, and downloads box art and screenshot for the hit you pick, replacing files that are already there. Default order is ScreenScraper, then TheGamesDB. Reorder with **Up** / **Down**, or edit the list.
 
 ```toml
 [scraper]
@@ -159,8 +159,9 @@ Ignored while the filter entry is focused, except Escape, `/`, and Tab.
 - **Enter**: Launch the selected game
 - **f**: Toggle the selected game as a favorite
 - **r**: Rescan the current console
-- **s**: Scrape artwork for the selected game
+- **s**: Scrape the selected game (search by name, then pick a match)
 - **Shift+S**: Scrape missing artwork for the current system
+- **Right-click**, **Menu**, or **Shift+F10**: Game menu (**Scrape…**, **Rename…**, **Delete…**) on the selected game
 - **Ctrl+G**: Scraper settings
 - **Ctrl+I**: Import ROMs
 - **Ctrl+E** or **Ctrl+M**: Manage Emulators
@@ -179,13 +180,14 @@ A gamepad is optional. Buttons follow the SDL / Xbox layout (South is the bottom
 - **A (South)**: From the systems list, move into that console’s games. On a game, launch it (same as Enter).
 - **B (East)**: From the game grid, return to the systems list.
 - **Y (North)**: Toggle the focused game as a favorite. Does nothing when focus is on the systems list.
+- **Select (Xbox Back / View, gilrs `Button::Select`)**: On a selected game, open the same menu as right-click. This is not B (East / Back) and not A (South / Confirm).
 
-Start, Select, and X are ignored. The header buttons are not mapped.
+Start and X are ignored. The header buttons are not mapped. While that menu or a dialog is open, the d-pad moves, A activates the focused control, and B closes it.
 
 ## Data locations
 
 - Config: `~/.config/retromarchy/config.toml`
-- Library: `~/.local/share/retromarchy/library.db` (SQLite). Each game has a `favorite` flag (0 or 1). Existing libraries gain that column on startup.
+- Library: `~/.local/share/retromarchy/library.db` (SQLite). Each game has a `favorite` flag (0 or 1) and a `title_custom` flag. A title saved from **Rename…** sets `title_custom` so a rescan does not replace it with the ROM stem. Existing libraries gain new columns on startup.
 - Scraped artwork: `~/.local/share/retromarchy/media/`
 
 ## License
