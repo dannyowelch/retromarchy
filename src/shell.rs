@@ -5,7 +5,9 @@ use crate::browse::{
     DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH, TILE_GAP,
 };
 use crate::config::{self, InputSettings};
+use crate::cores;
 use crate::database;
+use crate::emulators::{emulator_key, Block, EmulatorCommand, Emulators, Kind, Slot};
 use crate::game_menu::{
     game_menu_key, Aim, DeleteSlot, Overlay, OverlayCommand, RenameSlot, ScrapeSlot,
 };
@@ -61,6 +63,13 @@ pub struct Shell {
     import_rx: Option<std::sync::mpsc::Receiver<ImportUpdate>>,
     import_scroll: ScrollHandle,
     pick_scroll: ScrollHandle,
+    /// GTK Manage Emulators. Writes `config.toml` as each change is confirmed.
+    emulators: Option<Emulators>,
+    emulator_scroll: ScrollHandle,
+    picking_core: bool,
+    /// Closing the dialog drops whatever control had focus. The next frame
+    /// puts the keyboard back on the shell.
+    refocus: bool,
 }
 
 /// GTK favorite red (`#e01b24`).
@@ -128,6 +137,10 @@ impl Shell {
             import_rx: None,
             import_scroll: ScrollHandle::new(),
             pick_scroll: ScrollHandle::new(),
+            emulators: None,
+            emulator_scroll: ScrollHandle::new(),
+            picking_core: false,
+            refocus: false,
         }
     }
 
@@ -137,6 +150,13 @@ impl Shell {
     fn poll_nav(&mut self, cx: &mut Context<Self>) {
         let events = self.drain_pad_events();
         let mut changed = self.poll_jobs();
+        if self.emulators.is_some() {
+            changed |= self.poll_emulator_pad(&events, cx);
+            if changed {
+                cx.notify();
+            }
+            return;
+        }
         if self.wizard.is_some() {
             changed |= self.poll_wizard_pad(&events, cx);
             if changed {
@@ -236,6 +256,10 @@ impl Shell {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.emulators.is_some() {
+            self.on_emulator_key(&event.keystroke, false, cx);
+            return;
+        }
         if self.wizard.is_some() {
             self.on_wizard_key(&event.keystroke, false, cx);
             return;
@@ -252,6 +276,18 @@ impl Shell {
             )
         {
             self.open_import();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if !event.is_held
+            && emulator_key(
+                event.keystroke.key.as_str(),
+                event.keystroke.key_char.as_deref(),
+                event.keystroke.modifiers.control,
+            )
+        {
+            self.open_emulators();
             cx.notify();
             cx.stop_propagation();
             return;
@@ -322,6 +358,10 @@ impl Shell {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+        if self.emulators.is_some() {
+            self.on_emulator_key(&event.keystroke, true, cx);
+            return;
+        }
         if self.wizard.is_some() {
             self.on_wizard_key(&event.keystroke, true, cx);
             return;
@@ -383,7 +423,10 @@ impl Shell {
             }
             cx.notify();
         } else if key == "space" && !modified {
-            let typing = self.wizard.as_ref().is_some_and(|wizard| wizard.accepts_text());
+            let typing = self
+                .wizard
+                .as_ref()
+                .is_some_and(|wizard| wizard.accepts_text());
             let toggled = self
                 .wizard
                 .as_mut()
@@ -435,8 +478,192 @@ impl Shell {
         changed
     }
 
+    fn poll_emulator_pad(&mut self, events: &[gilrs::EventType], cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        for event in events {
+            match self.pad.apply(event) {
+                Some(PadAction::Confirm) => {
+                    self.confirm_emulators(cx);
+                    changed = true;
+                }
+                Some(PadAction::Back) => {
+                    self.close_emulators();
+                    changed = true;
+                }
+                Some(PadAction::Favorite | PadAction::Menu) | None => {}
+            }
+        }
+        let now = monotonic_ms(self.nav_started);
+        let (step_x, step_y) =
+            self.hold
+                .poll(&self.input, self.pad.horizontal(), self.pad.vertical(), now);
+        for dir in [step_x, step_y].into_iter().flatten() {
+            let write = self
+                .emulators
+                .as_mut()
+                .is_some_and(|dialog| dialog.move_dir(dir));
+            if write {
+                self.write_emulators();
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    /// Arrows and Tab move. Enter confirms the focused control. Esc closes.
+    /// A console's left/right choice is written immediately, same as GTK's combo.
+    fn on_emulator_key(&mut self, keystroke: &Keystroke, release: bool, cx: &mut Context<Self>) {
+        if let Some(dir) = arrow_dir(keystroke) {
+            let modified = keystroke.modifiers.control
+                || keystroke.modifiers.alt
+                || keystroke.modifiers.platform;
+            if !(modified && !release) {
+                let now = monotonic_ms(self.nav_started);
+                if release {
+                    self.hold.release(&self.input, dir, now);
+                } else if self.hold.press(&self.input, dir, now) > 0 {
+                    let write = self
+                        .emulators
+                        .as_mut()
+                        .is_some_and(|dialog| dialog.move_dir(dir));
+                    if write {
+                        self.write_emulators();
+                    }
+                    cx.notify();
+                }
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if release {
+            // The focus scope binds Tab to its own focus order and consumes the
+            // keydown. The keyup still arrives, and that is what moves this dialog.
+            if keystroke.key == "tab" {
+                if let Some(dialog) = &mut self.emulators {
+                    dialog.tab(keystroke.modifiers.shift);
+                }
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+        let key = keystroke.key.as_str();
+        let modified =
+            keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
+        if key == "escape" {
+            self.close_emulators();
+            cx.notify();
+        } else if key == "enter" {
+            self.confirm_emulators(cx);
+            cx.notify();
+        } else if key == "backspace" {
+            if let Some(dialog) = &mut self.emulators {
+                dialog.backspace();
+            }
+            cx.notify();
+        } else if key == "delete" {
+            if let Some(dialog) = &mut self.emulators {
+                dialog.delete_forward();
+            }
+            cx.notify();
+        } else if key == "space" && !modified {
+            let typing = self
+                .emulators
+                .as_ref()
+                .is_some_and(|dialog| dialog.accepts_text());
+            if typing {
+                if let Some(dialog) = &mut self.emulators {
+                    dialog.type_text(" ");
+                }
+            } else {
+                self.confirm_emulators(cx);
+            }
+            cx.notify();
+        } else if !modified {
+            if let Some(text) = typed_text(keystroke) {
+                if let Some(dialog) = &mut self.emulators {
+                    dialog.type_text(text);
+                }
+                cx.notify();
+            }
+        }
+        cx.stop_propagation();
+    }
+
+    fn close_emulators(&mut self) {
+        self.emulators = None;
+        self.picking_core = false;
+        self.refocus = true;
+    }
+
+    fn open_emulators(&mut self) {
+        if self.import_rx.is_some() || self.wizard.is_some() || self.emulators.is_some() {
+            return;
+        }
+        let config = match config::load_config() {
+            Ok(config) => config,
+            Err(err) => {
+                self.browse.status = format!("Could not read config ({err}).");
+                return;
+            }
+        };
+        self.browse.close_overlay();
+        self.search = None;
+        let show_cores = crate::emulators::retroarch_on_path();
+        let cores = if show_cores {
+            cores::discover_cores()
+        } else {
+            Vec::new()
+        };
+        self.picking_core = false;
+        self.emulators = Some(Emulators::open(&config, cores, show_cores));
+    }
+
+    fn confirm_emulators(&mut self, cx: &mut Context<Self>) {
+        let Some(command) = self.emulators.as_mut().map(|dialog| dialog.confirm()) else {
+            return;
+        };
+        match command {
+            EmulatorCommand::None => {}
+            EmulatorCommand::Close => self.close_emulators(),
+            EmulatorCommand::Browse => self.pick_core(cx),
+            EmulatorCommand::Write => self.write_emulators(),
+        }
+    }
+
+    fn write_emulators(&mut self) {
+        let (profiles, consoles) = {
+            let Some(dialog) = &self.emulators else {
+                return;
+            };
+            (dialog.profiles().to_vec(), dialog.consoles().to_vec())
+        };
+        let mut config = match config::load_config() {
+            Ok(config) => config,
+            Err(err) => {
+                if let Some(dialog) = &mut self.emulators {
+                    dialog.set_error(format!("Could not read config ({err})."));
+                }
+                return;
+            }
+        };
+        crate::emulators::apply_assignments(&mut config, &profiles, &consoles);
+        if let Err(err) = config::save_config(&config) {
+            if let Some(dialog) = &mut self.emulators {
+                dialog.set_error(format!("Could not save config ({err})."));
+            }
+            return;
+        }
+        self.browse.library.profiles = config.profiles.clone();
+        for shelf in &mut self.browse.library.shelves {
+            if let Some(console) = config.consoles.iter().find(|c| c.id == shelf.console.id) {
+                shelf.console.profile = console.profile.clone();
+            }
+        }
+    }
+
     fn open_import(&mut self) {
-        if self.import_rx.is_some() || self.wizard.is_some() {
+        if self.import_rx.is_some() || self.wizard.is_some() || self.emulators.is_some() {
             return;
         }
         self.browse.close_overlay();
@@ -445,7 +672,11 @@ impl Shell {
     }
 
     fn dismiss_import(&mut self) {
-        if self.import_rx.is_some() || self.wizard.as_ref().is_some_and(|wizard| wizard.blocks_escape())
+        if self.import_rx.is_some()
+            || self
+                .wizard
+                .as_ref()
+                .is_some_and(|wizard| wizard.blocks_escape())
         {
             return;
         }
@@ -483,11 +714,15 @@ impl Shell {
         });
         cx.spawn(async move |this, cx| {
             let picked = match rx.await {
-                Ok(Ok(Some(paths))) => paths.into_iter().next().map(Picked::Path).unwrap_or(Picked::Cancel),
+                Ok(Ok(Some(paths))) => paths
+                    .into_iter()
+                    .next()
+                    .map(Picked::Path)
+                    .unwrap_or(Picked::Cancel),
                 Ok(Ok(None)) | Err(_) => Picked::Cancel,
-                Ok(Err(err)) => Picked::Failed(format!(
-                    "Folder picker unavailable ({err}). Type the path."
-                )),
+                Ok(Err(err)) => {
+                    Picked::Failed(format!("Folder picker unavailable ({err}). Type the path."))
+                }
             };
             let _ = this.update(cx, |this, cx| {
                 this.finish_pick(picked);
@@ -510,6 +745,56 @@ impl Shell {
                     wizard.set_error(message);
                 } else {
                     self.browse.status = message;
+                }
+            }
+        }
+    }
+
+    /// GTK's core Browse is an open-file chooser filtered to `*.so`. GPUI's
+    /// prompt has no filter, so the path field stays editable.
+    fn pick_core(&mut self, cx: &mut Context<Self>) {
+        if self.picking_core {
+            return;
+        }
+        self.picking_core = true;
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = match rx.await {
+                Ok(Ok(Some(paths))) => paths
+                    .into_iter()
+                    .next()
+                    .map(Picked::Path)
+                    .unwrap_or(Picked::Cancel),
+                Ok(Ok(None)) | Err(_) => Picked::Cancel,
+                Ok(Err(err)) => {
+                    Picked::Failed(format!("Core picker unavailable ({err}). Type the path."))
+                }
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.finish_core_pick(picked);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn finish_core_pick(&mut self, picked: Picked) {
+        self.picking_core = false;
+        match picked {
+            Picked::Cancel => {}
+            Picked::Path(path) => {
+                if let Some(dialog) = &mut self.emulators {
+                    dialog.set_core_path(path);
+                }
+            }
+            Picked::Failed(message) => {
+                if let Some(dialog) = &mut self.emulators {
+                    dialog.set_error(message);
                 }
             }
         }
@@ -887,7 +1172,9 @@ impl Shell {
             return;
         };
         let Some(profile) = resolve_profile(&self.browse.library, &game) else {
-            self.browse.status = "This system has no emulator profile.".into();
+            self.browse.status =
+                "This system has no emulator profile. Use Manage Emulators to add one and assign it."
+                    .into();
             return;
         };
         match launcher::launch_game_tracked(&profile, &game.rom) {
@@ -930,6 +1217,15 @@ impl Shell {
         self.revealed_columns = columns;
     }
 
+    fn reveal_emulators(&mut self) {
+        let Some(dialog) = &self.emulators else {
+            return;
+        };
+        if self.emulator_scroll.bounds().size.height > px(0.) {
+            self.emulator_scroll.scroll_to_item(dialog.scroll_index());
+        }
+    }
+
     fn reveal_import(&mut self) {
         let Some(wizard) = &self.wizard else {
             return;
@@ -955,6 +1251,7 @@ impl Render for Shell {
             .set_columns(columns_for(width, self.browse.details_open, frame.width));
         self.reveal_selection();
         self.reveal_import();
+        self.reveal_emulators();
         if let Overlay::Scrape(prompt) = &self.browse.overlay {
             if prompt.slot == ScrapeSlot::Results {
                 self.scrape_scroll.scroll_to_item(prompt.cursor);
@@ -962,6 +1259,10 @@ impl Render for Shell {
         }
         if !self.armed {
             self.armed = true;
+            self.focus_handle.focus(window, cx);
+        }
+        if self.refocus {
+            self.refocus = false;
             self.focus_handle.focus(window, cx);
         }
 
@@ -1000,6 +1301,11 @@ impl Render for Shell {
                 &self.pick_scroll,
                 cx,
             ))
+            .children(emulator_dialog(
+                self.emulators.as_ref(),
+                &self.emulator_scroll,
+                cx,
+            ))
     }
 }
 
@@ -1030,6 +1336,7 @@ fn header(browse: &Browse, theme_name: &str, cx: &Context<Shell>) -> impl IntoEl
             .items_center()
             .gap(px(4.))
             .child(import_button(cx))
+            .child(emulators_button(cx))
             .child(scrape_button(false, cx))
             .child(scrape_button(true, cx)),
     )
@@ -1059,6 +1366,21 @@ fn header(browse: &Browse, theme_name: &str, cx: &Context<Shell>) -> impl IntoEl
             .child(keycap("-/+", cx))
             .child("size"),
     )
+}
+
+fn emulators_button(cx: &Context<Shell>) -> impl IntoElement {
+    button(
+        "manage-emulators",
+        "Manage Emulators",
+        ButtonVariant::Secondary,
+        cx,
+    )
+    .flex_shrink_0()
+    .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
+        this.open_emulators();
+        this.focus_handle.focus(window, cx);
+        cx.notify();
+    }))
 }
 
 fn import_button(cx: &Context<Shell>) -> impl IntoElement {
@@ -1672,7 +1994,7 @@ fn status_line(
 ) -> impl IntoElement {
     let theme = cx.omarchy();
     let text = if browse.status.is_empty() {
-        "Ctrl+I imports ROMs. Emulator setup stays on the GTK app."
+        "Ctrl+I imports ROMs. Ctrl+M or Ctrl+E manages emulators."
     } else {
         browse.status.as_str()
     };
@@ -2181,6 +2503,19 @@ fn import_empty(cx: &Context<Shell>) -> impl IntoElement {
                 cx.notify();
             })),
         )
+        .child(
+            button(
+                "empty-emulators",
+                "Manage Emulators",
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
+                this.open_emulators();
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            })),
+        )
 }
 
 fn import_dialog(
@@ -2207,7 +2542,9 @@ fn import_dialog(
             root_page(&edit, slot, error.as_deref(), cx).into_any_element()
         }
         ImportSnap::Systems => {
-            let (lines, slot) = wizard.system_lines().unwrap_or_else(|| (Vec::new(), SystemsSlot::Import));
+            let (lines, slot) = wizard
+                .system_lines()
+                .unwrap_or_else(|| (Vec::new(), SystemsSlot::Import));
             systems_page(&lines, slot, import_scroll, error.as_deref(), cx).into_any_element()
         }
         ImportSnap::Pick(edit, slot) => {
@@ -2347,7 +2684,11 @@ fn systems_page(
                         .flex()
                         .flex_col()
                         .border_1()
-                        .border_color(if check { theme.accent } else { theme.background })
+                        .border_color(if check {
+                            theme.accent
+                        } else {
+                            theme.background
+                        })
                         .child(
                             checkbox(
                                 ("import-check", index),
@@ -2358,10 +2699,7 @@ fn systems_page(
                             .on_change(move |state, _, _, cx| {
                                 entity.update(cx, |this, cx| {
                                     if let Some(wizard) = &mut this.wizard {
-                                        wizard.set_included(
-                                            index,
-                                            state == CheckboxState::Checked,
-                                        );
+                                        wizard.set_included(index, state == CheckboxState::Checked);
                                     }
                                     cx.notify();
                                 });
@@ -2464,14 +2802,16 @@ fn pick_page(
             .px(px(8.))
             .py(px(6.))
             .cursor_pointer()
-            .on_click(cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                if let Some(wizard) = &mut this.wizard {
-                    wizard.aim(ImportFocus::Pick(PickSlot::Row(index)));
-                }
-                this.confirm_import(cx);
-                this.focus_handle.focus(window, cx);
-                cx.notify();
-            }));
+            .on_click(
+                cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                    if let Some(wizard) = &mut this.wizard {
+                        wizard.aim(ImportFocus::Pick(PickSlot::Row(index)));
+                    }
+                    this.confirm_import(cx);
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                }),
+            );
         if chosen {
             row = row.bg(theme.selected_fill()).text_color(theme.accent);
         } else {
@@ -2578,11 +2918,7 @@ fn import_path(
             );
         }
         if let Some(placeholder) = placeholder {
-            text = text.child(
-                div()
-                    .text_color(theme.secondary)
-                    .child(placeholder),
-            );
+            text = text.child(div().text_color(theme.secondary).child(placeholder));
         }
     } else {
         let line = edit.caret_line();
@@ -2606,13 +2942,15 @@ fn import_path(
         .border_1()
         .border_color(if focused { theme.accent } else { theme.border })
         .bg(theme.surface)
-        .on_click(cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
-            if let Some(wizard) = &mut this.wizard {
-                wizard.aim(aim);
-            }
-            this.focus_handle.focus(window, cx);
-            cx.notify();
-        }))
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                if let Some(wizard) = &mut this.wizard {
+                    wizard.aim(aim);
+                }
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
         .child(text)
 }
 
@@ -2632,19 +2970,21 @@ fn import_action(
     };
     div()
         .border_1()
-        .border_color(if aimed { theme.accent } else { theme.background })
-        .child(
-            button(id, label, variant, cx).on_click(cx.listener(
-                move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                    if let Some(wizard) = &mut this.wizard {
-                        wizard.aim(aim);
-                    }
-                    this.confirm_import(cx);
-                    this.focus_handle.focus(window, cx);
-                    cx.notify();
-                },
-            )),
-        )
+        .border_color(if aimed {
+            theme.accent
+        } else {
+            theme.background
+        })
+        .child(button(id, label, variant, cx).on_click(cx.listener(
+            move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                if let Some(wizard) = &mut this.wizard {
+                    wizard.aim(aim);
+                }
+                this.confirm_import(cx);
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            },
+        )))
 }
 
 fn import_error(text: &str, cx: &Context<Shell>) -> impl IntoElement {
@@ -2652,6 +2992,339 @@ fn import_error(text: &str, cx: &Context<Shell>) -> impl IntoElement {
         .text_size(px(12.))
         .text_color(cx.omarchy().danger)
         .child(text.to_string())
+}
+
+fn emulator_dialog(
+    dialog: Option<&Emulators>,
+    scroll: &ScrollHandle,
+    cx: &Context<Shell>,
+) -> Option<gpui_kit::AnyElement> {
+    let dialog = dialog?;
+    let mut list = div()
+        .id("emulator-list")
+        .w_full()
+        .h(px(520.))
+        .overflow_y_scroll()
+        .track_scroll(scroll)
+        .flex()
+        .flex_col()
+        .gap(px(8.));
+    for block in dialog.blocks() {
+        list = list.child(emulator_block(block, cx));
+    }
+    Some(
+        modal(
+            dialog_page("emulator-dialog", "Manage Emulators", 820., cx)
+                .child(hint(
+                    "Arrows move. Left and right change a choice. Enter confirms. Esc closes.",
+                    cx,
+                ))
+                .child(list),
+        )
+        .into_any_element(),
+    )
+}
+
+fn emulator_block(block: Block, cx: &Context<Shell>) -> gpui_kit::AnyElement {
+    match block {
+        Block::Heading(text) => heading(text).into_any_element(),
+        Block::Note(text) => hint(text, cx).into_any_element(),
+        Block::Error(text) => import_error(&text, cx).into_any_element(),
+        Block::Core(line) => core_block(line, cx).into_any_element(),
+        Block::Profile(line) => profile_block(line, cx).into_any_element(),
+        Block::Kind { kind, aimed } => kind_block(kind, aimed, cx).into_any_element(),
+        Block::Id { edit, aimed } => {
+            emulator_field("emulator-id", &edit, aimed, "Profile id", Slot::Id, cx)
+                .into_any_element()
+        }
+        Block::Detail {
+            edit,
+            field_aimed,
+            browse_aimed,
+        } => div()
+            .flex()
+            .gap(px(8.))
+            .items_center()
+            .child(emulator_field(
+                "emulator-detail",
+                &edit,
+                field_aimed,
+                "Command with {rom}, or core path",
+                Slot::Detail,
+                cx,
+            ))
+            .child(emulator_action(
+                "emulator-browse".to_string(),
+                "Browse…".to_string(),
+                ButtonVariant::Secondary,
+                browse_aimed,
+                Slot::Browse,
+                cx,
+            ))
+            .into_any_element(),
+        Block::Add { aimed } => emulator_action(
+            "emulator-add".to_string(),
+            "Add profile".to_string(),
+            ButtonVariant::Primary,
+            aimed,
+            Slot::Add,
+            cx,
+        )
+        .into_any_element(),
+        Block::Console(line) => console_block(line, cx).into_any_element(),
+        Block::Close { aimed } => div()
+            .flex()
+            .justify_end()
+            .child(emulator_action(
+                "emulator-close".to_string(),
+                "Close".to_string(),
+                ButtonVariant::Secondary,
+                aimed,
+                Slot::Close,
+                cx,
+            ))
+            .into_any_element(),
+    }
+}
+
+fn core_block(line: crate::emulators::CoreLine, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let mut actions = div().flex().flex_wrap().gap(px(6.)).items_center();
+    for (index, core_button) in line.buttons.into_iter().enumerate() {
+        let id = format!("emulator-core-{}-{index}", line.index);
+        if let Some(slot) = core_button.slot {
+            let variant = if core_button.primary {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Secondary
+            };
+            actions = actions.child(emulator_action(
+                id,
+                core_button.label,
+                variant,
+                core_button.aimed,
+                slot,
+                cx,
+            ));
+        } else {
+            actions = actions
+                .child(button(id, core_button.label, ButtonVariant::Secondary, cx).disabled(true));
+        }
+    }
+    div()
+        .flex()
+        .gap(px(8.))
+        .items_center()
+        .p(px(8.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.surface)
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .child(line.name)
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.secondary)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(line.path),
+                ),
+        )
+        .child(actions)
+}
+
+fn profile_block(line: crate::emulators::ProfileLine, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .p(px(8.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.surface)
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .child(line.label),
+        )
+        .child(emulator_action(
+            format!("emulator-delete-{}", line.index),
+            "Delete".to_string(),
+            ButtonVariant::Danger,
+            line.aimed,
+            Slot::Delete(line.index),
+            cx,
+        ))
+}
+
+fn console_block(line: crate::emulators::ConsoleLine, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .p(px(8.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.surface)
+        .child(div().flex_1().child(line.name))
+        .child(emulator_action(
+            format!("emulator-console-{}", line.index),
+            line.value,
+            ButtonVariant::Secondary,
+            line.aimed,
+            Slot::Console(line.index),
+            cx,
+        ))
+}
+
+fn kind_block(kind: Kind, aimed: bool, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .id("emulator-kind")
+        .flex()
+        .border_1()
+        .border_color(if aimed { theme.accent } else { theme.border })
+        .child(kind_segment(Kind::Standalone, kind, false, cx))
+        .child(kind_segment(Kind::RetroArch, kind, true, cx))
+}
+
+fn kind_segment(
+    kind: Kind,
+    selected: Kind,
+    divider: bool,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let on = kind == selected;
+    let mut segment = div()
+        .id(match kind {
+            Kind::Standalone => "emulator-kind-standalone",
+            Kind::RetroArch => "emulator-kind-retroarch",
+        })
+        .px(px(10.))
+        .py(px(6.))
+        .cursor_pointer()
+        .bg(if on {
+            theme.selected_fill()
+        } else {
+            theme.background
+        })
+        .text_color(if on { theme.accent } else { theme.foreground })
+        .hover(|style| style.bg(theme.hover_fill()))
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                if let Some(dialog) = &mut this.emulators {
+                    dialog.set_kind(kind);
+                }
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+        .child(kind.label());
+    if divider {
+        segment = segment.border_l_1().border_color(theme.border);
+    }
+    segment
+}
+
+fn emulator_field(
+    id: &'static str,
+    edit: &crate::game_menu::LineEdit,
+    focused: bool,
+    placeholder: &'static str,
+    slot: Slot,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let mut text = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .overflow_hidden()
+        .min_h(px(18.));
+    if edit.text.is_empty() {
+        if focused {
+            text = text.child(
+                div()
+                    .w(px(1.))
+                    .h(px(16.))
+                    .flex_shrink_0()
+                    .bg(theme.foreground),
+            );
+        }
+        text = text.child(div().text_color(theme.secondary).child(placeholder));
+    } else {
+        let line = edit.caret_line();
+        text = text.child(line.head.clone());
+        if focused {
+            text = text.child(
+                div()
+                    .w(px(1.))
+                    .h(px(16.))
+                    .flex_shrink_0()
+                    .bg(theme.foreground),
+            );
+        }
+        text = text.child(line.tail.clone());
+    }
+    div()
+        .id(id)
+        .flex_1()
+        .min_w(px(0.))
+        .px(px(8.))
+        .py(px(6.))
+        .border_1()
+        .border_color(if focused { theme.accent } else { theme.border })
+        .bg(theme.surface)
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                if let Some(dialog) = &mut this.emulators {
+                    dialog.aim(slot);
+                }
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+        .child(text)
+}
+
+fn emulator_action(
+    id: String,
+    label: String,
+    variant: ButtonVariant,
+    aimed: bool,
+    slot: Slot,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .border_1()
+        .border_color(if aimed {
+            theme.accent
+        } else {
+            theme.background
+        })
+        .child(button(id, label, variant, cx).on_click(cx.listener(
+            move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                let aimed = this
+                    .emulators
+                    .as_mut()
+                    .is_some_and(|dialog| dialog.aim(slot));
+                if aimed {
+                    this.confirm_emulators(cx);
+                }
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            },
+        )))
 }
 
 pub fn window_options() -> WindowOptions {
