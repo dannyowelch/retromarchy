@@ -89,7 +89,15 @@ pub fn open_library() -> Library {
                 "Demo library. Could not open the library database ({err})."
             )),
         },
-        Ok(_) => demo_library("Demo library. No consoles in ~/.config/retromarchy/config.toml."),
+        // A blank config is an empty library, same as GTK's first run. The demo
+        // stays for a config or database that cannot be opened.
+        Ok(config) => Library {
+            kind: LibraryKind::Disk,
+            note: String::new(),
+            details_open: config.details_visible,
+            shelves: Vec::new(),
+            profiles: config.profiles.clone(),
+        },
         Err(err) => demo_library(&format!("Demo library. Could not read config ({err}).")),
     }
 }
@@ -896,6 +904,16 @@ mod tests {
 
     fn sample() -> Browse {
         Browse::new(demo_library("Demo library."))
+    }
+
+    #[test]
+    fn blank_config_opens_an_empty_disk_library() {
+        let root = tempfile::tempdir().unwrap();
+        let _env = crate::config::XdgEnv::sandbox(root.path());
+        let library = open_library();
+        assert_eq!(library.kind, LibraryKind::Disk);
+        assert!(library.shelves.is_empty());
+        assert!(library.note.is_empty());
     }
 
     #[test]

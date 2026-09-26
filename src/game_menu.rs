@@ -41,6 +41,15 @@ impl LineEdit {
         }
     }
 
+    pub(crate) fn plain(text: String) -> Self {
+        let caret = text.chars().count();
+        Self {
+            text,
+            caret,
+            replace: false,
+        }
+    }
+
     pub fn caret_line(&self) -> CaretLine {
         if self.replace {
             return CaretLine {
@@ -57,7 +66,7 @@ impl LineEdit {
         }
     }
 
-    fn insert(&mut self, extra: &str) {
+    pub(crate) fn insert(&mut self, extra: &str) {
         if extra.is_empty() {
             return;
         }
@@ -72,7 +81,7 @@ impl LineEdit {
         self.caret += extra.chars().count();
     }
 
-    fn backspace(&mut self) {
+    pub(crate) fn backspace(&mut self) {
         if self.replace {
             self.text.clear();
             self.caret = 0;
@@ -88,7 +97,7 @@ impl LineEdit {
         self.text.replace_range(start..end, "");
     }
 
-    fn delete_forward(&mut self) {
+    pub(crate) fn delete_forward(&mut self) {
         if self.replace {
             self.text.clear();
             self.caret = 0;
@@ -103,7 +112,7 @@ impl LineEdit {
         self.text.replace_range(start..end, "");
     }
 
-    fn move_caret(&mut self, delta: isize) {
+    pub(crate) fn move_caret(&mut self, delta: isize) {
         if self.replace {
             let len = self.text.chars().count();
             self.caret = if delta < 0 { 0 } else { len };

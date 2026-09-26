@@ -28,7 +28,7 @@ The window has three panes.
 2. The center pane is a box-art grid for the selected console. A tile uses the console's `grid_art` file when that file exists, then the other scraped image. Otherwise it shows initials.
 3. The right pane shows console stats when no game is selected. Select a game and it shows the title, console, play stats, ROM path, CRC32, box art, and screenshot.
 
-If the config has no consoles, the shell shows an in-memory demo and labels it **Demo library**. The demo does not write games into your library. Placeholder art for one Super Nintendo row lives in `resources/demo/`. Those files are not ROMs.
+If the config has no consoles, the center pane is empty and offers **Import ROMs**. That is the first-run screen. The in-memory demo still appears when the config file or the library database cannot be opened, and it is labeled **Demo library**. The demo does not write games into your library. Placeholder art for one Super Nintendo row lives in `resources/demo/`. Those files are not ROMs.
 
 ## Keys
 
@@ -43,10 +43,11 @@ If the config has no consoles, the shell shows an in-memory demo and labels it *
 - The game-menu Scrape row searches by name, then saves box art and screenshot for that one game. Rename writes the display title (`title` and `title_custom`) and leaves the ROM file alone. Delete asks before removing the library row; the ROM and cached artwork stay unless those boxes are checked. The demo library opens the same dialogs and does not write them.
 - Escape clears the selected game when the menu is closed. B does not.
 - `-` and `+` (or `=`, and the numpad equivalents) change the game-grid cover width by 10px. The same width is used for every system and saved as `cover_width` in the config. The range is 120–400. The status bar slider does the same thing.
+- Ctrl+I opens the ROM import wizard. The header **Import ROMs** button does the same, and so does the button on an empty library. The steps match GTK: an ES-DE / EmulationStation root, or one system. Arrows, Tab, and Enter move. Esc closes. Gamepad A confirms and B closes. Scan runs off the UI thread. **Browse…** uses GPUI's folder prompt (`prompt_for_paths`, the XDG desktop portal). The path field is always there, prefilled with `~/ROMs`, when the portal is unavailable.
 
 ## Not in this branch
 
-Import, emulator setup, and the LaunchBox theme toggle stay in the GTK app on `main`. This shell reads the d-pad, the left stick, A, B, Y, and Select. `src/ui.rs` and `src/dialogs.rs` are that window. This binary does not compile them.
+Emulator setup and the LaunchBox theme toggle stay in the GTK app on `main`. The import wizard does not assign emulator profiles. GTK keeps that in Manage Emulators, which this shell does not open. This shell reads the d-pad, the left stick, A, B, Y, and Select. `src/ui.rs` and `src/dialogs.rs` are the GTK window. This binary does not compile them.
 
 Scan, config, the SQLite library, and launch command building are the library crate. `cargo test` runs those tests. The binary is the shell.
 
