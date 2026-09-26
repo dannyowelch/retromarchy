@@ -1,6 +1,10 @@
 # Retromarchy Configuration Example
 # Copy this to ~/.config/retromarchy/config.toml and adjust paths
 
+# theme = "system" follows the Omarchy theme. "launchbox" is the built-in dark theme.
+# The header Theme button and the t key toggle it.
+# theme = "system"
+
 # One cover width for every system's game grid, in pixels.
 # The GPUI shell slider and - / + keys step by 10 between 120 and 400.
 # cover_width = 216
@@ -69,7 +73,8 @@ manual = false
 video = false
 
 # Hold-repeat for arrow keys, the d-pad, and the left stick.
-# GTK Options → Input edits this. The GPUI shell reads it at startup.
+# GTK Options → Input and the GPUI Options button edit this.
+# Hold-repeat uses the saved values immediately.
 # Confirm, Back, and Favorite do not repeat.
 [input]
 initial_delay_ms = 400

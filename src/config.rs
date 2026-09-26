@@ -199,6 +199,20 @@ pub fn save_cover_width(width: f32) -> Result<()> {
     save_config(&config)
 }
 
+/// Load config, store hold-repeat timings, and write the file back.
+pub fn save_input_settings(input: InputSettings) -> Result<()> {
+    let mut config = load_config()?;
+    config.input = input.sanitized();
+    save_config(&config)
+}
+
+/// Load config, store `theme`, and write the file back.
+pub fn save_theme_name(theme: &str) -> Result<()> {
+    let mut config = load_config()?;
+    config.theme = theme.to_string();
+    save_config(&config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,7 +228,9 @@ mod tests {
 
     impl EnvLock {
         fn set(key: &'static str, value: &Path) -> Self {
-            let guard = super::XDG_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            let guard = super::XDG_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             let prev = std::env::var(key).ok();
             std::env::set_var(key, value);
             Self {
@@ -379,6 +395,50 @@ screenshot = false
         assert_eq!(loaded.consoles[0].grid_art, GridArt::Screenshot);
         // A second launch reads the same global width.
         assert_eq!(load_config().unwrap().cover_width, 246.0);
+    }
+
+    #[test]
+    fn save_input_and_theme_keep_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvLock::set("XDG_CONFIG_HOME", dir.path());
+        let mut config = Config::default();
+        config.theme = "system".into();
+        config.details_visible = false;
+        config.cover_width = 250.0;
+        config.consoles.push(Console {
+            id: "nes".into(),
+            name: "NES".into(),
+            rom_dirs: Vec::new(),
+            extensions: vec!["nes".into()],
+            profile: None,
+            grid_art: GridArt::Screenshot,
+            media: MediaToggles::default(),
+        });
+        save_config(&config).unwrap();
+
+        save_input_settings(InputSettings {
+            initial_delay_ms: 250,
+            slow_interval_ms: 120,
+            fast_interval_ms: 40,
+            ramp_ms: 1500,
+        })
+        .unwrap();
+        let loaded = load_config().unwrap();
+        assert_eq!(loaded.input.initial_delay_ms, 250);
+        assert_eq!(loaded.input.slow_interval_ms, 120);
+        assert_eq!(loaded.input.fast_interval_ms, 40);
+        assert_eq!(loaded.input.ramp_ms, 1500);
+        assert_eq!(loaded.theme, "system");
+        assert!(!loaded.details_visible);
+        assert_eq!(loaded.cover_width, 250.0);
+        assert_eq!(loaded.consoles[0].id, "nes");
+
+        save_theme_name("launchbox").unwrap();
+        let loaded = load_config().unwrap();
+        assert_eq!(loaded.theme, "launchbox");
+        assert_eq!(loaded.input.initial_delay_ms, 250);
+        assert_eq!(loaded.cover_width, 250.0);
+        assert_eq!(loaded.consoles[0].grid_art, GridArt::Screenshot);
     }
 
     #[test]
