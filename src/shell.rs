@@ -1,26 +1,27 @@
 use crate::browse::{
     clamp_cover_width, columns_for, cover_path, file_for, format_play_time, image_aspect,
-    key_from_parts, resolve_profile, row_of, Browse, Key, LibraryKind, Pane, TileFrame,
+    key_from_parts, resolve_profile, row_of, Browse, Confirm, Key, LibraryKind, Pane, TileFrame,
     COVER_WIDTH_MAX, COVER_WIDTH_MIN, COVER_WIDTH_STEP, DETAILS_PAD, DETAILS_WIDTH, GRID_PAD,
     SIDEBAR_WIDTH, TILE_GAP,
 };
-use crate::config;
+use crate::config::{self, InputSettings};
 use crate::database;
-use crate::gamepad::{PadAction, PadHeld};
+use crate::gamepad::{NavDir, PadAction, PadHeld};
+use crate::input_repeat::HoldRepeat;
 use crate::launcher;
 use crate::types::{Game, GridArt, GridFilter, MediaKind};
 use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::{
     div, img, point, px, rgb, App, AppContext, ClickEvent, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyDownEvent, ObjectFit, ParentElement, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, Window, WindowBounds,
-    WindowDecorations, WindowOptions,
+    InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, ObjectFit, ParentElement,
+    Render, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task,
+    Window, WindowBounds, WindowDecorations, WindowOptions,
 };
 use gpui_omarchy::{
     badge, button, empty_state, focus_scope, keycap, separator, slider, vertical_separator,
     ActiveTheme, ButtonVariant, Status,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct Shell {
     browse: Browse,
@@ -35,7 +36,11 @@ pub struct Shell {
     _cover_slider_sub: Subscription,
     gilrs: Option<gilrs::Gilrs>,
     pad: PadHeld,
-    _pad_poll: Task<()>,
+    /// Arrow keys and the pad share this clock. Rates come from config `[input]`.
+    hold: HoldRepeat,
+    input: InputSettings,
+    nav_started: Instant,
+    _nav_poll: Task<()>,
 }
 
 /// GTK favorite red (`#e01b24`).
@@ -65,23 +70,20 @@ impl Shell {
                 None
             }
         };
-        let pad_poll = if gilrs.is_some() {
-            cx.spawn(async move |this, cx| loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
-                if this
-                    .update(cx, |this, cx| {
-                        this.poll_gamepad(cx);
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            })
-        } else {
-            Task::ready(())
-        };
+        let nav_started = Instant::now();
+        let nav_poll = cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
+            if this
+                .update(cx, |this, cx| {
+                    this.poll_nav(cx);
+                })
+                .is_err()
+            {
+                break;
+            }
+        });
         Self {
             browse,
             focus_handle: cx.focus_handle(),
@@ -95,21 +97,52 @@ impl Shell {
             _cover_slider_sub: cover_slider_sub,
             gilrs,
             pad: PadHeld::default(),
-            _pad_poll: pad_poll,
+            hold: HoldRepeat::default(),
+            input: load_input(),
+            nav_started,
+            _nav_poll: nav_poll,
         }
     }
 
-    /// North (Y) toggles the selected game. Directions stay on the keyboard path.
-    fn poll_gamepad(&mut self, cx: &mut Context<Self>) {
+    /// Face buttons are edges. Held directions step through [`HoldRepeat`].
+    /// South enters the grid or launches. East returns to the system list.
+    /// North toggles a favorite. Select is the GTK game menu, which this shell does not open.
+    fn poll_nav(&mut self, cx: &mut Context<Self>) {
         let events = self.drain_pad_events();
         let mut changed = false;
         for event in &events {
-            if self.pad.apply(event) == Some(PadAction::Favorite) {
-                changed |= self.toggle_favorite();
+            match self.pad.apply(event) {
+                Some(PadAction::Favorite) => changed |= self.toggle_favorite(),
+                Some(PadAction::Confirm) => changed |= self.confirm_pad(),
+                Some(PadAction::Back) => changed |= self.browse.back(),
+                Some(PadAction::Menu) | None => {}
             }
+        }
+        let now = monotonic_ms(self.nav_started);
+        let (step_x, step_y) =
+            self.hold
+                .poll(&self.input, self.pad.horizontal(), self.pad.vertical(), now);
+        if let Some(dir) = step_x {
+            self.browse.apply(Key::Arrow(dir));
+            changed = true;
+        }
+        if let Some(dir) = step_y {
+            self.browse.apply(Key::Arrow(dir));
+            changed = true;
         }
         if changed {
             cx.notify();
+        }
+    }
+
+    fn confirm_pad(&mut self) -> bool {
+        match self.browse.confirm() {
+            Some(Confirm::Launch) => {
+                self.launch_selected();
+                true
+            }
+            Some(Confirm::Entered) => true,
+            None => false,
         }
     }
 
@@ -140,6 +173,9 @@ impl Shell {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.on_arrow(&event.keystroke, false, cx) {
+            return;
+        }
         let keystroke = &event.keystroke;
         let modified =
             keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
@@ -167,6 +203,35 @@ impl Shell {
         }
         cx.notify();
         cx.stop_propagation();
+    }
+
+    fn on_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+        self.on_arrow(&event.keystroke, true, cx);
+    }
+
+    /// Arrow keys use the same clock as the pad. `release` clears a hold.
+    /// A modified arrow is left for the platform. Returns whether this was an arrow.
+    fn on_arrow(&mut self, keystroke: &Keystroke, release: bool, cx: &mut Context<Self>) -> bool {
+        let Some(dir) = arrow_dir(keystroke) else {
+            return false;
+        };
+        let modified =
+            keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
+        if modified && !release {
+            return true;
+        }
+        let now = monotonic_ms(self.nav_started);
+        if release {
+            self.hold.release(&self.input, dir, now);
+        } else {
+            let steps = self.hold.press(&self.input, dir, now);
+            if steps > 0 {
+                self.browse.apply(Key::Arrow(dir));
+                cx.notify();
+            }
+        }
+        cx.stop_propagation();
+        true
     }
 
     fn apply_cover_width(&mut self, width: f32, cx: &mut Context<Self>) {
@@ -269,6 +334,9 @@ impl Render for Shell {
             .font_family(font)
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key(event, window, cx);
+            }))
+            .capture_key_up(cx.listener(|this, event: &KeyUpEvent, _window, cx| {
+                this.on_key_up(event, cx);
             }))
             .child(header(&self.browse, &theme_name, cx))
             .children(note_bar(&self.browse.library.note, cx))
@@ -889,6 +957,24 @@ fn cover_width_control(
                 .flex_shrink_0()
                 .child(format!("{:.0}px", browse.cover_width)),
         )
+}
+
+fn load_input() -> InputSettings {
+    config::load_config()
+        .map(|config| config.input)
+        .unwrap_or_default()
+        .sanitized()
+}
+
+fn monotonic_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn arrow_dir(keystroke: &Keystroke) -> Option<NavDir> {
+    match key_from_parts(keystroke.key.as_ref(), keystroke.key_char.as_deref(), false) {
+        Some(Key::Arrow(dir)) => Some(dir),
+        _ => None,
+    }
 }
 
 pub fn window_options() -> WindowOptions {
