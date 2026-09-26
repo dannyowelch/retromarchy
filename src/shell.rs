@@ -1553,7 +1553,10 @@ fn header(
     .child(
         div()
             .flex()
-            .gap(px(6.))
+            .flex_shrink_1()
+            .min_w(px(0.))
+            .overflow_hidden()
+            .gap(px(4.))
             .items_center()
             .text_color(theme.secondary)
             .text_size(px(12.))
@@ -1563,8 +1566,6 @@ fn header(
             .child("details")
             .child(keycap("f", cx))
             .child("favorite")
-            .child(keycap("t", cx))
-            .child("theme")
             .child(keycap("s", cx))
             .child("scrape")
             .child(keycap("S", cx))
@@ -1572,9 +1573,7 @@ fn header(
             .child(keycap("menu", cx))
             .child("game")
             .child(keycap("esc", cx))
-            .child("clear")
-            .child(keycap("-/+", cx))
-            .child("size"),
+            .child("clear"),
     )
 }
 
