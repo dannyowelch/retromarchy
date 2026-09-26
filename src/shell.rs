@@ -633,11 +633,11 @@ fn favorite_badge() -> impl IntoElement {
         .font_weight(gpui_kit::FontWeight::BOLD)
         .text_size(px(18.))
         .text_color(rgb(FAVORITE_RED))
-        .child("\u2665")
+        .child("♥")
 }
 
 fn favorite_toggle(favorite: bool, cx: &Context<Shell>) -> impl IntoElement {
-    let label = if favorite { "\u2665" } else { "\u2661" };
+    let label = if favorite { "♥" } else { "♡" };
     let mut button = button("favorite", label, ButtonVariant::Secondary, cx)
         .flex_none()
         .font_family("DejaVu Sans")
