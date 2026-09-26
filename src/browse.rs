@@ -292,6 +292,44 @@ pub fn cover_path(game: &Game, art: GridArt) -> Option<PathBuf> {
     None
 }
 
+pub const SIDEBAR_WIDTH: f32 = 220.0;
+pub const DETAILS_WIDTH: f32 = 280.0;
+pub const GRID_PAD: f32 = 16.0;
+pub const TILE_GAP: f32 = 12.0;
+
+/// Fixed cover slot for one console grid. Every card in that grid uses the same
+/// size so keyboard columns and painted rows stay the same grid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TileFrame {
+    pub width: f32,
+    pub height: f32,
+}
+
+impl TileFrame {
+    pub fn for_art(art: GridArt) -> Self {
+        match art {
+            // 4:3. A screenshot fills the slot. Anything else is letterboxed inside it.
+            GridArt::Screenshot => Self {
+                width: 236.0,
+                height: 177.0,
+            },
+            // 3:4. A box fills the slot. A landscape fallback is letterboxed.
+            GridArt::BoxArt => Self {
+                width: 168.0,
+                height: 224.0,
+            },
+        }
+    }
+
+    pub fn ratio(self) -> f32 {
+        self.width / self.height
+    }
+}
+
+pub fn row_of(index: usize, columns: usize) -> usize {
+    index / columns.max(1)
+}
+
 pub fn file_for(game: &Game, kind: MediaKind) -> Option<PathBuf> {
     game.media
         .iter()
@@ -337,6 +375,30 @@ impl Browse {
 
     pub fn set_columns(&mut self, columns: usize) {
         self.columns = columns.max(1);
+    }
+
+    pub fn tile_frame(&self) -> TileFrame {
+        self.shelf()
+            .map(|shelf| TileFrame::for_art(shelf.console.grid_art))
+            .unwrap_or_else(|| TileFrame::for_art(GridArt::BoxArt))
+    }
+
+    pub fn select_console(&mut self, index: usize) {
+        if index >= self.library.shelves.len() {
+            return;
+        }
+        self.console = index;
+        self.game = None;
+        self.pane = Pane::Sidebar;
+    }
+
+    pub fn select_game(&mut self, index: usize) {
+        let len = self.shelf().map(|shelf| shelf.games.len()).unwrap_or(0);
+        if index >= len {
+            return;
+        }
+        self.game = Some(index);
+        self.pane = Pane::Grid;
     }
 
     fn move_arrow(&mut self, dir: NavDir) {
@@ -415,10 +477,12 @@ pub fn resolve_profile(library: &Library, game: &Game) -> Option<EmulatorProfile
         .cloned()
 }
 
-pub fn columns_for(width: f32, details_open: bool) -> usize {
-    let reserved = 220.0 + if details_open { 280.0 } else { 0.0 } + 48.0;
-    let grid = (width - reserved).max(148.0);
-    let columns = ((grid + 12.0) / 160.0).floor() as usize;
+pub fn columns_for(width: f32, details_open: bool, tile_width: f32) -> usize {
+    let tile_width = tile_width.max(1.0);
+    let reserved =
+        SIDEBAR_WIDTH + if details_open { DETAILS_WIDTH } else { 0.0 } + GRID_PAD * 2.0 + 16.0;
+    let grid = (width - reserved).max(tile_width);
+    let columns = ((grid + TILE_GAP) / (tile_width + TILE_GAP)).floor() as usize;
     columns.clamp(1, 8)
 }
 
@@ -555,7 +619,33 @@ mod tests {
         assert_eq!(format_play_time(45), "45s");
         assert_eq!(format_play_time(120), "2m");
         assert_eq!(format_play_time(5400), "1h 30m");
-        assert_eq!(columns_for(1280.0, true), 4);
-        assert!(columns_for(1600.0, false) > columns_for(1280.0, true));
+        let shot = TileFrame::for_art(GridArt::Screenshot);
+        let box_art = TileFrame::for_art(GridArt::BoxArt);
+        assert!((shot.ratio() - 4.0 / 3.0).abs() < 0.001);
+        assert!((box_art.width / box_art.height - 3.0 / 4.0).abs() < 0.001);
+        assert!(shot.width > 148.0);
+        assert_eq!(columns_for(1280.0, true, shot.width), 3);
+        assert_eq!(columns_for(1280.0, true, box_art.width), 4);
+        assert!(columns_for(1600.0, false, shot.width) > columns_for(1280.0, true, shot.width));
+        assert_eq!(row_of(0, 3), 0);
+        assert_eq!(row_of(5, 3), 1);
+    }
+
+    #[test]
+    fn click_selects_console_and_game() {
+        let mut browse = sample();
+        browse.select_game(99);
+        assert_eq!(browse.game, None);
+        browse.select_console(1);
+        assert_eq!(browse.console, 1);
+        assert_eq!(browse.pane, Pane::Sidebar);
+        assert_eq!(browse.game, None);
+        browse.select_game(2);
+        assert_eq!(browse.pane, Pane::Grid);
+        assert_eq!(browse.selected_game().unwrap().title, "Gunstar Heroes");
+        browse.select_console(0);
+        assert_eq!(browse.console, 0);
+        assert_eq!(browse.game, None);
+        assert_eq!(browse.pane, Pane::Sidebar);
     }
 }
