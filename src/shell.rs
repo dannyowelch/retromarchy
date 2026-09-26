@@ -22,6 +22,10 @@ use crate::input_repeat::HoldRepeat;
 use crate::launcher;
 use crate::options::{self, InputOptions};
 use crate::scraper::{self, NameSearch, ScrapeUpdate};
+use crate::scraper_settings::{
+    self, scraper_key, Block as ScraperBlock, Command as ScraperCommand, Part as ScraperPart,
+    ScraperSettings, Slot as ScraperSlot,
+};
 use crate::types::{DeleteOptions, Game, GridArt, GridFilter, Media, MediaKind};
 use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::base::CheckboxState;
@@ -34,7 +38,7 @@ use gpui_kit::{
 };
 use gpui_omarchy::{
     badge, button, checkbox, empty_state, focus_scope, keycap, separator, slider,
-    vertical_separator, ActiveTheme, ButtonVariant, Status,
+    vertical_separator, with_tooltip, ActiveTheme, ButtonVariant, Status,
 };
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -72,7 +76,10 @@ pub struct Shell {
     emulators: Option<Emulators>,
     /// GTK Options → Input. Writes `[input]` as each spin changes.
     options: Option<InputOptions>,
+    /// GTK Scraper settings. Writes `[scraper]` when Save is confirmed.
+    scraper: Option<ScraperSettings>,
     emulator_scroll: ScrollHandle,
+    scraper_scroll: ScrollHandle,
     picking_core: bool,
     /// Closing the dialog drops whatever control had focus. The next frame
     /// puts the keyboard back on the shell.
@@ -151,7 +158,9 @@ impl Shell {
             pick_scroll: ScrollHandle::new(),
             emulators: None,
             options: None,
+            scraper: None,
             emulator_scroll: ScrollHandle::new(),
+            scraper_scroll: ScrollHandle::new(),
             picking_core: false,
             refocus: false,
         }
@@ -163,6 +172,13 @@ impl Shell {
     fn poll_nav(&mut self, cx: &mut Context<Self>) {
         let events = self.drain_pad_events();
         let mut changed = self.poll_jobs();
+        if self.scraper.is_some() {
+            changed |= self.poll_scraper_pad(&events, cx);
+            if changed {
+                cx.notify();
+            }
+            return;
+        }
         if self.options.is_some() {
             changed |= self.poll_options_pad(&events, cx);
             if changed {
@@ -276,6 +292,10 @@ impl Shell {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scraper.is_some() {
+            self.on_scraper_key(&event.keystroke, false, cx);
+            return;
+        }
         if self.options.is_some() {
             self.on_options_key(&event.keystroke, false, cx);
             return;
@@ -312,6 +332,18 @@ impl Shell {
             )
         {
             self.open_emulators();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if !event.is_held
+            && scraper_key(
+                event.keystroke.key.as_str(),
+                event.keystroke.key_char.as_deref(),
+                event.keystroke.modifiers.control,
+            )
+        {
+            self.open_scraper();
             cx.notify();
             cx.stop_propagation();
             return;
@@ -397,6 +429,10 @@ impl Shell {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+        if self.scraper.is_some() {
+            self.on_scraper_key(&event.keystroke, true, cx);
+            return;
+        }
         if self.options.is_some() {
             self.on_options_key(&event.keystroke, true, cx);
             return;
@@ -711,11 +747,164 @@ impl Shell {
         changed
     }
 
+    /// Arrows and Tab move. Enter confirms the focused control. Esc closes
+    /// without writing. A credential field takes characters.
+    fn on_scraper_key(&mut self, keystroke: &Keystroke, release: bool, cx: &mut Context<Self>) {
+        if let Some(dir) = arrow_dir(keystroke) {
+            let modified = keystroke.modifiers.control
+                || keystroke.modifiers.alt
+                || keystroke.modifiers.platform;
+            if !(modified && !release) {
+                let now = monotonic_ms(self.nav_started);
+                if release {
+                    self.hold.release(&self.input, dir, now);
+                } else if self.hold.press(&self.input, dir, now) > 0 {
+                    if let Some(dialog) = &mut self.scraper {
+                        dialog.move_dir(dir);
+                    }
+                    cx.notify();
+                }
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if release {
+            if keystroke.key == "tab" {
+                if let Some(dialog) = &mut self.scraper {
+                    dialog.tab(keystroke.modifiers.shift);
+                }
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+        let key = keystroke.key.as_str();
+        let modified =
+            keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
+        if key == "escape" {
+            self.close_scraper();
+            cx.notify();
+        } else if key == "enter" {
+            self.confirm_scraper();
+            cx.notify();
+        } else if key == "backspace" {
+            if let Some(dialog) = &mut self.scraper {
+                dialog.backspace();
+            }
+            cx.notify();
+        } else if key == "delete" {
+            if let Some(dialog) = &mut self.scraper {
+                dialog.delete_forward();
+            }
+            cx.notify();
+        } else if key == "space" && !modified {
+            let typing = self
+                .scraper
+                .as_ref()
+                .is_some_and(|dialog| dialog.accepts_text());
+            if typing {
+                if let Some(dialog) = &mut self.scraper {
+                    dialog.type_text(" ");
+                }
+            } else {
+                self.confirm_scraper();
+            }
+            cx.notify();
+        } else if !modified {
+            if let Some(text) = typed_text(keystroke) {
+                if let Some(dialog) = &mut self.scraper {
+                    dialog.type_text(text);
+                }
+                cx.notify();
+            }
+        }
+        cx.stop_propagation();
+    }
+
+    fn poll_scraper_pad(&mut self, events: &[gilrs::EventType], _cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        for event in events {
+            match self.pad.apply(event) {
+                Some(PadAction::Confirm) => {
+                    self.confirm_scraper();
+                    changed = true;
+                }
+                Some(PadAction::Back) => {
+                    self.close_scraper();
+                    changed = true;
+                }
+                Some(PadAction::Favorite | PadAction::Menu) | None => {}
+            }
+        }
+        let now = monotonic_ms(self.nav_started);
+        let (step_x, step_y) =
+            self.hold
+                .poll(&self.input, self.pad.horizontal(), self.pad.vertical(), now);
+        for dir in [step_x, step_y].into_iter().flatten() {
+            if let Some(dialog) = &mut self.scraper {
+                dialog.move_dir(dir);
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    fn open_scraper(&mut self) {
+        if self.import_rx.is_some()
+            || self.wizard.is_some()
+            || self.emulators.is_some()
+            || self.options.is_some()
+            || self.scraper.is_some()
+        {
+            return;
+        }
+        let scraper = match config::load_config() {
+            Ok(config) => config.scraper,
+            Err(err) => {
+                self.browse.status = format!("Could not read config ({err}).");
+                return;
+            }
+        };
+        self.browse.close_overlay();
+        self.search = None;
+        self.scraper = Some(ScraperSettings::open(scraper));
+    }
+
+    fn close_scraper(&mut self) {
+        self.scraper = None;
+        self.refocus = true;
+    }
+
+    fn confirm_scraper(&mut self) {
+        let Some(command) = self.scraper.as_mut().map(|dialog| dialog.confirm()) else {
+            return;
+        };
+        if command == ScraperCommand::Save {
+            self.write_scraper();
+        }
+    }
+
+    fn write_scraper(&mut self) {
+        let Some(draft) = self.scraper.as_ref().map(|dialog| dialog.draft()) else {
+            return;
+        };
+        if let Err(err) = config::save_scraper_settings(draft) {
+            let message = format!("Could not save scraper settings ({err}).");
+            self.browse.status = message.clone();
+            if let Some(dialog) = &mut self.scraper {
+                dialog.set_error(message);
+            }
+            return;
+        }
+        self.close_scraper();
+    }
+
     fn open_options(&mut self) {
         if self.import_rx.is_some()
             || self.wizard.is_some()
             || self.emulators.is_some()
             || self.options.is_some()
+            || self.scraper.is_some()
         {
             return;
         }
@@ -788,6 +977,7 @@ impl Shell {
             || self.wizard.is_some()
             || self.emulators.is_some()
             || self.options.is_some()
+            || self.scraper.is_some()
         {
             return;
         }
@@ -858,6 +1048,7 @@ impl Shell {
             || self.wizard.is_some()
             || self.emulators.is_some()
             || self.options.is_some()
+            || self.scraper.is_some()
         {
             return;
         }
@@ -1421,6 +1612,15 @@ impl Shell {
         }
     }
 
+    fn reveal_scraper(&mut self) {
+        let Some(dialog) = &self.scraper else {
+            return;
+        };
+        if self.scraper_scroll.bounds().size.height > px(0.) {
+            self.scraper_scroll.scroll_to_item(dialog.scroll_index());
+        }
+    }
+
     fn reveal_import(&mut self) {
         let Some(wizard) = &self.wizard else {
             return;
@@ -1447,6 +1647,7 @@ impl Render for Shell {
         self.reveal_selection();
         self.reveal_import();
         self.reveal_emulators();
+        self.reveal_scraper();
         if let Overlay::Scrape(prompt) = &self.browse.overlay {
             if prompt.slot == ScrapeSlot::Results {
                 self.scrape_scroll.scroll_to_item(prompt.cursor);
@@ -1502,6 +1703,11 @@ impl Render for Shell {
                 cx,
             ))
             .children(options_dialog(self.options.as_ref(), cx))
+            .children(scraper_dialog(
+                self.scraper.as_ref(),
+                &self.scraper_scroll,
+                cx,
+            ))
     }
 }
 
@@ -1520,8 +1726,8 @@ fn header(
     let mut row = div()
         .flex()
         .items_center()
-        .gap(px(12.))
-        .px(px(16.))
+        .gap(px(8.))
+        .px(px(12.))
         .h(px(48.))
         .bg(theme.surface)
         .border_b_1()
@@ -1540,9 +1746,10 @@ fn header(
             .flex()
             .flex_shrink_0()
             .items_center()
-            .gap(px(4.))
+            .gap(px(2.))
             .child(import_button(cx))
             .child(emulators_button(cx))
+            .child(scraper_button(cx))
             .child(options_button(cx))
             .child(scrape_button(false, cx))
             .child(scrape_button(true, cx)),
@@ -1556,7 +1763,7 @@ fn header(
             .flex_shrink_1()
             .min_w(px(0.))
             .overflow_hidden()
-            .gap(px(4.))
+            .gap(px(2.))
             .items_center()
             .text_color(theme.secondary)
             .text_size(px(12.))
@@ -1577,8 +1784,23 @@ fn header(
     )
 }
 
+fn scraper_button(cx: &Context<Shell>) -> impl IntoElement {
+    with_tooltip(
+        button("scraper-settings", "Scraper", ButtonVariant::Secondary, cx)
+            .px(px(4.))
+            .flex_shrink_0()
+            .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
+                this.open_scraper();
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            })),
+        "Scraper settings (Ctrl+G)",
+    )
+}
+
 fn options_button(cx: &Context<Shell>) -> impl IntoElement {
     button("options", "Options", ButtonVariant::Secondary, cx)
+        .px(px(4.))
         .flex_shrink_0()
         .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
             this.open_options();
@@ -1595,13 +1817,13 @@ fn theme_button(appearance: &str, cx: &Context<Shell>) -> impl IntoElement {
         .border_1()
         .border_color(if on { theme.accent } else { theme.background })
         .child(
-            button("theme-toggle", "Theme", ButtonVariant::Secondary, cx).on_click(cx.listener(
-                |this: &mut Shell, _: &ClickEvent, window, cx| {
+            button("theme-toggle", "Theme", ButtonVariant::Secondary, cx)
+                .px(px(4.))
+                .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
                     this.toggle_appearance(cx);
                     this.focus_handle.focus(window, cx);
                     cx.notify();
-                },
-            )),
+                })),
         )
 }
 
@@ -1612,6 +1834,7 @@ fn emulators_button(cx: &Context<Shell>) -> impl IntoElement {
         ButtonVariant::Secondary,
         cx,
     )
+    .px(px(4.))
     .flex_shrink_0()
     .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
         this.open_emulators();
@@ -1622,6 +1845,7 @@ fn emulators_button(cx: &Context<Shell>) -> impl IntoElement {
 
 fn import_button(cx: &Context<Shell>) -> impl IntoElement {
     button("import-roms", "Import ROMs", ButtonVariant::Secondary, cx)
+        .px(px(4.))
         .flex_shrink_0()
         .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
             this.open_import();
@@ -1637,6 +1861,7 @@ fn scrape_button(missing: bool, cx: &Context<Shell>) -> impl IntoElement {
         ("scrape-selected", "Scrape")
     };
     button(id, label, ButtonVariant::Secondary, cx)
+        .px(px(4.))
         .flex_shrink_0()
         .on_click(
             cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
@@ -1676,7 +1901,7 @@ fn filter_segment(
             GridFilter::All => "filter-all",
             GridFilter::Favorites => "filter-favorites",
         })
-        .px(px(10.))
+        .px(px(6.))
         .py(px(4.))
         .text_size(px(12.))
         .cursor_pointer()
@@ -2232,7 +2457,7 @@ fn status_line(
 ) -> impl IntoElement {
     let theme = cx.omarchy();
     let text = if browse.status.is_empty() {
-        "Ctrl+I imports ROMs. Ctrl+M or Ctrl+E manages emulators."
+        "Ctrl+I imports ROMs. Ctrl+G scraper settings. Ctrl+M or Ctrl+E manages emulators."
     } else {
         browse.status.as_str()
     };
@@ -3698,6 +3923,292 @@ fn emulator_action(
                     .is_some_and(|dialog| dialog.aim(slot));
                 if aimed {
                     this.confirm_emulators(cx);
+                }
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            },
+        )))
+}
+
+fn scraper_dialog(
+    dialog: Option<&ScraperSettings>,
+    scroll: &ScrollHandle,
+    cx: &Context<Shell>,
+) -> Option<gpui_kit::AnyElement> {
+    let dialog = dialog?;
+    let mut list = div()
+        .id("scraper-list")
+        .w_full()
+        .max_h(px(560.))
+        .overflow_y_scroll()
+        .track_scroll(scroll)
+        .flex()
+        .flex_col()
+        .gap(px(12.));
+    for block in dialog.blocks() {
+        list = list.child(scraper_block(block, cx));
+    }
+    Some(
+        modal(
+            dialog_page("scraper-dialog", scraper_settings::TITLE, 560., cx)
+                .child(hint(
+                    "Arrows and Tab move. Enter toggles, reorders, or saves. Esc closes.",
+                    cx,
+                ))
+                .child(list),
+        )
+        .into_any_element(),
+    )
+}
+
+fn scraper_block(block: ScraperBlock, cx: &Context<Shell>) -> gpui_kit::AnyElement {
+    match block {
+        ScraperBlock::Heading(text) => heading(text).into_any_element(),
+        ScraperBlock::Note(text) => hint(text, cx).into_any_element(),
+        ScraperBlock::Art(line) => scraper_check(line, cx).into_any_element(),
+        ScraperBlock::Provider(line) => scraper_provider(line, cx).into_any_element(),
+        ScraperBlock::Field(line) => scraper_field(line, cx).into_any_element(),
+        ScraperBlock::Error(text) => import_error(&text, cx).into_any_element(),
+        ScraperBlock::Save { aimed } => div()
+            .flex()
+            .justify_end()
+            .child(scraper_action(
+                "scraper-save",
+                "Save",
+                ButtonVariant::Primary,
+                aimed,
+                ScraperSlot::Save,
+                cx,
+            ))
+            .into_any_element(),
+    }
+}
+
+fn scraper_check(line: crate::scraper_settings::ArtLine, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let id = match line.slot {
+        ScraperSlot::BoxArt => "scraper-box-art",
+        ScraperSlot::Screenshot => "scraper-screenshot",
+        _ => "scraper-art",
+    };
+    let state = if line.on {
+        CheckboxState::Checked
+    } else {
+        CheckboxState::Unchecked
+    };
+    let slot = line.slot;
+    let entity = cx.entity();
+    div()
+        .border_1()
+        .border_color(if line.aimed {
+            theme.accent
+        } else {
+            theme.background
+        })
+        .child(
+            checkbox(id, line.label, state, cx).on_change(move |state, _, window, cx| {
+                entity.update(cx, |this, cx| {
+                    if let Some(dialog) = &mut this.scraper {
+                        dialog.aim(slot);
+                        dialog.set_checked(slot, state == CheckboxState::Checked);
+                    }
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                });
+            }),
+        )
+}
+
+fn scraper_provider(
+    line: crate::scraper_settings::ProviderLine,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let state = if line.enabled {
+        CheckboxState::Checked
+    } else {
+        CheckboxState::Unchecked
+    };
+    let index = line.index;
+    let enable = ScraperSlot::Provider {
+        index,
+        part: ScraperPart::Enabled,
+    };
+    let entity = cx.entity();
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .border_1()
+                .border_color(if line.check_aimed {
+                    theme.accent
+                } else {
+                    theme.background
+                })
+                .child(
+                    checkbox(("scraper-enable", index), line.label, state, cx).on_change(
+                        move |state, _, window, cx| {
+                            entity.update(cx, |this, cx| {
+                                if let Some(dialog) = &mut this.scraper {
+                                    dialog.aim(enable);
+                                    dialog.set_checked(enable, state == CheckboxState::Checked);
+                                }
+                                this.focus_handle.focus(window, cx);
+                                cx.notify();
+                            });
+                        },
+                    ),
+                ),
+        )
+        .child(scraper_move(index, true, line.up_on, line.up_aimed, cx))
+        .child(scraper_move(
+            index,
+            false,
+            line.down_on,
+            line.down_aimed,
+            cx,
+        ))
+}
+
+fn scraper_move(
+    index: usize,
+    up: bool,
+    enabled: bool,
+    aimed: bool,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let label = if up { "Up" } else { "Down" };
+    let id = if up {
+        format!("scraper-up-{index}")
+    } else {
+        format!("scraper-down-{index}")
+    };
+    let slot = ScraperSlot::Provider {
+        index,
+        part: if up {
+            ScraperPart::Up
+        } else {
+            ScraperPart::Down
+        },
+    };
+    let control = button(id, label, ButtonVariant::Secondary, cx);
+    let control = if enabled {
+        control.on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                let aimed = this.scraper.as_mut().is_some_and(|dialog| dialog.aim(slot));
+                if aimed {
+                    this.confirm_scraper();
+                }
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+    } else {
+        control.disabled(true)
+    };
+    div()
+        .border_1()
+        .border_color(if aimed {
+            theme.accent
+        } else {
+            theme.background
+        })
+        .child(control)
+}
+
+fn scraper_field(
+    line: crate::scraper_settings::FieldLine,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let id = match line.slot {
+        ScraperSlot::User => "scraper-user",
+        ScraperSlot::Password => "scraper-password",
+        ScraperSlot::ApiKey => "scraper-api-key",
+        _ => "scraper-field",
+    };
+    let slot = line.slot;
+    let mut text = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .overflow_hidden()
+        .min_h(px(18.));
+    if line.edit.text.is_empty() {
+        if line.aimed {
+            text = text.child(
+                div()
+                    .w(px(1.))
+                    .h(px(16.))
+                    .flex_shrink_0()
+                    .bg(theme.foreground),
+            );
+        }
+        text = text.child(div().text_color(theme.secondary).child(line.placeholder));
+    } else {
+        let caret = line.edit.caret_line();
+        text = text.child(caret.head);
+        if line.aimed {
+            text = text.child(
+                div()
+                    .w(px(1.))
+                    .h(px(16.))
+                    .flex_shrink_0()
+                    .bg(theme.foreground),
+            );
+        }
+        text = text.child(caret.tail);
+    }
+    div()
+        .id(id)
+        .w_full()
+        .px(px(8.))
+        .py(px(6.))
+        .border_1()
+        .border_color(if line.aimed {
+            theme.accent
+        } else {
+            theme.border
+        })
+        .bg(theme.surface)
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                if let Some(dialog) = &mut this.scraper {
+                    dialog.aim(slot);
+                }
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+        .child(text)
+}
+
+fn scraper_action(
+    id: &'static str,
+    label: &'static str,
+    variant: ButtonVariant,
+    aimed: bool,
+    slot: ScraperSlot,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .border_1()
+        .border_color(if aimed {
+            theme.accent
+        } else {
+            theme.background
+        })
+        .child(button(id, label, variant, cx).on_click(cx.listener(
+            move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                let aimed = this.scraper.as_mut().is_some_and(|dialog| dialog.aim(slot));
+                if aimed {
+                    this.confirm_scraper();
                 }
                 this.focus_handle.focus(window, cx);
                 cx.notify();

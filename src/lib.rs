@@ -14,6 +14,7 @@ pub mod launcher;
 pub mod options;
 pub mod scanner;
 pub mod scraper;
+pub mod scraper_settings;
 pub mod shell;
 pub mod softname;
 pub mod types;
