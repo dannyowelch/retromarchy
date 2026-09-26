@@ -153,6 +153,9 @@ impl Default for GridArt {
 }
 
 impl GridArt {
+    /// Status-bar order, and the `1`, `2`, … keys. A new kind is one variant here.
+    pub const ALL: [GridArt; 2] = [Self::BoxArt, Self::Screenshot];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::BoxArt => "box_art",
