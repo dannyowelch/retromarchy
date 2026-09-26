@@ -2743,15 +2743,16 @@ fn detail_art(path: std::path::PathBuf, kind: MediaKind) -> impl IntoElement {
         MediaKind::Screenshot => 4.0 / 3.0,
         _ => 3.0 / 4.0,
     });
-    // Border box includes padding and the 1px left border. Height follows the
-    // file so Contain fills the slot instead of a tall letterbox.
+    // Border box includes padding and the 1px left border. GTK scales this
+    // picture into 250×180. Past that, a box plus a screenshot push play time
+    // below the pane, so Contain letterboxes inside the cap.
     let width = (DETAILS_WIDTH - DETAILS_PAD * 2.0 - 1.0).max(1.0);
-    let height = (width / ratio.max(0.05)).max(1.0);
+    let height = (width / ratio.max(0.05)).clamp(1.0, 180.0);
     img(path)
         .w_full()
         .h(px(height))
         .flex_none()
-        .aspect_ratio(ratio)
+        .aspect_ratio(width / height)
         .object_fit(ObjectFit::Contain)
 }
 
