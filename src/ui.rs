@@ -771,11 +771,14 @@ impl App {
         config: &Config,
         library_empty: bool,
     ) {
+        // The menu is parented to a tile. Unparent it before those tiles are
+        // removed, or GTK finalizes the tile with the popover still attached
+        // and the next click aborts.
+        Self::detach_popovers(grid.upcast_ref());
+
         while let Some(child) = grid.first_child() {
             grid.remove(&child);
         }
-
-        Self::detach_popovers(grid.upcast_ref());
 
         for game in games {
             let game_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
@@ -3578,6 +3581,7 @@ mod tests {
         detail_column_stays_fixed_when_play_expands();
         favorite_toggle_updates_badge_and_detail_heart();
         game_menu_activates_rename();
+        rebuilding_the_grid_unparents_the_game_menu();
     }
 
     fn game_menu_activates_rename() {
@@ -3601,6 +3605,46 @@ mod tests {
         assert_eq!(labels, vec!["Scrape…", "Rename…", "Delete…"]);
         list.row_at_index(1).unwrap().activate();
         assert_eq!(*seen.borrow(), Some(GameAction::Rename));
+    }
+
+    fn rebuilding_the_grid_unparents_the_game_menu() {
+        use crate::config::Config;
+        use crate::types::{Console, GridArt, MediaToggles};
+
+        let config = Config {
+            consoles: vec![Console {
+                id: "snes".into(),
+                name: "Super Nintendo".into(),
+                rom_dirs: Vec::new(),
+                extensions: Vec::new(),
+                profile: None,
+                grid_art: GridArt::BoxArt,
+                media: MediaToggles::default(),
+            }],
+            ..Config::default()
+        };
+        let grid = gtk4::FlowBox::new();
+        let stack = gtk4::Stack::new();
+        stack.add_named(
+            &gtk4::Box::new(gtk4::Orientation::Vertical, 0),
+            Some("grid"),
+        );
+        stack.add_named(&gtk4::Label::new(Some("empty")), Some("empty"));
+        let games = vec![sample_game("Chrono Trigger", false)];
+        App::update_game_grid(&grid, &stack, &games, &config, false);
+
+        let menu = gtk4::Popover::new();
+        menu.set_child(Some(&gtk4::Label::new(Some("Scrape…"))));
+        let tile = grid.child_at_index(0).unwrap();
+        menu.set_parent(&tile);
+        assert!(menu.parent().is_some());
+
+        App::update_game_grid(&grid, &stack, &games, &config, false);
+        assert!(menu.parent().is_none());
+        assert!(menu.child().is_some());
+        menu.set_parent(&grid.child_at_index(0).unwrap());
+        assert!(menu.parent().is_some());
+        menu.unparent();
     }
 
     fn flow_columns_follows_the_allocated_line() {
