@@ -3442,14 +3442,15 @@ impl App {
                     }
                 }
                 PadTarget::Dialog(dialog) => {
+                    dialog.set_focus_visible(true);
                     if let Some(dir) = held_x {
                         for _ in 0..steps_x {
-                            dialog.child_focus(Self::nav_direction(dir));
+                            let _ = Self::move_dialog_focus(&dialog, dir);
                         }
                     }
                     if let Some(dir) = held_y {
                         for _ in 0..steps_y {
-                            dialog.child_focus(Self::nav_direction(dir));
+                            let _ = Self::move_dialog_focus(&dialog, dir);
                         }
                     }
                 }
@@ -3509,6 +3510,11 @@ impl App {
             PadAction::Confirm => Self::activate_menu(menu),
             PadAction::Favorite => {}
         }
+    }
+
+    fn move_dialog_focus(dialog: &gtk4::Window, dir: NavDir) -> bool {
+        dialog.set_focus_visible(true);
+        dialog.child_focus(Self::nav_direction(dir))
     }
 
     fn dialog_pad_action(dialog: &gtk4::Window, action: PadAction) {
@@ -3582,6 +3588,7 @@ mod tests {
         favorite_toggle_updates_badge_and_detail_heart();
         game_menu_activates_rename();
         rebuilding_the_grid_unparents_the_game_menu();
+        controller_reaches_context_dialog_controls();
     }
 
     fn game_menu_activates_rename() {
@@ -3981,5 +3988,151 @@ mod tests {
             child = current.next_sibling();
         }
         out
+    }
+
+    fn pump_until(mut ready: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        let ctx = glib::MainContext::default();
+        while start.elapsed() < std::time::Duration::from_secs(2) {
+            while ctx.pending() {
+                ctx.iteration(false);
+            }
+            if ready() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        panic!("timed out waiting for a dialog");
+    }
+
+    fn toplevel_titled(title: &str) -> gtk4::Window {
+        gtk4::Window::list_toplevels()
+            .into_iter()
+            .find_map(|widget| {
+                let window = widget.downcast::<gtk4::Window>().ok()?;
+                (window.title().as_deref() == Some(title)).then_some(window)
+            })
+            .unwrap_or_else(|| panic!("missing dialog {title}"))
+    }
+
+    fn focused_check(dialog: &gtk4::Window) -> gtk4::CheckButton {
+        gtk4::prelude::RootExt::focus(dialog)
+            .and_then(|widget| widget.downcast::<gtk4::CheckButton>().ok())
+            .expect("focus is not a check button")
+    }
+
+    fn controller_reaches_context_dialog_controls() {
+        let app = adw::Application::builder()
+            .application_id("org.omarchy.Retromarchy.DialogFocusTest")
+            .build();
+        let failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let failure_in = failure.clone();
+        app.connect_activate(move |app| {
+            let app = app.clone();
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let parent = adw::ApplicationWindow::new(&app);
+                parent.set_default_size(640, 480);
+                parent.present();
+                let menu = gtk4::Popover::new();
+                pump_until(|| parent.is_mapped());
+                assert!(
+                    matches!(App::pad_target(&parent, &menu), PadTarget::Grid),
+                    "controller left the grid with no dialog open"
+                );
+
+                crate::dialogs::open_delete(&parent, "Stay Frosty 2", |_| {});
+                pump_until(|| {
+                    let dialog = toplevel_titled("Delete");
+                    dialog.is_mapped() && dialog.allocation().width() > 50
+                });
+                let PadTarget::Dialog(dialog) = App::pad_target(&parent, &menu) else {
+                    panic!("controller stayed on the grid while Delete was open");
+                };
+                assert!(App::move_dialog_focus(&dialog, NavDir::Up));
+                assert!(dialog.gets_focus_visible());
+                let assets = focused_check(&dialog);
+                assert_eq!(assets.label().as_deref(), Some("Delete scraped assets"));
+                assert!(!assets.is_active());
+                assert!(assets.activate());
+                assert!(assets.is_active());
+                assert!(App::move_dialog_focus(&dialog, NavDir::Up));
+                let rom = focused_check(&dialog);
+                assert_eq!(rom.label().as_deref(), Some("Delete ROM file from disk"));
+                assert!(!rom.is_active());
+                assert!(rom.activate());
+                assert!(rom.is_active());
+                assert!(App::move_dialog_focus(&dialog, NavDir::Down));
+                assert!(App::move_dialog_focus(&dialog, NavDir::Down));
+                let buttons =
+                    gtk4::prelude::RootExt::focus(&dialog).expect("focus left the dialog");
+                assert!(
+                    buttons.downcast_ref::<gtk4::Button>().is_some(),
+                    "down from the checkboxes did not reach Cancel or Delete"
+                );
+                dialog.close();
+
+                crate::dialogs::open_rename(&parent, "Stay Frosty 2", |_| {});
+                pump_until(|| toplevel_titled("Rename").is_mapped());
+                let PadTarget::Dialog(rename) = App::pad_target(&parent, &menu) else {
+                    panic!("controller stayed on the grid while Rename was open");
+                };
+                assert!(App::move_dialog_focus(&rename, NavDir::Down));
+                let cancel = gtk4::prelude::RootExt::focus(&rename).expect("rename lost focus");
+                let cancel = cancel
+                    .downcast::<gtk4::Button>()
+                    .expect("Down did not reach a button");
+                assert_eq!(cancel.label().as_deref(), Some("Cancel"));
+                assert!(App::move_dialog_focus(&rename, NavDir::Right));
+                let save = gtk4::prelude::RootExt::focus(&rename)
+                    .and_then(|widget| widget.downcast::<gtk4::Button>().ok())
+                    .expect("Right did not reach Save");
+                assert_eq!(save.label().as_deref(), Some("Save"));
+                assert!(App::move_dialog_focus(&rename, NavDir::Up));
+                let entry = gtk4::prelude::RootExt::focus(&rename).expect("Up left Rename");
+                assert!(
+                    entry.ancestor(gtk4::Entry::static_type()).is_some()
+                        || entry.downcast_ref::<gtk4::Entry>().is_some(),
+                    "Up from Save did not return to the title entry"
+                );
+                rename.close();
+
+                crate::dialogs::open_game_scrape(
+                    &parent,
+                    "Stay Frosty 2",
+                    "nes",
+                    Rc::new(RefCell::new(Config::default())),
+                    Rc::new(|_| {}),
+                );
+                pump_until(|| toplevel_titled("Scrape").is_mapped());
+                let PadTarget::Dialog(scrape) = App::pad_target(&parent, &menu) else {
+                    panic!("controller stayed on the grid while Scrape was open");
+                };
+                assert!(App::move_dialog_focus(&scrape, NavDir::Right));
+                let search = gtk4::prelude::RootExt::focus(&scrape)
+                    .and_then(|widget| widget.downcast::<gtk4::Button>().ok())
+                    .expect("Right did not reach Search");
+                assert_eq!(search.label().as_deref(), Some("Search"));
+                scrape.close();
+                app.quit();
+            }));
+            if let Err(payload) = ran {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        payload
+                            .downcast_ref::<&str>()
+                            .map(|text| (*text).to_string())
+                    })
+                    .unwrap_or_else(|| "dialog focus test panicked".to_string());
+                *failure_in.borrow_mut() = Some(message);
+                app.quit();
+            }
+        });
+        app.run_with_args::<&str>(&[]);
+        let message = failure.borrow().clone();
+        if let Some(message) = message {
+            panic!("{message}");
+        }
     }
 }

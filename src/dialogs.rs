@@ -1347,6 +1347,7 @@ pub fn open_game_scrape(
     });
 
     close_on_escape(&window);
+    use_parent_application(&window, parent);
     window.present();
     entry.grab_focus();
     run_search();
@@ -1463,6 +1464,7 @@ pub fn open_rename(
     entry.connect_activate(move |_| save_title());
 
     close_on_escape(&window);
+    use_parent_application(&window, parent);
     window.present();
     entry.grab_focus();
 }
@@ -1536,6 +1538,7 @@ pub fn open_delete(
     });
 
     close_on_escape(&window);
+    use_parent_application(&window, parent);
     window.present();
     cancel.grab_focus();
 }
@@ -1559,6 +1562,12 @@ fn input_row(
     row.add_suffix(&spin);
     row.set_activatable_widget(Some(&spin));
     (row, spin)
+}
+
+fn use_parent_application(window: &Window, parent: &impl gtk4::prelude::GtkWindowExt) {
+    if let Some(application) = parent.application() {
+        window.set_application(Some(&application));
+    }
 }
 
 fn close_on_escape(window: &Window) {
