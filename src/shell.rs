@@ -1,13 +1,13 @@
 use crate::browse::{
-    columns_for, cover_path, file_for, format_play_time, key_from_name, resolve_profile, Browse,
-    Key, LibraryKind, Pane,
+    columns_for, cover_path, file_for, format_play_time, key_from_name, resolve_profile, row_of,
+    Browse, Key, LibraryKind, Pane, TileFrame, DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH, TILE_GAP,
 };
 use crate::launcher;
-use crate::types::MediaKind;
+use crate::types::{Game, GridArt, MediaKind};
 use gpui_kit::{
-    div, img, px, App, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, StatefulInteractiveElement, Styled, StyledImage, Window, WindowBounds,
-    WindowDecorations, WindowOptions,
+    div, img, point, px, App, ClickEvent, Context, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, ObjectFit, ParentElement, Render, ScrollHandle, StatefulInteractiveElement,
+    Styled, StyledImage, Window, WindowBounds, WindowDecorations, WindowOptions,
 };
 use gpui_omarchy::{
     badge, button, empty_state, focus_scope, keycap, separator, ActiveTheme, ButtonVariant, Status,
@@ -17,6 +17,11 @@ pub struct Shell {
     browse: Browse,
     focus_handle: FocusHandle,
     armed: bool,
+    grid_scroll: ScrollHandle,
+    sidebar_scroll: ScrollHandle,
+    revealed_console: Option<usize>,
+    revealed_game: Option<usize>,
+    revealed_columns: usize,
 }
 
 impl Shell {
@@ -25,6 +30,11 @@ impl Shell {
             browse,
             focus_handle: cx.focus_handle(),
             armed: false,
+            grid_scroll: ScrollHandle::new(),
+            sidebar_scroll: ScrollHandle::new(),
+            revealed_console: None,
+            revealed_game: None,
+            revealed_columns: 0,
         }
     }
 
@@ -63,13 +73,44 @@ impl Shell {
             Err(err) => self.browse.status = err.to_string(),
         }
     }
+
+    /// Scroll the selected row into view after the scrollports have a real size.
+    /// Remembering the last reveal keeps a wheel gesture from snapping back.
+    fn reveal_selection(&mut self) {
+        if self.grid_scroll.bounds().size.height <= px(0.) {
+            return;
+        }
+        let columns = self.browse.columns.max(1);
+        let console = self.browse.console;
+        let game = self.browse.game;
+        if self.revealed_console == Some(console)
+            && self.revealed_game == game
+            && self.revealed_columns == columns
+        {
+            return;
+        }
+        if self.revealed_console != Some(console) {
+            self.grid_scroll.set_offset(point(px(0.), px(0.)));
+            if self.sidebar_scroll.bounds().size.height > px(0.) {
+                self.sidebar_scroll.scroll_to_item(console + 1);
+            }
+        }
+        if let Some(index) = game {
+            self.grid_scroll.scroll_to_item(row_of(index, columns));
+        }
+        self.revealed_console = Some(console);
+        self.revealed_game = game;
+        self.revealed_columns = columns;
+    }
 }
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let width = window.viewport_size().width.as_f32();
+        let frame = self.browse.tile_frame();
         self.browse
-            .set_columns(columns_for(width, self.browse.details_open));
+            .set_columns(columns_for(width, self.browse.details_open, frame.width));
+        self.reveal_selection();
         if !self.armed {
             self.armed = true;
             self.focus_handle.focus(window, cx);
@@ -93,7 +134,12 @@ impl Render for Shell {
             }))
             .child(header(&self.browse, &theme_name, cx))
             .children(note_bar(&self.browse.library.note, cx))
-            .child(body(&self.browse, cx))
+            .child(body(
+                &self.browse,
+                &self.grid_scroll,
+                &self.sidebar_scroll,
+                cx,
+            ))
             .child(status_line(&self.browse.status, cx))
     }
 }
@@ -152,31 +198,38 @@ fn note_bar(note: &str, cx: &App) -> Option<impl IntoElement> {
     )
 }
 
-fn body(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
+fn body(
+    browse: &Browse,
+    grid_scroll: &ScrollHandle,
+    sidebar_scroll: &ScrollHandle,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
     let mut row = div()
         .flex_1()
         .min_h_0()
         .flex()
         .flex_row()
-        .child(sidebar(browse, cx))
-        .child(grid(browse, cx));
+        .child(sidebar(browse, sidebar_scroll, cx))
+        .child(grid(browse, grid_scroll, cx));
     if browse.details_open {
         row = row.child(details(browse, cx));
     }
     row
 }
 
-fn sidebar(browse: &Browse, cx: &App) -> impl IntoElement {
+fn sidebar(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl IntoElement {
     let theme = cx.omarchy();
     let focused = browse.pane == Pane::Sidebar;
     div()
         .id("sidebar")
-        .w(px(220.))
+        .w(px(SIDEBAR_WIDTH))
         .h_full()
+        .min_h_0()
         .flex_shrink_0()
         .flex()
         .flex_col()
         .overflow_y_scroll()
+        .track_scroll(scroll)
         .bg(theme.inset)
         .border_r_1()
         .border_color(if focused { theme.accent } else { theme.border })
@@ -184,6 +237,7 @@ fn sidebar(browse: &Browse, cx: &App) -> impl IntoElement {
         .gap(px(4.))
         .child(
             div()
+                .flex_shrink_0()
                 .px(px(8.))
                 .py(px(6.))
                 .text_size(px(12.))
@@ -199,6 +253,8 @@ fn sidebar(browse: &Browse, cx: &App) -> impl IntoElement {
                 .map(|(index, shelf)| {
                     let selected = index == browse.console;
                     div()
+                        .id(("console", index))
+                        .flex_shrink_0()
                         .px(px(8.))
                         .py(px(8.))
                         .bg(if selected {
@@ -208,6 +264,15 @@ fn sidebar(browse: &Browse, cx: &App) -> impl IntoElement {
                         })
                         .border_1()
                         .border_color(if selected { theme.accent } else { theme.border })
+                        .hover(|style| style.bg(theme.hover_fill()))
+                        .on_click(cx.listener(
+                            move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                                this.revealed_console = None;
+                                this.browse.select_console(index);
+                                this.focus_handle.focus(window, cx);
+                                cx.notify();
+                            },
+                        ))
                         .child(shelf.console.name.clone())
                         .child(
                             div()
@@ -219,7 +284,7 @@ fn sidebar(browse: &Browse, cx: &App) -> impl IntoElement {
         )
 }
 
-fn grid(browse: &Browse, cx: &App) -> impl IntoElement {
+fn grid(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl IntoElement {
     let theme = cx.omarchy();
     let focused = browse.pane == Pane::Grid;
     let shelf = browse.shelf();
@@ -228,8 +293,14 @@ fn grid(browse: &Browse, cx: &App) -> impl IntoElement {
         .flex_1()
         .h_full()
         .min_w_0()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .gap(px(TILE_GAP))
+        .overflow_hidden()
         .overflow_y_scroll()
-        .p(px(16.))
+        .track_scroll(scroll)
+        .p(px(GRID_PAD))
         .border_1()
         .border_color(if focused {
             theme.accent
@@ -250,55 +321,85 @@ fn grid(browse: &Browse, cx: &App) -> impl IntoElement {
             cx,
         ));
     }
-    pane = pane.child(div().flex().flex_wrap().gap(px(12.)).children(
-        shelf.games.iter().enumerate().map(|(index, game)| {
-            tile(
-                &game.title,
-                cover_path(game, shelf.console.grid_art),
-                browse.game == Some(index),
-                browse.library.kind == LibraryKind::Demo,
-                cx,
-            )
-        }),
-    ));
+    let columns = browse.columns.max(1);
+    let art = shelf.console.grid_art;
+    let demo = browse.library.kind == LibraryKind::Demo;
+    let count = shelf.games.len();
+    for start in (0..count).step_by(columns) {
+        let end = (start + columns).min(count);
+        let mut row = div().flex().flex_row().flex_shrink_0().gap(px(TILE_GAP));
+        for index in start..end {
+            let game = &shelf.games[index];
+            row = row.child(tile(index, game, art, browse.game == Some(index), demo, cx));
+        }
+        pane = pane.child(row);
+    }
     pane
 }
 
 fn tile(
-    title: &str,
-    cover: Option<std::path::PathBuf>,
+    index: usize,
+    game: &Game,
+    art: GridArt,
     selected: bool,
     demo: bool,
-    cx: &App,
+    cx: &Context<Shell>,
 ) -> impl IntoElement {
     let theme = cx.omarchy();
-    let art = div().w(px(148.)).h(px(148.)).overflow_hidden();
-    let art = if let Some(path) = cover {
-        art.child(img(path).size_full().object_fit(gpui_kit::ObjectFit::Cover))
+    let frame = TileFrame::for_art(art);
+    let title = game.title.clone();
+    let cover = cover_path(game, art);
+    // An explicit ratio stops GPUI from resizing the tile to the file's own ratio.
+    let image = div()
+        .w(px(frame.width))
+        .h(px(frame.height))
+        .flex_shrink_0()
+        .overflow_hidden()
+        .bg(theme.surface);
+    let image = if let Some(path) = cover {
+        image.child(
+            img(path)
+                .w(px(frame.width))
+                .h(px(frame.height))
+                .aspect_ratio(frame.ratio())
+                .object_fit(ObjectFit::Contain),
+        )
     } else {
-        art.bg(theme.surface)
+        image
             .flex()
             .items_center()
             .justify_center()
             .text_size(px(28.))
             .font_weight(gpui_kit::FontWeight::BOLD)
             .text_color(theme.accent)
-            .child(initials(title))
+            .child(initials(&title))
     };
     let mut caption = div()
         .p(px(8.))
-        .w(px(148.))
+        .w(px(frame.width))
         .text_size(px(12.))
-        .child(title.to_string());
+        .line_clamp(2)
+        .child(title);
     if demo {
         caption = caption.child(div().text_color(theme.secondary).child("Placeholder"));
     }
     div()
-        .w(px(148.))
+        .id(("game", index))
+        .w(px(frame.width))
+        .flex_shrink_0()
         .bg(theme.inset)
         .border_1()
         .border_color(if selected { theme.accent } else { theme.border })
-        .child(art)
+        .hover(|style| style.border_color(theme.accent))
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                this.revealed_game = None;
+                this.browse.select_game(index);
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+        .child(image)
         .child(caption)
 }
 
@@ -323,7 +424,7 @@ fn details(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
     let theme = cx.omarchy();
     let mut pane = div()
         .id("details")
-        .w(px(280.))
+        .w(px(DETAILS_WIDTH))
         .h_full()
         .flex_shrink_0()
         .overflow_y_scroll()
@@ -341,14 +442,15 @@ fn details(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
         pane = pane
             .child(
                 button("play", "Play", ButtonVariant::Primary, cx).on_click(cx.listener(
-                    |this: &mut Shell, _, _, cx| {
+                    |this: &mut Shell, _: &ClickEvent, window, cx| {
                         this.launch_selected();
+                        this.focus_handle.focus(window, cx);
                         cx.notify();
                     },
                 )),
             )
-            .child(art_block(file_for(game, MediaKind::BoxArt), cx))
-            .child(art_block(file_for(game, MediaKind::Screenshot), cx))
+            .child(art_block(file_for(game, MediaKind::BoxArt)))
+            .child(art_block(file_for(game, MediaKind::Screenshot)))
             .child(heading(&game.title))
             .child(meta(format!("Console: {}", shelf.console.name), cx));
         if let Some(played) = game.last_played {
@@ -431,18 +533,17 @@ fn details(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
         }))
 }
 
-fn art_block(path: Option<std::path::PathBuf>, _cx: &App) -> impl IntoElement {
-    let block = div().w_full().h(px(140.)).overflow_hidden();
+fn art_block(path: Option<std::path::PathBuf>) -> impl IntoElement {
+    let mut block = div().w_full().flex_shrink_0();
     if let Some(path) = path {
-        block.child(
+        block = block.child(
             img(path)
                 .w_full()
-                .h(px(140.))
-                .object_fit(gpui_kit::ObjectFit::Contain),
-        )
-    } else {
-        block
+                .flex_shrink_0()
+                .object_fit(ObjectFit::Contain),
+        );
     }
+    block
 }
 
 fn heading(text: &str) -> impl IntoElement {
