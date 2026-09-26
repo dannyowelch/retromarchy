@@ -1,9 +1,10 @@
 use crate::appearance::{self, launchbox_theme, theme_key};
 use crate::browse::{
     clamp_cover_width, columns_for, cover_path, file_for, format_play_time, grid_art_key,
-    image_aspect, key_from_parts, resolve_profile, row_of, scrape_chord, Browse, Confirm, Key,
-    LibraryKind, Pane, ScrapeChord, TileFrame, COVER_WIDTH_MAX, COVER_WIDTH_MIN, COVER_WIDTH_STEP,
-    DETAILS_PAD, DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH, TILE_GAP,
+    image_aspect, is_launch_key, key_from_parts, rescan_key, resolve_profile, row_of, scrape_chord,
+    title_search_key, Browse, Confirm, Key, LibraryKind, Pane, ScrapeChord, TileFrame,
+    COVER_WIDTH_MAX, COVER_WIDTH_MIN, COVER_WIDTH_STEP, DETAILS_PAD, DETAILS_WIDTH, GRID_PAD,
+    SIDEBAR_WIDTH, TILE_GAP,
 };
 use crate::config::{self, InputSettings};
 use crate::cores;
@@ -21,6 +22,7 @@ use crate::importer::{self, ImportUpdate};
 use crate::input_repeat::HoldRepeat;
 use crate::launcher;
 use crate::options::{self, InputOptions};
+use crate::scanner;
 use crate::scraper::{self, NameSearch, ScrapeUpdate};
 use crate::scraper_settings::{
     self, scraper_key, Block as ScraperBlock, Command as ScraperCommand, Part as ScraperPart,
@@ -84,6 +86,29 @@ pub struct Shell {
     /// Closing the dialog drops whatever control had focus. The next frame
     /// puts the keyboard back on the shell.
     refocus: bool,
+    play_tx: std::sync::mpsc::Sender<PlayNote>,
+    play_rx: std::sync::mpsc::Receiver<PlayNote>,
+    rescan_rx: Option<std::sync::mpsc::Receiver<RescanNote>>,
+}
+
+enum PlayNote {
+    Saved {
+        game_id: String,
+        play_count: u32,
+        play_time: u32,
+        last_played: chrono::DateTime<chrono::Utc>,
+    },
+    Failed(String),
+}
+
+enum RescanNote {
+    Done {
+        console_id: String,
+        name: String,
+        games: Vec<Game>,
+        stats: database::LibraryStats,
+    },
+    Failed(String),
 }
 
 /// GTK favorite red (`#e01b24`).
@@ -117,6 +142,7 @@ impl Shell {
         if appearance::is_launchbox(&appearance) {
             launchbox_theme().apply(cx);
         }
+        let (play_tx, play_rx) = std::sync::mpsc::channel();
         let nav_started = Instant::now();
         let nav_poll = cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -163,6 +189,9 @@ impl Shell {
             scraper_scroll: ScrollHandle::new(),
             picking_core: false,
             refocus: false,
+            play_tx,
+            play_rx,
+            rescan_rx: None,
         }
     }
 
@@ -344,6 +373,41 @@ impl Shell {
             )
         {
             self.open_scraper();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if self.browse.search_open() {
+            if self.edit_title_search(event, cx) {
+                return;
+            }
+        } else if !event.is_held
+            && title_search_key(
+                event.keystroke.key.as_str(),
+                event.keystroke.key_char.as_deref(),
+                event.keystroke.modifiers.shift,
+                event.keystroke.modifiers.control
+                    || event.keystroke.modifiers.alt
+                    || event.keystroke.modifiers.platform,
+            )
+        {
+            self.browse.open_search();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if !event.is_held
+            && !self.browse.search_open()
+            && rescan_key(
+                event.keystroke.key.as_str(),
+                event.keystroke.key_char.as_deref(),
+                event.keystroke.modifiers.shift,
+                event.keystroke.modifiers.control
+                    || event.keystroke.modifiers.alt
+                    || event.keystroke.modifiers.platform,
+            )
+        {
+            self.rescan_current();
             cx.notify();
             cx.stop_propagation();
             return;
@@ -1451,6 +1515,51 @@ impl Shell {
             }
             changed = true;
         }
+        while let Ok(note) = self.play_rx.try_recv() {
+            match note {
+                PlayNote::Saved {
+                    game_id,
+                    play_count,
+                    play_time,
+                    last_played,
+                } => {
+                    if let Some(title) =
+                        self.browse
+                            .apply_play_stats(&game_id, play_count, play_time, last_played)
+                    {
+                        self.browse.status = format!("Played {title}.");
+                    }
+                }
+                PlayNote::Failed(message) => self.browse.status = message,
+            }
+            changed = true;
+        }
+        if let Some(note) = self.rescan_rx.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(note) => Some(note),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Some(RescanNote::Failed("Rescan stopped.".into()))
+            }
+        }) {
+            self.rescan_rx = None;
+            match note {
+                RescanNote::Done {
+                    console_id,
+                    name,
+                    games,
+                    stats,
+                } => {
+                    let count = games.len();
+                    if self.browse.replace_console_games(&console_id, games, stats) {
+                        self.browse.status = format!("Scanned {count} games in {name}.");
+                    }
+                }
+                RescanNote::Failed(message) => {
+                    self.browse.status = format!("Rescan failed: {message}");
+                }
+            }
+            changed = true;
+        }
         changed |= self.poll_import();
         changed
     }
@@ -1585,6 +1694,84 @@ impl Shell {
         }
     }
 
+    /// Characters go into the title filter. Arrows, Tab, and Enter still move
+    /// and launch, so the grid stays keyboard-first while the query changes.
+    fn edit_title_search(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let keystroke = &event.keystroke;
+        let modified =
+            keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
+        if modified {
+            return false;
+        }
+        let key = keystroke.key.as_str();
+        if is_launch_key(key) || matches!(key, "up" | "down" | "left" | "right" | "tab") {
+            return false;
+        }
+        if key == "escape" {
+            self.browse.close_search();
+            cx.notify();
+            cx.stop_propagation();
+            return true;
+        }
+        if key == "backspace" {
+            self.browse.pop_search();
+            cx.notify();
+            cx.stop_propagation();
+            return true;
+        }
+        if title_search_key(
+            key,
+            keystroke.key_char.as_deref(),
+            keystroke.modifiers.shift,
+            false,
+        ) {
+            if !event.is_held {
+                self.browse.close_search();
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return true;
+        }
+        if let Some(text) = typed_text(keystroke) {
+            self.browse.push_search(text);
+            cx.notify();
+            cx.stop_propagation();
+            return true;
+        }
+        false
+    }
+
+    fn rescan_current(&mut self) {
+        if self.rescan_rx.is_some() {
+            self.browse.status = "A rescan is already running.".into();
+            return;
+        }
+        if self.browse.library.kind == LibraryKind::Demo {
+            self.browse.status = "Demo library. Rescan needs a library on disk.".into();
+            return;
+        }
+        let Some(console) = self.browse.shelf().map(|shelf| shelf.console.clone()) else {
+            self.browse.status = "Select a system before rescanning.".into();
+            return;
+        };
+        let name = console.name.clone();
+        self.browse.status = format!("Scanning {name}…");
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rescan_rx = Some(rx);
+        std::thread::spawn(move || {
+            let note = match rescan_console(console) {
+                Ok((console_id, name, games, stats)) => RescanNote::Done {
+                    console_id,
+                    name,
+                    games,
+                    stats,
+                },
+                Err(err) => RescanNote::Failed(err),
+            };
+            let _ = tx.send(note);
+        });
+    }
+
     fn launch_selected(&mut self) {
         let Some(game) = self.browse.selected_game().cloned() else {
             self.browse.status = "Select a game, then press Enter.".into();
@@ -1598,8 +1785,30 @@ impl Shell {
         };
         match launcher::launch_game_tracked(&profile, &game.rom) {
             Ok(mut child) => {
+                let tx = self.play_tx.clone();
+                let game_id = game.id.clone();
+                let console_id = game.console.clone();
+                let disk = self.browse.library.kind == LibraryKind::Disk;
+                let base_count = game.play_count;
+                let base_time = game.play_time;
                 std::thread::spawn(move || {
+                    let started = Instant::now();
                     let _ = child.wait();
+                    let elapsed = u32::try_from(started.elapsed().as_secs()).unwrap_or(u32::MAX);
+                    let note = if disk {
+                        match save_play_session(&game_id, &console_id, elapsed) {
+                            Ok(saved) => saved,
+                            Err(err) => PlayNote::Failed(err),
+                        }
+                    } else {
+                        PlayNote::Saved {
+                            game_id,
+                            play_count: base_count.saturating_add(1),
+                            play_time: base_time.saturating_add(elapsed),
+                            last_played: chrono::Utc::now(),
+                        }
+                    };
+                    let _ = tx.send(note);
                 });
                 self.browse.status = format!("Launched {}.", game.title);
             }
@@ -1787,10 +1996,14 @@ fn header(
             .child(scrape_button(false, cx))
             .child(scrape_button(true, cx)),
     )
-    .child(div().flex_1())
+    .child(if browse.search_open() {
+        search_field(browse.query(), cx).into_any_element()
+    } else {
+        div().flex_1().into_any_element()
+    })
     .child(filter_control(browse, cx))
     .child(theme_button(appearance, cx))
-    .child(
+    .children((!browse.search_open()).then(|| {
         div()
             .flex()
             .flex_shrink_1()
@@ -1806,6 +2019,10 @@ fn header(
             .child("details")
             .child(keycap("f", cx))
             .child("favorite")
+            .child(keycap("/", cx))
+            .child("filter")
+            .child(keycap("r", cx))
+            .child("rescan")
             .child(keycap("s", cx))
             .child("scrape")
             .child(keycap("S", cx))
@@ -1813,8 +2030,46 @@ fn header(
             .child(keycap("menu", cx))
             .child("game")
             .child(keycap("esc", cx))
-            .child("clear"),
-    )
+            .child("clear")
+    }))
+}
+
+fn search_field(query: &str, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let empty = query.is_empty();
+    div()
+        .id("title-search")
+        .flex()
+        .flex_1()
+        .min_w(px(160.))
+        .items_center()
+        .h(px(28.))
+        .px(px(8.))
+        .gap(px(6.))
+        .bg(theme.background)
+        .border_1()
+        .border_color(theme.accent)
+        .overflow_hidden()
+        .text_size(px(13.))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_color(if empty {
+                    theme.secondary
+                } else {
+                    theme.foreground
+                })
+                .child(if empty {
+                    "Filter titles".to_string()
+                } else {
+                    query.to_string()
+                }),
+        )
+        .child(div().w(px(1.)).h(px(14.)).bg(theme.accent))
 }
 
 fn scraper_button(cx: &Context<Shell>) -> impl IntoElement {
@@ -2089,14 +2344,18 @@ fn grid(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl Int
     let Some(shelf) = shelf else {
         return pane.child(import_empty(cx));
     };
-    let visible: Vec<&Game> = shelf
-        .games
-        .iter()
-        .filter(|game| browse.filter.matches(game))
-        .collect();
+    let console_name = shelf.console.name.clone();
+    let visible: Vec<&Game> = browse.visible_games().collect();
     if visible.is_empty() {
         if shelf.games.is_empty() {
             return pane.child(import_empty(cx));
+        }
+        if !browse.query().trim().is_empty() {
+            return pane.child(empty_state(
+                "No matches",
+                "No titles match this filter. Esc clears it.",
+                cx,
+            ));
         }
         return pane.child(empty_state(
             "No favorites",
@@ -2118,6 +2377,7 @@ fn grid(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl Int
             row = row.child(tile(
                 index,
                 visible[index],
+                &console_name,
                 art,
                 browse.cover_width,
                 browse.game == Some(index),
@@ -2134,6 +2394,7 @@ fn grid(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl Int
 fn tile(
     index: usize,
     game: &Game,
+    console_name: &str,
     art: GridArt,
     cover_width: f32,
     selected: bool,
@@ -2171,15 +2432,44 @@ fn tile(
             .child(initials(&title))
     };
     let mut caption = div()
-        .p(px(8.))
-        .min_h(px(40.))
         .w(px(frame.width))
-        .text_size(px(12.))
-        .line_clamp(2)
-        .child(title);
+        .px(px(8.))
+        .pt(px(8.))
+        .pb(px(6.))
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .overflow_hidden()
+        .child(
+            div()
+                .text_size(px(12.))
+                .line_clamp(2)
+                .min_h(px(32.))
+                .child(title),
+        );
     if demo {
-        caption = caption.child(div().text_color(theme.secondary).child("Placeholder"));
+        caption = caption.child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme.secondary)
+                .child("Placeholder"),
+        );
     }
+    // GTK `.console-subtitle`: 0.9em under the title, middle-ellipsized, dim.
+    // Omarchy uses the theme secondary color. LaunchBox secondary is #999999.
+    // The heart sits on this line, so a favorite keeps the name clear of it.
+    let mut subtitle = div()
+        .text_size(px(11.))
+        .line_height(px(14.))
+        .text_color(theme.secondary)
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis_middle()
+        .child(console_name.to_string());
+    if game.favorite {
+        subtitle = subtitle.pr(px(22.));
+    }
+    caption = caption.child(subtitle);
     // The heart is a card overlay, in the title band, so the cover does not crop it.
     let mut card = div()
         .id(("game", index))
@@ -3000,6 +3290,41 @@ fn delete_notes(game: &Game, options: DeleteOptions) -> Vec<String> {
         }
     }
     notes
+}
+
+fn rescan_console(
+    console: crate::types::Console,
+) -> Result<(String, String, Vec<Game>, database::LibraryStats), String> {
+    let scanned = scanner::scan_console(&console).map_err(|err| err.to_string())?;
+    let conn = database::init_db().map_err(|err| err.to_string())?;
+    let games = database::replace_scanned_games(&conn, &console.id, &scanned)
+        .map_err(|err| err.to_string())?;
+    let stats = database::get_library_stats(&conn, &console.id).map_err(|err| err.to_string())?;
+    Ok((console.id, console.name, games, stats))
+}
+
+fn save_play_session(game_id: &str, console_id: &str, elapsed: u32) -> Result<PlayNote, String> {
+    let conn = database::init_db().map_err(|err| format!("Could not save play time ({err})."))?;
+    let id = game_id.to_string();
+    database::increment_play_stats(&conn, &id, elapsed)
+        .map_err(|err| format!("Could not save play time ({err})."))?;
+    database::update_last_played(&conn, &id)
+        .map_err(|err| format!("Could not save play time ({err})."))?;
+    let console = console_id.to_string();
+    let game = database::load_games(&conn, Some(&console))
+        .map_err(|err| format!("Could not save play time ({err})."))?
+        .into_iter()
+        .find(|game| game.id == id)
+        .ok_or_else(|| "Could not save play time.".to_string())?;
+    let last_played = game
+        .last_played
+        .ok_or_else(|| "Could not save play time.".to_string())?;
+    Ok(PlayNote::Saved {
+        game_id: id,
+        play_count: game.play_count,
+        play_time: game.play_time,
+        last_played,
+    })
 }
 
 fn typed_text(keystroke: &Keystroke) -> Option<&str> {

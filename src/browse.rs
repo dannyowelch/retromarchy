@@ -2,7 +2,9 @@ use crate::config::{self, ConsoleMetadata};
 use crate::database::{self, LibraryStats};
 use crate::game_menu::Overlay;
 use crate::gamepad::{grid_step, list_step, NavDir};
-use crate::types::{Console, EmulatorProfile, Game, GridArt, GridFilter, Media, MediaKind, Source};
+use crate::types::{
+    game_matches, Console, EmulatorProfile, Game, GridArt, GridFilter, Media, MediaKind, Source,
+};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::fs::File;
@@ -53,6 +55,10 @@ pub struct Browse {
     pub cover_width: f32,
     /// All games, or favorites only, for the console on screen.
     pub filter: GridFilter,
+    /// Title filter. Empty unless [`Self::search_open`] is set.
+    query: String,
+    /// `/` opens this. Typing edits [`Self::query`]. Esc clears and closes it.
+    search_open: bool,
     pub status: String,
     /// Per-game menu, or the rename, delete, or scrape dialog in front of it.
     pub overlay: Overlay,
@@ -557,6 +563,8 @@ impl Browse {
             columns: 4,
             cover_width: clamp_cover_width(cover_width),
             filter: GridFilter::All,
+            query: String::new(),
+            search_open: false,
             status: String::new(),
             overlay: Overlay::None,
         }
@@ -578,15 +586,63 @@ impl Browse {
         self.visible_games().nth(index)
     }
 
+    pub fn search_open(&self) -> bool {
+        self.search_open
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// `/` shows the title field. The current query, if any, stays.
+    pub fn open_search(&mut self) {
+        self.search_open = true;
+    }
+
+    /// Esc, or `/` again: close the field and show the unfiltered grid.
+    pub fn close_search(&mut self) {
+        self.search_open = false;
+        self.set_query(String::new());
+    }
+
+    pub fn push_search(&mut self, text: &str) {
+        let mut query = self.query.clone();
+        query.push_str(text);
+        self.set_query(query);
+    }
+
+    pub fn pop_search(&mut self) {
+        if self.query.is_empty() {
+            return;
+        }
+        let mut query = self.query.clone();
+        query.pop();
+        self.set_query(query);
+    }
+
+    fn set_query(&mut self, query: String) {
+        if self.query == query {
+            return;
+        }
+        let keep = self.selected_game().map(|game| game.id.clone());
+        let previous = self.game;
+        let pane = self.pane;
+        self.query = query;
+        self.rebind_visible(keep, previous, pane);
+    }
+
     /// Games the grid shows for the current console. Same rule as GTK
-    /// `visible_games` with an empty title query: [`GridFilter`] only.
+    /// [`crate::types::visible_games`]: title query plus [`GridFilter`].
     pub fn visible_games(&self) -> impl Iterator<Item = &Game> {
         let filter = self.filter;
+        let query = self.query.clone();
         let games = self
             .shelf()
             .map(|shelf| shelf.games.as_slice())
             .unwrap_or(&[]);
-        games.iter().filter(move |game| filter.matches(game))
+        games
+            .iter()
+            .filter(move |game| game_matches(game, &query, filter))
     }
 
     pub fn visible_len(&self) -> usize {
@@ -677,6 +733,81 @@ impl Browse {
         let keep = self.selected_game().map(|game| game.id.clone());
         self.filter = filter;
         self.game = keep.and_then(|id| self.visible_position(&id));
+    }
+
+    /// Replace one console's rows after a rescan. The selected game stays when
+    /// its id is still in the list. On the grid, a removed game leaves the
+    /// highlight on the nearest remaining row.
+    pub fn replace_console_games(
+        &mut self,
+        console_id: &str,
+        games: Vec<Game>,
+        stats: LibraryStats,
+    ) -> bool {
+        let current = self.shelf().map(|shelf| shelf.console.id.clone());
+        let updating_current = current.as_deref() == Some(console_id);
+        let keep = updating_current
+            .then(|| self.selected_game().map(|game| game.id.clone()))
+            .flatten();
+        let previous = updating_current.then_some(self.game).flatten();
+        let pane = self.pane;
+        let Some(shelf) = self
+            .library
+            .shelves
+            .iter_mut()
+            .find(|shelf| shelf.console.id == console_id)
+        else {
+            return false;
+        };
+        shelf.games = games;
+        shelf.stats = stats;
+        if updating_current {
+            self.rebind_visible(keep, previous, pane);
+        }
+        true
+    }
+
+    /// Write the stats a finished session stored. Returns the game title.
+    pub fn apply_play_stats(
+        &mut self,
+        game_id: &str,
+        play_count: u32,
+        play_time: u32,
+        last_played: DateTime<Utc>,
+    ) -> Option<String> {
+        let index = self
+            .library
+            .shelves
+            .iter()
+            .position(|shelf| shelf.games.iter().any(|game| game.id == game_id))?;
+        let shelf = &mut self.library.shelves[index];
+        let title = {
+            let game = shelf.games.iter_mut().find(|game| game.id == game_id)?;
+            game.play_count = play_count;
+            game.play_time = play_time;
+            game.last_played = Some(last_played);
+            game.title.clone()
+        };
+        shelf.stats = stats_of(&shelf.games);
+        Some(title)
+    }
+
+    /// Follow the selected id when the visible list changes. On the grid, a
+    /// game that dropped out leaves the nearest remaining row selected so
+    /// Enter still launches and the row can scroll into view.
+    fn rebind_visible(&mut self, keep: Option<String>, previous: Option<usize>, pane: Pane) {
+        if let Some(id) = keep.as_deref() {
+            if let Some(index) = self.visible_position(id) {
+                self.game = Some(index);
+                return;
+            }
+        }
+        let len = self.visible_len();
+        if pane == Pane::Grid && len > 0 {
+            self.game = Some(previous.unwrap_or(0).min(len - 1));
+        } else {
+            self.game = None;
+        }
     }
 
     /// Flip the selected game. `conn` is the open library database for a disk
@@ -904,6 +1035,9 @@ pub fn key_from_parts(name: &str, key_char: Option<&str>, modified: bool) -> Opt
 }
 
 fn map_key(name: &str) -> Option<Key> {
+    if is_launch_key(name) {
+        return Some(Key::Launch);
+    }
     Some(match name {
         "up" => Key::Arrow(NavDir::Up),
         "down" => Key::Arrow(NavDir::Down),
@@ -917,13 +1051,39 @@ fn map_key(name: &str) -> Option<Key> {
         "escape" => Key::Clear,
         "d" => Key::ToggleDetails,
         "f" => Key::ToggleFavorite,
-        "enter" => Key::Launch,
         "-" | "minus" | "subtract" | "kp_subtract" | "numpadsubtract" => Key::CoverSmaller,
         "+" | "plus" | "=" | "equal" | "equals" | "add" | "kp_add" | "numpadadd" => {
             Key::CoverLarger
         }
         _ => return None,
     })
+}
+
+/// gpui-pre 0.3 Linux `keystroke_from_xkb` maps `Keysym::Return` to `"enter"`
+/// and strips `kp_` from keypad keysym names, so `KP_Enter` arrives as `"enter"`.
+/// A compose sequence can rewrite the key to the raw keysym `"KP_Enter"`.
+/// Those names, and the numpad aliases, launch the same way GTK treats `KP_Enter`.
+pub fn is_launch_key(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "enter" | "return" | "kp_enter" | "kpenter" | "numpadenter" | "numpad_enter"
+    )
+}
+
+/// `/` opens the title filter. Shift+`/` is `?` and is not the shortcut.
+pub fn title_search_key(key: &str, key_char: Option<&str>, shift: bool, modified: bool) -> bool {
+    if shift || modified {
+        return false;
+    }
+    key == "/" || key == "slash" || key_char == Some("/")
+}
+
+/// `r` rescans the current system. Shift+R and Ctrl+R do not.
+pub fn rescan_key(key: &str, key_char: Option<&str>, shift: bool, modified: bool) -> bool {
+    if shift || modified {
+        return false;
+    }
+    key == "r" || key_char == Some("r")
 }
 
 #[cfg(test)]
@@ -1462,5 +1622,117 @@ mod tests {
             browse.status,
             "Select a system before scraping missing artwork."
         );
+    }
+
+    #[test]
+    fn title_filter_composes_with_favorites_and_keeps_a_visible_game() {
+        let mut browse = sample();
+        browse.select_game(2);
+        assert_eq!(browse.selected_game().unwrap().title, "Super Metroid");
+        browse.open_search();
+        browse.push_search("super");
+        let titles: Vec<String> = browse
+            .visible_games()
+            .map(|game| game.title.clone())
+            .collect();
+        let expected: Vec<String> =
+            crate::types::visible_games(&browse.shelf().unwrap().games, "super", GridFilter::All)
+                .into_iter()
+                .map(|game| game.title)
+                .collect();
+        assert_eq!(titles, expected);
+        assert_eq!(browse.selected_game().unwrap().title, "Super Metroid");
+        assert_eq!(browse.game, Some(1));
+
+        browse.push_search("z");
+        assert!(browse.visible_games().next().is_none());
+        assert!(browse.selected_game().is_none());
+
+        browse.pop_search();
+        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        browse.library.shelves[0].games[0].favorite = true;
+        browse.set_filter(GridFilter::Favorites);
+        assert_eq!(browse.visible_len(), 1);
+        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+
+        browse.close_search();
+        assert!(!browse.search_open());
+        assert!(browse.query().is_empty());
+        assert_eq!(browse.visible_len(), 1);
+        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+    }
+
+    #[test]
+    fn rescan_keeps_the_selected_id_and_drops_a_missing_rom() {
+        let mut browse = sample();
+        browse.select_game(1);
+        let id = browse.selected_game().unwrap().id.clone();
+        let mut games = browse.shelf().unwrap().games.clone();
+        games.remove(0);
+        games.push(demo_game("snes", "Zelda II", 0, 0, None));
+        let stats = stats_of(&games);
+        assert!(browse.replace_console_games("snes", games, stats));
+        assert_eq!(browse.selected_game().unwrap().id, id);
+        assert!(browse
+            .shelf()
+            .unwrap()
+            .games
+            .iter()
+            .any(|game| game.title == "Zelda II"));
+        assert!(!browse
+            .shelf()
+            .unwrap()
+            .games
+            .iter()
+            .any(|game| game.title == "Super Mario World"));
+        assert_eq!(browse.shelf().unwrap().stats.total_games, 4);
+    }
+
+    #[test]
+    fn play_stats_refresh_the_selected_game_and_the_shelf() {
+        let mut browse = sample();
+        browse.select_game(3);
+        let id = browse.selected_game().unwrap().id.clone();
+        assert_eq!(browse.selected_game().unwrap().play_count, 0);
+        let before = browse.shelf().unwrap().stats.total_play_count;
+        let when = demo_played() + chrono::Duration::hours(1);
+        assert_eq!(
+            browse.apply_play_stats(&id, 1, 4, when).as_deref(),
+            Some("Chrono Trigger")
+        );
+        let game = browse.selected_game().unwrap();
+        assert_eq!(game.play_count, 1);
+        assert_eq!(game.play_time, 4);
+        assert_eq!(game.last_played, Some(when));
+        assert_eq!(browse.shelf().unwrap().stats.total_play_count, before + 1);
+        assert_eq!(
+            browse.shelf().unwrap().stats.last_played_game.as_deref(),
+            Some("Chrono Trigger")
+        );
+    }
+
+    #[test]
+    fn launch_search_and_rescan_keys_do_not_overlap() {
+        for name in [
+            "enter",
+            "return",
+            "kp_enter",
+            "KP_Enter",
+            "numpadenter",
+            "numpad_enter",
+        ] {
+            assert_eq!(key_from_name(name, false), Some(Key::Launch), "{name}");
+        }
+        assert_eq!(key_from_name("enter", true), None);
+        assert!(title_search_key("/", None, false, false));
+        assert!(title_search_key("slash", Some("/"), false, false));
+        assert!(!title_search_key("/", Some("/"), true, false));
+        assert!(!title_search_key("/", None, false, true));
+        assert!(rescan_key("r", Some("r"), false, false));
+        assert!(!rescan_key("r", Some("R"), true, false));
+        assert!(!rescan_key("r", None, false, true));
+        assert_eq!(key_from_name("r", false), None);
+        assert_eq!(key_from_name("/", false), None);
+        assert_ne!(key_from_name("s", false), Some(Key::Launch));
     }
 }
