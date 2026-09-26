@@ -62,7 +62,7 @@ pub fn open_db(path: &std::path::Path) -> Result<Connection> {
 
 fn run_migrations(conn: &Connection) -> Result<()> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    
+
     if version < 1 {
         conn.execute(
             "ALTER TABLE games ADD COLUMN play_count INTEGER NOT NULL DEFAULT 0",
@@ -83,6 +83,14 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute("PRAGMA user_version = 2", [])?;
     }
 
+    if version < 3 {
+        conn.execute(
+            "ALTER TABLE games ADD COLUMN title_custom INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute("PRAGMA user_version = 3", [])?;
+    }
+
     Ok(())
 }
 
@@ -93,7 +101,8 @@ pub fn upsert_game(conn: &Connection, game: &Game) -> Result<()> {
          ON CONFLICT(id) DO UPDATE SET
             console = excluded.console,
             rom = excluded.rom,
-            title = excluded.title,
+            -- A renamed library title (title_custom) survives rescan. The ROM path is unchanged.
+            title = CASE WHEN games.title_custom != 0 THEN games.title ELSE excluded.title END,
             crc32 = COALESCE(games.crc32, excluded.crc32),
             profile = COALESCE(games.profile, excluded.profile),
             last_played = COALESCE(games.last_played, excluded.last_played),
@@ -139,13 +148,21 @@ pub fn upsert_game(conn: &Connection, game: &Game) -> Result<()> {
     Ok(())
 }
 
-pub fn remove_missing_games(conn: &Connection, console: &ConsoleId, existing_ids: &[GameId]) -> Result<usize> {
+pub fn remove_missing_games(
+    conn: &Connection,
+    console: &ConsoleId,
+    existing_ids: &[GameId],
+) -> Result<usize> {
     if existing_ids.is_empty() {
         let count = conn.execute("DELETE FROM games WHERE console = ?1", params![console])?;
         return Ok(count);
     }
 
-    let placeholders = existing_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders = existing_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let query = format!(
         "DELETE FROM games WHERE console = ?1 AND id NOT IN ({})",
         placeholders
@@ -206,9 +223,7 @@ pub fn load_games(conn: &Connection, console: Option<&ConsoleId>) -> Result<Vec<
 }
 
 fn load_media(conn: &Connection, game_id: &GameId) -> Result<Vec<Media>> {
-    let mut stmt = conn.prepare(
-        "SELECT kind, path, source FROM media WHERE game_id = ?1",
-    )?;
+    let mut stmt = conn.prepare("SELECT kind, path, source FROM media WHERE game_id = ?1")?;
 
     let media = stmt
         .query_map([game_id], |row| {
@@ -258,7 +273,28 @@ pub fn set_favorite(conn: &Connection, game_id: &GameId, favorite: bool) -> Resu
     Ok(())
 }
 
-pub fn increment_play_stats(conn: &Connection, game_id: &GameId, play_time_seconds: u32) -> Result<()> {
+/// Library display title. Sets `title_custom` so a later rescan does not
+/// replace it with the ROM stem. Does not rename the file.
+pub fn set_game_title(conn: &Connection, game_id: &GameId, title: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE games SET title = ?1, title_custom = 1 WHERE id = ?2",
+        params![title, game_id],
+    )?;
+    Ok(())
+}
+
+/// Drop the game and its media rows. Does not touch files on disk.
+pub fn delete_game(conn: &Connection, game_id: &GameId) -> Result<()> {
+    conn.execute("DELETE FROM media WHERE game_id = ?1", params![game_id])?;
+    conn.execute("DELETE FROM games WHERE id = ?1", params![game_id])?;
+    Ok(())
+}
+
+pub fn increment_play_stats(
+    conn: &Connection,
+    game_id: &GameId,
+    play_time_seconds: u32,
+) -> Result<()> {
     conn.execute(
         "UPDATE games SET play_count = play_count + 1, play_time = play_time + ?1 WHERE id = ?2",
         params![play_time_seconds, game_id],
@@ -393,8 +429,49 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            2
+            3
         );
+    }
+
+    #[test]
+    fn renamed_title_survives_rescan_and_delete_drops_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(&dir.path().join("library.db")).unwrap();
+        upsert_game(&conn, &sample("a", "Alpha", false)).unwrap();
+        upsert_game(&conn, &sample("b", "Beta", false)).unwrap();
+        set_game_title(&conn, &"a".to_string(), "Alpha Renamed").unwrap();
+        set_game_media(
+            &conn,
+            &"a".to_string(),
+            &Media {
+                kind: MediaKind::BoxArt,
+                path: PathBuf::from("/tmp/a/box_art.png"),
+                source: Source::ScreenScraper,
+            },
+        )
+        .unwrap();
+
+        upsert_game(&conn, &sample("a", "Alpha From Scan", false)).unwrap();
+        upsert_game(&conn, &sample("b", "Beta Cleaned", false)).unwrap();
+        let games = load_games(&conn, None).unwrap();
+        let alpha = games.iter().find(|game| game.id == "a").unwrap();
+        let beta = games.iter().find(|game| game.id == "b").unwrap();
+        assert_eq!(alpha.title, "Alpha Renamed");
+        assert_eq!(alpha.media.len(), 1);
+        assert_eq!(beta.title, "Beta Cleaned");
+
+        delete_game(&conn, &"a".to_string()).unwrap();
+        let left = load_games(&conn, None).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, "b");
+        let media_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media WHERE game_id = 'a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(media_rows, 0);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::input_repeat::{AxisHold, AxisSide, DirectionRepeat};
 use crate::launcher;
 use crate::scanner;
 use crate::scraper::{self, pick_kind, present_kinds};
-use crate::types::{visible_games, Game, GridArt, GridFilter, Media, MediaKind};
+use crate::types::{visible_games, Game, GameAction, GridArt, GridFilter, Media, MediaKind};
 use anyhow::Result;
 use gtk4::gdk_pixbuf::Pixbuf;
 use gtk4::prelude::*;
@@ -21,6 +21,12 @@ use std::time::Instant;
 enum FocusPane {
     Systems,
     Games,
+}
+
+enum PadTarget {
+    Menu,
+    Dialog(gtk4::Window),
+    Grid,
 }
 
 /// Shared width of the details column. Console info and a selected game
@@ -51,6 +57,7 @@ pub struct App {
     status_label: gtk4::Label,
     scrape_running: Rc<RefCell<bool>>,
     updating_grid_art: Rc<RefCell<bool>>,
+    game_menu: gtk4::Popover,
 }
 
 impl App {
@@ -124,7 +131,7 @@ impl App {
 
         let scrape_button = gtk4::Button::with_label("Scrape");
         scrape_button.add_css_class("flat");
-        scrape_button.set_tooltip_text(Some("Scrape artwork for the selected game (S)"));
+        scrape_button.set_tooltip_text(Some("Choose a match for the selected game (S)"));
         header_bar.pack_start(&scrape_button);
 
         let scrape_missing_button = gtk4::Button::with_label("Scrape Missing");
@@ -305,6 +312,7 @@ impl App {
             status_label: status_label.clone(),
             scrape_running: Rc::new(RefCell::new(false)),
             updating_grid_art: Rc::new(RefCell::new(false)),
+            game_menu: gtk4::Popover::new(),
         };
 
         app_instance.apply_theme(&config.theme);
@@ -315,6 +323,7 @@ impl App {
         let repeat_x = Rc::new(RefCell::new(DirectionRepeat::default()));
         let repeat_y = Rc::new(RefCell::new(DirectionRepeat::default()));
         let nav_started = Instant::now();
+        app_instance.setup_game_menu();
         app_instance.setup_keyboard_navigation(
             key_x.clone(),
             key_y.clone(),
@@ -762,6 +771,11 @@ impl App {
         config: &Config,
         library_empty: bool,
     ) {
+        // The menu is parented to a tile. Unparent it before those tiles are
+        // removed, or GTK finalizes the tile with the popover still attached
+        // and the next click aborts.
+        Self::detach_popovers(grid.upcast_ref());
+
         while let Some(child) = grid.first_child() {
             grid.remove(&child);
         }
@@ -776,6 +790,7 @@ impl App {
             Self::set_tile_art(&frame, game, config);
 
             let title = gtk4::Label::new(Some(&game.title));
+            title.set_widget_name("game-title");
             title.set_wrap(true);
             title.set_max_width_chars(20);
             title.set_lines(2);
@@ -1219,6 +1234,7 @@ impl App {
         let grid_filter = self.grid_filter.clone();
         let focus_pane = self.focus_pane.clone();
         let updating_grid_art = self.updating_grid_art.clone();
+        let game_menu = self.game_menu.clone();
 
         let key_x_release = key_x.clone();
         let key_y_release = key_y.clone();
@@ -1226,6 +1242,27 @@ impl App {
         let repeat_y_release = repeat_y.clone();
         let config_release = self.config.clone();
         key_controller.connect_key_pressed(move |_, key, _, mods| {
+            if game_menu.is_visible() {
+                return match key {
+                    gdk::Key::Escape => {
+                        game_menu.popdown();
+                        glib::Propagation::Stop
+                    }
+                    gdk::Key::Return | gdk::Key::KP_Enter => {
+                        Self::activate_menu(&game_menu);
+                        glib::Propagation::Stop
+                    }
+                    gdk::Key::Up | gdk::Key::k => {
+                        Self::move_menu(&game_menu, NavDir::Up);
+                        glib::Propagation::Stop
+                    }
+                    gdk::Key::Down | gdk::Key::j => {
+                        Self::move_menu(&game_menu, NavDir::Down);
+                        glib::Propagation::Stop
+                    }
+                    _ => glib::Propagation::Stop,
+                };
+            }
             let focused = gtk4::prelude::RootExt::focus(&window);
             let search_has_focus = focused.as_ref().is_some_and(|w| {
                 w.upcast_ref::<gtk4::Widget>() == search_entry.upcast_ref::<gtk4::Widget>()
@@ -1340,6 +1377,7 @@ impl App {
                             );
                         } else {
                             Self::request_scrape_selected(
+                                &window,
                                 &status_label,
                                 &scrape_running,
                                 &config,
@@ -1347,10 +1385,8 @@ impl App {
                                 &games,
                                 &all_games,
                                 &game_grid,
-                                &center_stack,
                                 &detail_content,
                                 &selected_game,
-                                &search_entry,
                             );
                         }
                         glib::Propagation::Stop
@@ -1631,6 +1667,34 @@ impl App {
                         }
                     }
                     glib::Propagation::Stop
+                }
+                gdk::Key::Menu => {
+                    if !search_has_focus && !combo_has_focus {
+                        Self::popup_selected_menu(
+                            &game_menu,
+                            &game_grid,
+                            &games,
+                            &selected_game,
+                            &focus_pane,
+                        );
+                        glib::Propagation::Stop
+                    } else {
+                        glib::Propagation::Proceed
+                    }
+                }
+                gdk::Key::F10 if mods.contains(gdk::ModifierType::SHIFT_MASK) => {
+                    if !search_has_focus && !combo_has_focus {
+                        Self::popup_selected_menu(
+                            &game_menu,
+                            &game_grid,
+                            &games,
+                            &selected_game,
+                            &focus_pane,
+                        );
+                        glib::Propagation::Stop
+                    } else {
+                        glib::Propagation::Proceed
+                    }
                 }
                 gdk::Key::slash => {
                     search_bar.set_search_mode(!search_bar.is_search_mode());
@@ -2007,14 +2071,21 @@ impl App {
         let games = self.games.clone();
         let all_games = self.all_games.clone();
         let grid = self.game_grid.clone();
-        let stack = self.center_stack.clone();
         let detail = self.detail_content.clone();
         let selected = self.selected_game.clone();
-        let search = self.search_entry.clone();
+        let window_scrape = self.window.clone();
         scrape_button.connect_clicked(move |_| {
             Self::request_scrape_selected(
-                &status, &running, &config, &conn, &games, &all_games, &grid, &stack, &detail,
-                &selected, &search,
+                &window_scrape,
+                &status,
+                &running,
+                &config,
+                &conn,
+                &games,
+                &all_games,
+                &grid,
+                &detail,
+                &selected,
             );
         });
 
@@ -2039,6 +2110,7 @@ impl App {
     }
 
     fn request_scrape_selected(
+        window: &adw::ApplicationWindow,
         status: &gtk4::Label,
         running: &Rc<RefCell<bool>>,
         config: &Rc<RefCell<crate::config::Config>>,
@@ -2046,10 +2118,8 @@ impl App {
         games: &Rc<RefCell<Vec<Game>>>,
         all_games: &Rc<RefCell<Vec<Game>>>,
         grid: &gtk4::FlowBox,
-        stack: &gtk4::Stack,
         detail: &gtk4::Box,
         selected: &Rc<RefCell<Option<usize>>>,
-        search: &gtk4::SearchEntry,
     ) {
         let idx = *selected.borrow();
         let Some(idx) = idx else {
@@ -2060,19 +2130,8 @@ impl App {
             Self::show_status(status, "Select a game to scrape.");
             return;
         };
-        Self::begin_scrape(
-            status,
-            running,
-            config,
-            conn,
-            vec![game],
-            all_games,
-            games,
-            grid,
-            stack,
-            detail,
-            selected,
-            search,
+        Self::open_scrape_dialog(
+            window, status, running, config, conn, &game, all_games, games, grid, detail, selected,
         );
     }
 
@@ -2132,15 +2191,32 @@ impl App {
         Self::show_status(status, "Scraping artwork…");
         let scraper = config.borrow().scraper.clone();
         let rx = scraper::spawn_scrape(targets, scraper, scraper::fixture_dir_from_env());
-        let status = status.clone();
-        let running = running.clone();
-        let conn = conn.clone();
-        let config = config.clone();
-        let all_games = all_games.clone();
-        let games = games.clone();
-        let grid = grid.clone();
-        let detail = detail.clone();
-        let selected = selected.clone();
+        Self::watch_scrape(
+            rx,
+            status.clone(),
+            running.clone(),
+            conn.clone(),
+            config.clone(),
+            all_games.clone(),
+            games.clone(),
+            grid.clone(),
+            detail.clone(),
+            selected.clone(),
+        );
+    }
+
+    fn watch_scrape(
+        rx: std::sync::mpsc::Receiver<scraper::ScrapeUpdate>,
+        status: gtk4::Label,
+        running: Rc<RefCell<bool>>,
+        conn: Rc<RefCell<rusqlite::Connection>>,
+        config: Rc<RefCell<crate::config::Config>>,
+        all_games: Rc<RefCell<Vec<Game>>>,
+        games: Rc<RefCell<Vec<Game>>>,
+        grid: gtk4::FlowBox,
+        detail: gtk4::Box,
+        selected: Rc<RefCell<Option<usize>>>,
+    ) {
         glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
             // One update per tick. A long scrape can queue many saves; draining
             // them here would decode images and stall input on the main loop.
@@ -2168,6 +2244,558 @@ impl App {
                 }
             }
         });
+    }
+
+    fn open_scrape_dialog(
+        window: &adw::ApplicationWindow,
+        status: &gtk4::Label,
+        running: &Rc<RefCell<bool>>,
+        config: &Rc<RefCell<crate::config::Config>>,
+        conn: &Rc<RefCell<rusqlite::Connection>>,
+        game: &Game,
+        all_games: &Rc<RefCell<Vec<Game>>>,
+        games: &Rc<RefCell<Vec<Game>>>,
+        grid: &gtk4::FlowBox,
+        detail: &gtk4::Box,
+        selected: &Rc<RefCell<Option<usize>>>,
+    ) {
+        let query = Self::scrape_query(game);
+        let console_id = game.console.clone();
+        let game = game.clone();
+        let status = status.clone();
+        let running = running.clone();
+        let config = config.clone();
+        let conn = conn.clone();
+        let all_games = all_games.clone();
+        let games = games.clone();
+        let grid = grid.clone();
+        let detail = detail.clone();
+        let selected = selected.clone();
+        crate::dialogs::open_game_scrape(
+            window,
+            &query,
+            &console_id,
+            config.clone(),
+            Rc::new(move |candidate| {
+                Self::begin_apply(
+                    &status,
+                    &running,
+                    &config,
+                    &conn,
+                    game.clone(),
+                    candidate,
+                    &all_games,
+                    &games,
+                    &grid,
+                    &detail,
+                    &selected,
+                );
+            }),
+        );
+    }
+
+    fn scrape_query(game: &Game) -> String {
+        let title = game.title.trim();
+        if title.is_empty() {
+            scanner::derive_title(&game.rom)
+        } else {
+            title.to_string()
+        }
+    }
+
+    fn begin_apply(
+        status: &gtk4::Label,
+        running: &Rc<RefCell<bool>>,
+        config: &Rc<RefCell<crate::config::Config>>,
+        conn: &Rc<RefCell<rusqlite::Connection>>,
+        game: Game,
+        candidate: scraper::ScrapeCandidate,
+        all_games: &Rc<RefCell<Vec<Game>>>,
+        games: &Rc<RefCell<Vec<Game>>>,
+        grid: &gtk4::FlowBox,
+        detail: &gtk4::Box,
+        selected: &Rc<RefCell<Option<usize>>>,
+    ) {
+        if *running.borrow() {
+            Self::show_status(status, "A scrape is already running.");
+            return;
+        }
+        *running.borrow_mut() = true;
+        Self::show_status(status, "Scraping artwork…");
+        let scraper_config = config.borrow().scraper.clone();
+        let rx = scraper::spawn_apply_candidate(
+            game,
+            candidate,
+            scraper_config,
+            scraper::fixture_dir_from_env(),
+        );
+        Self::watch_scrape(
+            rx,
+            status.clone(),
+            running.clone(),
+            conn.clone(),
+            config.clone(),
+            all_games.clone(),
+            games.clone(),
+            grid.clone(),
+            detail.clone(),
+            selected.clone(),
+        );
+    }
+
+    fn setup_game_menu(&self) {
+        let on_action = {
+            let window = self.window.clone();
+            let status = self.status_label.clone();
+            let running = self.scrape_running.clone();
+            let config = self.config.clone();
+            let conn = self.conn.clone();
+            let games = self.games.clone();
+            let all_games = self.all_games.clone();
+            let grid = self.game_grid.clone();
+            let stack = self.center_stack.clone();
+            let detail = self.detail_content.clone();
+            let selected = self.selected_game.clone();
+            let search = self.search_entry.clone();
+            let grid_filter = self.grid_filter.clone();
+            let current = self.current_console.clone();
+            move |action| {
+                Self::perform_game_action(
+                    action,
+                    &window,
+                    &status,
+                    &running,
+                    &config,
+                    &conn,
+                    &games,
+                    &all_games,
+                    &grid,
+                    &stack,
+                    &detail,
+                    &selected,
+                    &search,
+                    &grid_filter,
+                    &current,
+                );
+            }
+        };
+        let built = Self::game_menu_popover(Rc::new(on_action));
+        if let Some(list) = built.child() {
+            built.set_child(None::<&gtk4::Widget>);
+            self.game_menu.set_child(Some(&list));
+        }
+        self.game_menu.set_has_arrow(false);
+
+        let gesture = gtk4::GestureClick::new();
+        gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
+        let grid = self.game_grid.clone();
+        let menu = self.game_menu.clone();
+        let games = self.games.clone();
+        let selected = self.selected_game.clone();
+        let focus = self.focus_pane.clone();
+        let detail = self.detail_content.clone();
+        let config = self.config.clone();
+        let conn = self.conn.clone();
+        gesture.connect_pressed(move |gesture, _, x, y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            let Some(child) = grid.child_at_pos(x as i32, y as i32) else {
+                return;
+            };
+            let index = child.index();
+            Self::select_game_index(
+                &grid, &games, &selected, &focus, &detail, &config, &conn, index,
+            );
+            Self::popup_game_menu(&menu, &grid, index);
+        });
+        self.game_grid.add_controller(gesture);
+    }
+
+    fn game_menu_popover(on_action: Rc<dyn Fn(GameAction)>) -> gtk4::Popover {
+        let popover = gtk4::Popover::new();
+        popover.set_has_arrow(false);
+        let list = gtk4::ListBox::new();
+        list.set_selection_mode(gtk4::SelectionMode::Single);
+        list.set_width_request(180);
+        for action in GameAction::ALL {
+            let label = gtk4::Label::new(Some(action.label()));
+            label.set_halign(gtk4::Align::Start);
+            label.set_margin_top(8);
+            label.set_margin_bottom(8);
+            label.set_margin_start(12);
+            label.set_margin_end(12);
+            list.append(&label);
+        }
+        list.connect_row_activated(move |list, row| {
+            if let Some(popover) = list
+                .ancestor(gtk4::Popover::static_type())
+                .and_then(|widget| widget.downcast::<gtk4::Popover>().ok())
+            {
+                popover.popdown();
+            }
+            if let Some(action) = GameAction::from_index(row.index()) {
+                on_action(action);
+            }
+        });
+        popover.set_child(Some(&list));
+        popover
+    }
+
+    fn perform_game_action(
+        action: GameAction,
+        window: &adw::ApplicationWindow,
+        status: &gtk4::Label,
+        running: &Rc<RefCell<bool>>,
+        config: &Rc<RefCell<crate::config::Config>>,
+        conn: &Rc<RefCell<rusqlite::Connection>>,
+        games: &Rc<RefCell<Vec<Game>>>,
+        all_games: &Rc<RefCell<Vec<Game>>>,
+        grid: &gtk4::FlowBox,
+        stack: &gtk4::Stack,
+        detail: &gtk4::Box,
+        selected: &Rc<RefCell<Option<usize>>>,
+        search: &gtk4::SearchEntry,
+        grid_filter: &Rc<RefCell<GridFilter>>,
+        current: &Rc<RefCell<Option<String>>>,
+    ) {
+        let Some(index) = *selected.borrow() else {
+            Self::show_status(status, "Select a game.");
+            return;
+        };
+        let Some(game) = games.borrow().get(index).cloned() else {
+            Self::show_status(status, "Select a game.");
+            return;
+        };
+        match action {
+            GameAction::Scrape => Self::open_scrape_dialog(
+                window, status, running, config, conn, &game, all_games, games, grid, detail,
+                selected,
+            ),
+            GameAction::Rename => {
+                let status = status.clone();
+                let conn = conn.clone();
+                let games = games.clone();
+                let all_games = all_games.clone();
+                let grid = grid.clone();
+                let stack = stack.clone();
+                let detail = detail.clone();
+                let selected = selected.clone();
+                let search = search.clone();
+                let grid_filter = grid_filter.clone();
+                let current = current.clone();
+                let config = config.clone();
+                let game_id = game.id.clone();
+                crate::dialogs::open_rename(window, &game.title, move |title| {
+                    Self::apply_rename(
+                        &status,
+                        &conn,
+                        &config,
+                        &games,
+                        &all_games,
+                        &grid,
+                        &stack,
+                        &detail,
+                        &selected,
+                        &search,
+                        &grid_filter,
+                        &current,
+                        &game_id,
+                        &title,
+                    );
+                });
+            }
+            GameAction::Delete => {
+                let status = status.clone();
+                let conn = conn.clone();
+                let games = games.clone();
+                let all_games = all_games.clone();
+                let grid = grid.clone();
+                let stack = stack.clone();
+                let detail = detail.clone();
+                let selected = selected.clone();
+                let search = search.clone();
+                let grid_filter = grid_filter.clone();
+                let current = current.clone();
+                let config = config.clone();
+                let heading = game.title.clone();
+                crate::dialogs::open_delete(window, &heading, move |options| {
+                    Self::apply_delete(
+                        &status,
+                        &conn,
+                        &config,
+                        &games,
+                        &all_games,
+                        &grid,
+                        &stack,
+                        &detail,
+                        &selected,
+                        &search,
+                        &grid_filter,
+                        &current,
+                        &game,
+                        options,
+                    );
+                });
+            }
+        }
+    }
+
+    fn apply_rename(
+        status: &gtk4::Label,
+        conn: &Rc<RefCell<rusqlite::Connection>>,
+        config: &Rc<RefCell<crate::config::Config>>,
+        games: &Rc<RefCell<Vec<Game>>>,
+        all_games: &Rc<RefCell<Vec<Game>>>,
+        grid: &gtk4::FlowBox,
+        stack: &gtk4::Stack,
+        detail: &gtk4::Box,
+        selected: &Rc<RefCell<Option<usize>>>,
+        search: &gtk4::SearchEntry,
+        grid_filter: &Rc<RefCell<GridFilter>>,
+        current: &Rc<RefCell<Option<String>>>,
+        game_id: &str,
+        title: &str,
+    ) {
+        if database::set_game_title(&conn.borrow(), &game_id.to_string(), title).is_err() {
+            Self::show_status(status, "Could not rename the game.");
+            return;
+        }
+        Self::write_title(all_games, game_id, title);
+        Self::write_title(games, game_id, title);
+        let visible = visible_games(&all_games.borrow(), &search.text(), *grid_filter.borrow());
+        let still_shown = visible.iter().any(|game| game.id == game_id);
+        if still_shown {
+            if let Some(index) = games.borrow().iter().position(|game| game.id == game_id) {
+                Self::set_tile_title(grid, index, title);
+                if let Some(game) = games.borrow().get(index).cloned() {
+                    Self::update_game_details(detail, &game, &config.borrow(), conn);
+                }
+            }
+        } else {
+            let library_empty = all_games.borrow().is_empty();
+            Self::replace_visible_games(
+                grid,
+                stack,
+                &config.borrow(),
+                visible,
+                library_empty,
+                games,
+                selected,
+                detail,
+                conn,
+                &current.borrow(),
+            );
+        }
+    }
+
+    fn apply_delete(
+        status: &gtk4::Label,
+        conn: &Rc<RefCell<rusqlite::Connection>>,
+        config: &Rc<RefCell<crate::config::Config>>,
+        games: &Rc<RefCell<Vec<Game>>>,
+        all_games: &Rc<RefCell<Vec<Game>>>,
+        grid: &gtk4::FlowBox,
+        stack: &gtk4::Stack,
+        detail: &gtk4::Box,
+        selected: &Rc<RefCell<Option<usize>>>,
+        search: &gtk4::SearchEntry,
+        grid_filter: &Rc<RefCell<GridFilter>>,
+        current: &Rc<RefCell<Option<String>>>,
+        game: &Game,
+        options: crate::types::DeleteOptions,
+    ) {
+        if let Err(err) = database::delete_game(&conn.borrow(), &game.id) {
+            Self::show_status(
+                status,
+                &format!("Could not remove the game from the library: {err}"),
+            );
+            return;
+        }
+        let mut notes = Vec::new();
+        if options.rom_file {
+            if let Err(err) = scraper::delete_rom_file(&game.rom) {
+                notes.push(format!("ROM file: {err}"));
+            }
+        }
+        if options.scraped_assets {
+            match scraper::media_root() {
+                Ok(root) => {
+                    if let Err(err) = scraper::delete_cached_assets(&root, game) {
+                        notes.push(format!("artwork: {err}"));
+                    }
+                }
+                Err(err) => notes.push(format!("artwork: {err}")),
+            }
+        }
+        let game_id = game.id.clone();
+        all_games.borrow_mut().retain(|item| item.id != game_id);
+        let visible = visible_games(&all_games.borrow(), &search.text(), *grid_filter.borrow());
+        let library_empty = all_games.borrow().is_empty();
+        Self::replace_visible_games(
+            grid,
+            stack,
+            &config.borrow(),
+            visible,
+            library_empty,
+            games,
+            selected,
+            detail,
+            conn,
+            &current.borrow(),
+        );
+        let message = if notes.is_empty() {
+            format!("Removed {} from the library.", game.title)
+        } else {
+            format!(
+                "Removed {} from the library. {}",
+                game.title,
+                notes.join(" ")
+            )
+        };
+        Self::show_status(status, &message);
+    }
+
+    fn write_title(games: &Rc<RefCell<Vec<Game>>>, id: &str, title: &str) {
+        if let Some(game) = games.borrow_mut().iter_mut().find(|game| game.id == id) {
+            game.title = title.to_string();
+        }
+    }
+
+    fn set_tile_title(grid: &gtk4::FlowBox, index: usize, title: &str) {
+        let Some(flow_child) = grid.child_at_index(index as i32) else {
+            return;
+        };
+        let Some(tile) = Self::tile_box(&flow_child) else {
+            return;
+        };
+        let Some(label) = Self::find_widget_name(tile.upcast_ref(), "game-title")
+            .and_then(|widget| widget.downcast::<gtk4::Label>().ok())
+        else {
+            return;
+        };
+        label.set_text(title);
+    }
+
+    fn select_game_index(
+        grid: &gtk4::FlowBox,
+        games: &Rc<RefCell<Vec<Game>>>,
+        selected: &Rc<RefCell<Option<usize>>>,
+        focus: &Rc<RefCell<FocusPane>>,
+        detail: &gtk4::Box,
+        config: &Rc<RefCell<crate::config::Config>>,
+        conn: &Rc<RefCell<rusqlite::Connection>>,
+        index: i32,
+    ) {
+        let Some(child) = grid.child_at_index(index) else {
+            return;
+        };
+        *focus.borrow_mut() = FocusPane::Games;
+        grid.select_child(&child);
+        *selected.borrow_mut() = Some(index as usize);
+        if let Some(game) = games.borrow().get(index as usize) {
+            Self::update_game_details(detail, game, &config.borrow(), conn);
+        }
+    }
+
+    fn popup_selected_menu(
+        menu: &gtk4::Popover,
+        grid: &gtk4::FlowBox,
+        games: &Rc<RefCell<Vec<Game>>>,
+        selected: &Rc<RefCell<Option<usize>>>,
+        focus: &Rc<RefCell<FocusPane>>,
+    ) {
+        if *focus.borrow() != FocusPane::Games {
+            return;
+        }
+        let Some(index) = *selected.borrow() else {
+            return;
+        };
+        if games.borrow().get(index).is_none() {
+            return;
+        }
+        Self::popup_game_menu(menu, grid, index as i32);
+    }
+
+    fn popup_game_menu(menu: &gtk4::Popover, grid: &gtk4::FlowBox, index: i32) {
+        let Some(child) = grid.child_at_index(index) else {
+            return;
+        };
+        let child_widget = child.clone().upcast::<gtk4::Widget>();
+        let same_parent = menu.parent().is_some_and(|parent| parent == child_widget);
+        if menu.is_visible() {
+            menu.popdown();
+        }
+        if !same_parent {
+            if menu.parent().is_some() {
+                menu.unparent();
+            }
+            menu.set_parent(&child);
+        }
+        let rect = child.allocation();
+        menu.set_pointing_to(Some(&gdk::Rectangle::new(
+            0,
+            0,
+            rect.width().max(1),
+            rect.height().max(1),
+        )));
+        menu.popup();
+        if let Some(list) = menu.child().and_downcast::<gtk4::ListBox>() {
+            if let Some(row) = list.row_at_index(0) {
+                list.select_row(Some(&row));
+                row.grab_focus();
+            }
+        }
+    }
+
+    fn move_menu(menu: &gtk4::Popover, dir: NavDir) {
+        let Some(list) = menu.child().and_downcast::<gtk4::ListBox>() else {
+            return;
+        };
+        let current = list.selected_row().map(|row| row.index()).unwrap_or(0);
+        let next = match dir {
+            NavDir::Up => current - 1,
+            NavDir::Down => current + 1,
+            NavDir::Left | NavDir::Right => return,
+        };
+        if next < 0 {
+            return;
+        }
+        if let Some(row) = list.row_at_index(next) {
+            list.select_row(Some(&row));
+            row.grab_focus();
+        }
+    }
+
+    fn activate_menu(menu: &gtk4::Popover) {
+        let Some(list) = menu.child().and_downcast::<gtk4::ListBox>() else {
+            return;
+        };
+        let row = list.selected_row().or_else(|| list.row_at_index(0));
+        if let Some(row) = row {
+            row.activate();
+        }
+    }
+
+    fn detach_popovers(widget: &gtk4::Widget) {
+        let mut found = Vec::new();
+        Self::collect_popovers(widget, &mut found);
+        for popover in found {
+            popover.popdown();
+            if popover.parent().is_some() {
+                popover.unparent();
+            }
+        }
+    }
+
+    fn collect_popovers(widget: &gtk4::Widget, out: &mut Vec<gtk4::Popover>) {
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Ok(popover) = current.clone().downcast::<gtk4::Popover>() {
+                out.push(popover);
+            } else {
+                Self::collect_popovers(&current, out);
+            }
+            child = current.next_sibling();
+        }
     }
 
     /// Persist one scraped file and patch that game's tile. The grid is not rebuilt,
@@ -2696,6 +3324,7 @@ impl App {
         let search_entry = self.search_entry.clone();
         let grid_art_combo = self.grid_art_combo.clone();
         let grid_filter_combo = self.grid_filter_combo.clone();
+        let game_menu = self.game_menu.clone();
 
         glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
             let blocked = Self::pad_blocked(
@@ -2706,15 +3335,129 @@ impl App {
             if let Some(gilrs) = gilrs.as_mut() {
                 while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
                     let action = pad.apply(&event);
-                    if blocked {
-                        continue;
-                    }
                     let Some(action) = action else {
                         continue;
                     };
-                    Self::with_focus_pane(&focus_pane, |pane| match action {
-                        PadAction::Confirm => match pane {
-                            FocusPane::Systems => Self::enter_games(
+                    match Self::pad_target(&window, &game_menu) {
+                        PadTarget::Menu => Self::menu_pad_action(&game_menu, action),
+                        PadTarget::Dialog(dialog) => Self::dialog_pad_action(&dialog, action),
+                        PadTarget::Grid => {
+                            if blocked {
+                                continue;
+                            }
+                            Self::with_focus_pane(&focus_pane, |pane| match action {
+                                PadAction::Confirm => match pane {
+                                    FocusPane::Systems => Self::enter_games(
+                                        &game_grid,
+                                        &games,
+                                        &selected_game,
+                                        &focus_pane,
+                                        &detail_content,
+                                        &config,
+                                        &conn,
+                                    ),
+                                    FocusPane::Games => Self::launch_selected(
+                                        &window,
+                                        &config,
+                                        &conn,
+                                        &detail_content,
+                                        &games,
+                                        &selected_game,
+                                    ),
+                                },
+                                PadAction::Back => {
+                                    if pane == FocusPane::Games {
+                                        *focus_pane.borrow_mut() = FocusPane::Systems;
+                                        if let Some(row) = console_list.selected_row() {
+                                            row.grab_focus();
+                                        } else {
+                                            console_list.grab_focus();
+                                        }
+                                    }
+                                }
+                                PadAction::Favorite => {
+                                    if pane == FocusPane::Games {
+                                        Self::toggle_favorite(
+                                            &conn,
+                                            &games,
+                                            &all_games,
+                                            &selected_game,
+                                            &grid_filter,
+                                            &game_grid,
+                                            &center_stack,
+                                            &config,
+                                            &detail_content,
+                                            &current_console,
+                                            &search_entry,
+                                        );
+                                    }
+                                }
+                                PadAction::Menu => {
+                                    if pane == FocusPane::Games {
+                                        Self::popup_selected_menu(
+                                            &game_menu,
+                                            &game_grid,
+                                            &games,
+                                            &selected_game,
+                                            &focus_pane,
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            let target = Self::pad_target(&window, &game_menu);
+            let use_grid = matches!(target, PadTarget::Grid) && !blocked;
+            if !use_grid {
+                *key_x.borrow_mut() = AxisHold::default();
+                *key_y.borrow_mut() = AxisHold::default();
+            }
+            let settings = config.borrow().input.sanitized();
+            let now = Self::monotonic_ms(started);
+            let held_x = if use_grid {
+                Self::axis_nav(*key_x.borrow(), NavDir::Left, NavDir::Right)
+                    .or_else(|| pad.horizontal())
+            } else if matches!(target, PadTarget::Grid) {
+                None
+            } else {
+                pad.horizontal()
+            };
+            let held_y = if use_grid {
+                Self::axis_nav(*key_y.borrow(), NavDir::Up, NavDir::Down).or_else(|| pad.vertical())
+            } else if matches!(target, PadTarget::Grid) {
+                None
+            } else {
+                pad.vertical()
+            };
+            let steps_x = repeat_x.borrow_mut().poll(&settings, held_x, now);
+            let steps_y = repeat_y.borrow_mut().poll(&settings, held_y, now);
+            match target {
+                PadTarget::Menu => {
+                    if let Some(dir) = held_y {
+                        for _ in 0..steps_y {
+                            Self::move_menu(&game_menu, dir);
+                        }
+                    }
+                }
+                PadTarget::Dialog(dialog) => {
+                    if let Some(dir) = held_x {
+                        for _ in 0..steps_x {
+                            dialog.child_focus(Self::nav_direction(dir));
+                        }
+                    }
+                    if let Some(dir) = held_y {
+                        for _ in 0..steps_y {
+                            dialog.child_focus(Self::nav_direction(dir));
+                        }
+                    }
+                }
+                PadTarget::Grid if use_grid => {
+                    if let Some(dir) = held_x {
+                        for _ in 0..steps_x {
+                            Self::step_nav(
+                                &console_list,
                                 &game_grid,
                                 &games,
                                 &selected_game,
@@ -2722,97 +3465,71 @@ impl App {
                                 &detail_content,
                                 &config,
                                 &conn,
-                            ),
-                            FocusPane::Games => Self::launch_selected(
-                                &window,
-                                &config,
-                                &conn,
-                                &detail_content,
+                                dir,
+                            );
+                        }
+                    }
+                    if let Some(dir) = held_y {
+                        for _ in 0..steps_y {
+                            Self::step_nav(
+                                &console_list,
+                                &game_grid,
                                 &games,
                                 &selected_game,
-                            ),
-                        },
-                        PadAction::Back => {
-                            if pane == FocusPane::Games {
-                                *focus_pane.borrow_mut() = FocusPane::Systems;
-                                if let Some(row) = console_list.selected_row() {
-                                    row.grab_focus();
-                                } else {
-                                    console_list.grab_focus();
-                                }
-                            }
+                                &focus_pane,
+                                &detail_content,
+                                &config,
+                                &conn,
+                                dir,
+                            );
                         }
-                        PadAction::Favorite => {
-                            if pane == FocusPane::Games {
-                                Self::toggle_favorite(
-                                    &conn,
-                                    &games,
-                                    &all_games,
-                                    &selected_game,
-                                    &grid_filter,
-                                    &game_grid,
-                                    &center_stack,
-                                    &config,
-                                    &detail_content,
-                                    &current_console,
-                                    &search_entry,
-                                );
-                            }
-                        }
-                    });
+                    }
                 }
-            }
-            if blocked {
-                *key_x.borrow_mut() = AxisHold::default();
-                *key_y.borrow_mut() = AxisHold::default();
-            }
-            let settings = config.borrow().input.sanitized();
-            let now = Self::monotonic_ms(started);
-            let held_x = if blocked {
-                None
-            } else {
-                Self::axis_nav(*key_x.borrow(), NavDir::Left, NavDir::Right)
-                    .or_else(|| pad.horizontal())
-            };
-            let held_y = if blocked {
-                None
-            } else {
-                Self::axis_nav(*key_y.borrow(), NavDir::Up, NavDir::Down).or_else(|| pad.vertical())
-            };
-            let steps_x = repeat_x.borrow_mut().poll(&settings, held_x, now);
-            let steps_y = repeat_y.borrow_mut().poll(&settings, held_y, now);
-            if let Some(dir) = held_x {
-                for _ in 0..steps_x {
-                    Self::step_nav(
-                        &console_list,
-                        &game_grid,
-                        &games,
-                        &selected_game,
-                        &focus_pane,
-                        &detail_content,
-                        &config,
-                        &conn,
-                        dir,
-                    );
-                }
-            }
-            if let Some(dir) = held_y {
-                for _ in 0..steps_y {
-                    Self::step_nav(
-                        &console_list,
-                        &game_grid,
-                        &games,
-                        &selected_game,
-                        &focus_pane,
-                        &detail_content,
-                        &config,
-                        &conn,
-                        dir,
-                    );
-                }
+                PadTarget::Grid => {}
             }
             glib::ControlFlow::Continue
         });
+    }
+
+    fn pad_target(main: &adw::ApplicationWindow, menu: &gtk4::Popover) -> PadTarget {
+        if menu.is_visible() {
+            return PadTarget::Menu;
+        }
+        if let Some(active) = main.application().and_then(|app| app.active_window()) {
+            if active.upcast_ref::<gtk4::Widget>() != main.upcast_ref::<gtk4::Widget>() {
+                return PadTarget::Dialog(active);
+            }
+        }
+        PadTarget::Grid
+    }
+
+    fn menu_pad_action(menu: &gtk4::Popover, action: PadAction) {
+        match action {
+            PadAction::Menu | PadAction::Back => menu.popdown(),
+            PadAction::Confirm => Self::activate_menu(menu),
+            PadAction::Favorite => {}
+        }
+    }
+
+    fn dialog_pad_action(dialog: &gtk4::Window, action: PadAction) {
+        match action {
+            PadAction::Back => dialog.close(),
+            PadAction::Confirm => {
+                if let Some(widget) = gtk4::prelude::RootExt::focus(dialog) {
+                    let _ = widget.activate();
+                }
+            }
+            PadAction::Menu | PadAction::Favorite => {}
+        }
+    }
+
+    fn nav_direction(dir: NavDir) -> gtk4::DirectionType {
+        match dir {
+            NavDir::Left => gtk4::DirectionType::Left,
+            NavDir::Right => gtk4::DirectionType::Right,
+            NavDir::Up => gtk4::DirectionType::Up,
+            NavDir::Down => gtk4::DirectionType::Down,
+        }
     }
 
     pub fn show(&self) {
@@ -2863,6 +3580,71 @@ mod tests {
         detail_pane_puts_play_above_stats_and_rom_at_the_bottom();
         detail_column_stays_fixed_when_play_expands();
         favorite_toggle_updates_badge_and_detail_heart();
+        game_menu_activates_rename();
+        rebuilding_the_grid_unparents_the_game_menu();
+    }
+
+    fn game_menu_activates_rename() {
+        let seen = Rc::new(RefCell::new(None));
+        let popover = App::game_menu_popover({
+            let seen = seen.clone();
+            Rc::new(move |action| *seen.borrow_mut() = Some(action))
+        });
+        let list = popover.child().and_downcast::<gtk4::ListBox>().unwrap();
+        let labels: Vec<String> = (0..3)
+            .map(|index| {
+                list.row_at_index(index)
+                    .unwrap()
+                    .child()
+                    .and_downcast::<gtk4::Label>()
+                    .unwrap()
+                    .text()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(labels, vec!["Scrape…", "Rename…", "Delete…"]);
+        list.row_at_index(1).unwrap().activate();
+        assert_eq!(*seen.borrow(), Some(GameAction::Rename));
+    }
+
+    fn rebuilding_the_grid_unparents_the_game_menu() {
+        use crate::config::Config;
+        use crate::types::{Console, GridArt, MediaToggles};
+
+        let config = Config {
+            consoles: vec![Console {
+                id: "snes".into(),
+                name: "Super Nintendo".into(),
+                rom_dirs: Vec::new(),
+                extensions: Vec::new(),
+                profile: None,
+                grid_art: GridArt::BoxArt,
+                media: MediaToggles::default(),
+            }],
+            ..Config::default()
+        };
+        let grid = gtk4::FlowBox::new();
+        let stack = gtk4::Stack::new();
+        stack.add_named(
+            &gtk4::Box::new(gtk4::Orientation::Vertical, 0),
+            Some("grid"),
+        );
+        stack.add_named(&gtk4::Label::new(Some("empty")), Some("empty"));
+        let games = vec![sample_game("Chrono Trigger", false)];
+        App::update_game_grid(&grid, &stack, &games, &config, false);
+
+        let menu = gtk4::Popover::new();
+        menu.set_child(Some(&gtk4::Label::new(Some("Scrape…"))));
+        let tile = grid.child_at_index(0).unwrap();
+        menu.set_parent(&tile);
+        assert!(menu.parent().is_some());
+
+        App::update_game_grid(&grid, &stack, &games, &config, false);
+        assert!(menu.parent().is_none());
+        assert!(menu.child().is_some());
+        menu.set_parent(&grid.child_at_index(0).unwrap());
+        assert!(menu.parent().is_some());
+        menu.unparent();
     }
 
     fn flow_columns_follows_the_allocated_line() {

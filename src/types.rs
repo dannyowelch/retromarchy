@@ -37,6 +37,49 @@ pub struct Game {
     pub favorite: bool,
 }
 
+/// Context menu on a selected game tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameAction {
+    Scrape,
+    Rename,
+    Delete,
+}
+
+impl GameAction {
+    pub const ALL: [GameAction; 3] = [Self::Scrape, Self::Rename, Self::Delete];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Scrape => "Scrape…",
+            Self::Rename => "Rename…",
+            Self::Delete => "Delete…",
+        }
+    }
+
+    pub fn from_index(index: i32) -> Option<Self> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| Self::ALL.get(index).copied())
+    }
+}
+
+/// Extra files to remove when a game leaves the library.
+/// Both are off unless the user checks them. The library row is always removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteOptions {
+    pub rom_file: bool,
+    pub scraped_assets: bool,
+}
+
+impl Default for DeleteOptions {
+    fn default() -> Self {
+        Self {
+            rom_file: false,
+            scraped_assets: false,
+        }
+    }
+}
+
 /// Which games the grid shows for the current console. Session UI state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GridFilter {
@@ -266,13 +309,14 @@ impl ScraperCredentials {
             ScrapeProvider::ScreenScraper => {
                 let missing = self.screenscraper_user.trim().is_empty()
                     || self.screenscraper_password.is_empty();
-                missing.then_some(
-                    "ScreenScraper needs a username and password in Scraper settings.",
-                )
+                missing
+                    .then_some("ScreenScraper needs a username and password in Scraper settings.")
             }
-            ScrapeProvider::TheGamesDb => self.thegamesdb_api_key.trim().is_empty().then_some(
-                "TheGamesDB needs an API key in Scraper settings.",
-            ),
+            ScrapeProvider::TheGamesDb => self
+                .thegamesdb_api_key
+                .trim()
+                .is_empty()
+                .then_some("TheGamesDB needs an API key in Scraper settings."),
         }
     }
 }
@@ -362,7 +406,10 @@ mod tests {
         ];
         let favorites = visible_games(&games, "", GridFilter::Favorites);
         assert_eq!(
-            favorites.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(),
+            favorites
+                .iter()
+                .map(|g| g.title.as_str())
+                .collect::<Vec<_>>(),
             vec!["Alpha", "Alpine"]
         );
         let queried = visible_games(&games, "alp", GridFilter::All);
@@ -372,5 +419,22 @@ mod tests {
         );
         let both = visible_games(&games, "beta", GridFilter::Favorites);
         assert!(both.is_empty());
+    }
+
+    #[test]
+    fn game_actions_and_delete_defaults() {
+        assert_eq!(
+            GameAction::ALL.map(GameAction::label),
+            ["Scrape…", "Rename…", "Delete…"]
+        );
+        assert_eq!(GameAction::from_index(1), Some(GameAction::Rename));
+        assert_eq!(GameAction::from_index(3), None);
+        assert_eq!(
+            DeleteOptions::default(),
+            DeleteOptions {
+                rom_file: false,
+                scraped_assets: false,
+            }
+        );
     }
 }
