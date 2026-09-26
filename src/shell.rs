@@ -6,20 +6,26 @@ use crate::browse::{
 };
 use crate::config::{self, InputSettings};
 use crate::database;
+use crate::game_menu::{
+    game_menu_key, Aim, DeleteSlot, Overlay, OverlayCommand, RenameSlot, ScrapeSlot,
+};
 use crate::gamepad::{NavDir, PadAction, PadHeld};
 use crate::input_repeat::HoldRepeat;
 use crate::launcher;
-use crate::types::{Game, GridArt, GridFilter, MediaKind};
+use crate::scraper::{self, NameSearch, ScrapeUpdate};
+use crate::types::{DeleteOptions, Game, GridArt, GridFilter, Media, MediaKind};
 use gpui_kit::base::slider::{SliderEvent, SliderState};
+use gpui_kit::base::CheckboxState;
 use gpui_kit::{
-    div, img, point, px, rgb, App, AppContext, ClickEvent, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, ObjectFit, ParentElement,
-    Render, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task,
-    Window, WindowBounds, WindowDecorations, WindowOptions,
+    anchored, deferred, div, img, point, px, rgb, App, AppContext, ClickEvent, Context, Edges,
+    Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke,
+    MouseButton, MouseDownEvent, ObjectFit, ParentElement, Render, ScrollHandle,
+    StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, Window, WindowBounds,
+    WindowDecorations, WindowOptions,
 };
 use gpui_omarchy::{
-    badge, button, empty_state, focus_scope, keycap, separator, slider, vertical_separator,
-    ActiveTheme, ButtonVariant, Status,
+    badge, button, checkbox, empty_state, focus_scope, keycap, separator, slider,
+    vertical_separator, ActiveTheme, ButtonVariant, Status,
 };
 use std::time::{Duration, Instant};
 
@@ -41,6 +47,9 @@ pub struct Shell {
     input: InputSettings,
     nav_started: Instant,
     _nav_poll: Task<()>,
+    search: Option<std::sync::mpsc::Receiver<NameSearch>>,
+    apply: Option<std::sync::mpsc::Receiver<ScrapeUpdate>>,
+    scrape_scroll: ScrollHandle,
 }
 
 /// GTK favorite red (`#e01b24`).
@@ -101,34 +110,66 @@ impl Shell {
             input: load_input(),
             nav_started,
             _nav_poll: nav_poll,
+            search: None,
+            apply: None,
+            scrape_scroll: ScrollHandle::new(),
         }
     }
 
     /// Face buttons are edges. Held directions step through [`HoldRepeat`].
     /// South enters the grid or launches. East returns to the system list.
-    /// North toggles a favorite. Select is the GTK game menu, which this shell does not open.
+    /// North toggles a favorite. Select opens the GTK game menu, and closes it.
     fn poll_nav(&mut self, cx: &mut Context<Self>) {
         let events = self.drain_pad_events();
-        let mut changed = false;
+        let mut changed = self.poll_jobs();
         for event in &events {
             match self.pad.apply(event) {
-                Some(PadAction::Favorite) => changed |= self.toggle_favorite(),
+                Some(PadAction::Favorite) if !self.browse.overlay_open() => {
+                    changed |= self.toggle_favorite();
+                }
+                Some(PadAction::Confirm) if self.browse.overlay_open() => {
+                    self.confirm_overlay();
+                    changed = true;
+                }
                 Some(PadAction::Confirm) => changed |= self.confirm_pad(),
+                Some(PadAction::Back) if self.browse.overlay_open() => {
+                    self.dismiss_overlay();
+                    changed = true;
+                }
                 Some(PadAction::Back) => changed |= self.browse.back(),
-                Some(PadAction::Menu) | None => {}
+                Some(PadAction::Menu) if self.browse.menu_open() => {
+                    self.dismiss_overlay();
+                    changed = true;
+                }
+                Some(PadAction::Menu) if !self.browse.overlay_open() => {
+                    self.browse.open_game_menu();
+                    changed = true;
+                }
+                Some(PadAction::Favorite | PadAction::Menu) | None => {}
             }
         }
         let now = monotonic_ms(self.nav_started);
         let (step_x, step_y) =
             self.hold
                 .poll(&self.input, self.pad.horizontal(), self.pad.vertical(), now);
-        if let Some(dir) = step_x {
-            self.browse.apply(Key::Arrow(dir));
-            changed = true;
-        }
-        if let Some(dir) = step_y {
-            self.browse.apply(Key::Arrow(dir));
-            changed = true;
+        if self.browse.overlay_open() {
+            if let Some(dir) = step_x {
+                self.browse.move_overlay(dir);
+                changed = true;
+            }
+            if let Some(dir) = step_y {
+                self.browse.move_overlay(dir);
+                changed = true;
+            }
+        } else {
+            if let Some(dir) = step_x {
+                self.browse.apply(Key::Arrow(dir));
+                changed = true;
+            }
+            if let Some(dir) = step_y {
+                self.browse.apply(Key::Arrow(dir));
+                changed = true;
+            }
         }
         if changed {
             cx.notify();
@@ -173,7 +214,24 @@ impl Shell {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.browse.overlay_open() {
+            self.on_overlay_key(&event.keystroke, false, cx);
+            return;
+        }
         if self.on_arrow(&event.keystroke, false, cx) {
+            return;
+        }
+        if game_menu_key(
+            event.keystroke.key.as_str(),
+            event.keystroke.modifiers.shift,
+            event.keystroke.modifiers.control
+                || event.keystroke.modifiers.alt
+                || event.keystroke.modifiers.platform,
+        ) && !event.is_held
+        {
+            self.browse.open_game_menu();
+            cx.notify();
+            cx.stop_propagation();
             return;
         }
         let keystroke = &event.keystroke;
@@ -206,7 +264,225 @@ impl Shell {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+        if self.browse.overlay_open() {
+            self.on_overlay_key(&event.keystroke, true, cx);
+            return;
+        }
         self.on_arrow(&event.keystroke, true, cx);
+    }
+
+    /// Arrows share the hold clock with the pad. Escape closes. Enter confirms.
+    /// A title or search box takes typed characters; every other key stays here.
+    fn on_overlay_key(&mut self, keystroke: &Keystroke, release: bool, cx: &mut Context<Self>) {
+        if let Some(dir) = arrow_dir(keystroke) {
+            let modified = keystroke.modifiers.control
+                || keystroke.modifiers.alt
+                || keystroke.modifiers.platform;
+            if !(modified && !release) {
+                let now = monotonic_ms(self.nav_started);
+                if release {
+                    self.hold.release(&self.input, dir, now);
+                } else if self.hold.press(&self.input, dir, now) > 0 {
+                    self.browse.move_overlay(dir);
+                    cx.notify();
+                }
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if release {
+            cx.stop_propagation();
+            return;
+        }
+        let key = keystroke.key.as_str();
+        if key == "escape" {
+            self.dismiss_overlay();
+            cx.notify();
+        } else if key == "enter" {
+            self.confirm_overlay();
+            cx.notify();
+        } else if key == "backspace" {
+            self.browse.backspace();
+            cx.notify();
+        } else if key == "delete" {
+            self.browse.delete_forward();
+            cx.notify();
+        } else if self.browse.menu_open() && matches!(key, "j" | "k") {
+            let dir = if key == "j" { NavDir::Down } else { NavDir::Up };
+            self.browse.move_overlay(dir);
+            cx.notify();
+        } else if self.browse.accepts_text() {
+            if let Some(text) = typed_text(keystroke) {
+                self.browse.insert_text(text);
+                cx.notify();
+            }
+        } else if key == "space" {
+            self.confirm_overlay();
+            cx.notify();
+        }
+        cx.stop_propagation();
+    }
+
+    fn confirm_overlay(&mut self) {
+        let busy = self.apply.is_some();
+        match self.browse.confirm_overlay(busy) {
+            OverlayCommand::None => {}
+            OverlayCommand::CommitRename => self.commit_rename(),
+            OverlayCommand::CommitDelete => self.commit_delete(),
+            OverlayCommand::Search { query, console_id } => self.start_search(query, console_id),
+            OverlayCommand::Apply { game_id, candidate } => self.start_apply(game_id, candidate),
+        }
+    }
+
+    fn dismiss_overlay(&mut self) {
+        let scrape = matches!(self.browse.overlay, Overlay::Scrape(_));
+        self.browse.close_overlay();
+        if scrape {
+            self.search = None;
+        }
+    }
+
+    fn commit_rename(&mut self) {
+        if self.browse.library.kind == LibraryKind::Demo {
+            self.browse.commit_rename(None);
+            return;
+        }
+        match database::init_db() {
+            Ok(conn) => {
+                self.browse.commit_rename(Some(&conn));
+            }
+            Err(err) => {
+                self.browse.close_overlay();
+                self.browse.status = format!("Could not rename the game ({err}).");
+            }
+        }
+    }
+
+    fn commit_delete(&mut self) {
+        if self.browse.library.kind == LibraryKind::Demo {
+            self.browse.commit_delete(None);
+            return;
+        }
+        let removed = match database::init_db() {
+            Ok(conn) => self.browse.commit_delete(Some(&conn)),
+            Err(err) => {
+                self.browse.close_overlay();
+                self.browse.status = format!("Could not remove the game from the library: {err}");
+                return;
+            }
+        };
+        let Some(removed) = removed else {
+            return;
+        };
+        let notes = delete_notes(&removed.game, removed.options);
+        if !notes.is_empty() {
+            self.browse.status = format!(
+                "Removed {} from the library. {}",
+                removed.game.title,
+                notes.join(" ")
+            );
+        }
+    }
+
+    fn start_search(&mut self, query: String, console_id: String) {
+        let config = match config::load_config() {
+            Ok(config) => config,
+            Err(err) => {
+                self.browse
+                    .fail_search(format!("Could not read scraper settings ({err})."));
+                return;
+            }
+        };
+        self.search = Some(scraper::spawn_name_search(
+            query,
+            console_id,
+            config.scraper,
+            scraper::fixture_dir_from_env(),
+        ));
+    }
+
+    fn start_apply(&mut self, game_id: String, candidate: crate::scraper::ScrapeCandidate) {
+        self.search = None;
+        if self.apply.is_some() {
+            self.browse.status = "A scrape is already running.".into();
+            return;
+        }
+        let Some(game) = self.browse.game_by_id(&game_id).cloned() else {
+            self.browse.status = "Select a game.".into();
+            return;
+        };
+        if self.browse.library.kind == LibraryKind::Demo {
+            self.browse.status = "Demo library. Scrape needs a library on disk.".into();
+            return;
+        }
+        let config = match config::load_config() {
+            Ok(config) => config,
+            Err(err) => {
+                self.browse.status = format!("Could not read scraper settings ({err}).");
+                return;
+            }
+        };
+        self.browse.status = "Scraping artwork…".into();
+        self.apply = Some(scraper::spawn_apply_candidate(
+            game,
+            candidate,
+            config.scraper,
+            scraper::fixture_dir_from_env(),
+        ));
+    }
+
+    fn poll_jobs(&mut self) -> bool {
+        let mut changed = false;
+        let search = self.search.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(outcome) => Some(Ok(outcome)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(())),
+        });
+        if let Some(search) = search {
+            self.search = None;
+            match search {
+                Ok(outcome) => self.browse.finish_search(outcome),
+                Err(()) => self.browse.fail_search("Search stopped.".into()),
+            }
+            changed = true;
+        }
+        let update = self.apply.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(update) => Some(Ok(update)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(())),
+        });
+        if let Some(update) = update {
+            match update {
+                Ok(ScrapeUpdate::Status(text)) => self.browse.status = text,
+                Ok(ScrapeUpdate::Saved { game_id, media }) => self.store_media(&game_id, &media),
+                Ok(ScrapeUpdate::Done(text)) => {
+                    self.apply = None;
+                    self.browse.status = text;
+                }
+                Err(()) => {
+                    self.apply = None;
+                    self.browse.status = "Scrape stopped.".into();
+                }
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    fn store_media(&mut self, game_id: &str, media: &Media) {
+        if self.browse.library.kind != LibraryKind::Disk {
+            return;
+        }
+        let Ok(conn) = database::init_db() else {
+            self.browse.status = "Could not save artwork.".into();
+            return;
+        };
+        let id = game_id.to_string();
+        if database::set_game_media(&conn, &id, media).is_err() {
+            self.browse.status = "Could not save artwork.".into();
+            return;
+        }
+        self.browse.remember_media(game_id, media);
     }
 
     /// Arrow keys use the same clock as the pad. `release` clears a hold.
@@ -314,6 +590,11 @@ impl Render for Shell {
         self.browse
             .set_columns(columns_for(width, self.browse.details_open, frame.width));
         self.reveal_selection();
+        if let Overlay::Scrape(prompt) = &self.browse.overlay {
+            if prompt.slot == ScrapeSlot::Results {
+                self.scrape_scroll.scroll_to_item(prompt.cursor);
+            }
+        }
         if !self.armed {
             self.armed = true;
             self.focus_handle.focus(window, cx);
@@ -347,6 +628,7 @@ impl Render for Shell {
                 cx,
             ))
             .child(status_line(&self.browse, &self.cover_slider, window, cx))
+            .children(game_dialog(&self.browse, &self.scrape_scroll, cx))
     }
 }
 
@@ -385,6 +667,8 @@ fn header(browse: &Browse, theme_name: &str, cx: &Context<Shell>) -> impl IntoEl
                 .child("details")
                 .child(keycap("f", cx))
                 .child("favorite")
+                .child(keycap("menu", cx))
+                .child("game")
                 .child(keycap("esc", cx))
                 .child("clear")
                 .child(keycap("-/+", cx))
@@ -603,12 +887,16 @@ fn grid(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl Int
         let end = (start + columns).min(count);
         let mut row = div().flex().flex_row().flex_shrink_0().gap(px(TILE_GAP));
         for index in start..end {
+            let menu = (browse.game == Some(index))
+                .then(|| browse.menu_cursor())
+                .flatten();
             row = row.child(tile(
                 index,
                 visible[index],
                 art,
                 browse.cover_width,
                 browse.game == Some(index),
+                menu,
                 demo,
                 cx,
             ));
@@ -624,6 +912,7 @@ fn tile(
     art: GridArt,
     cover_width: f32,
     selected: bool,
+    menu: Option<usize>,
     demo: bool,
     cx: &Context<Shell>,
 ) -> impl IntoElement {
@@ -684,12 +973,81 @@ fn tile(
                 cx.notify();
             }),
         )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this: &mut Shell, _: &MouseDownEvent, window, cx| {
+                this.revealed_game = None;
+                this.browse.select_game(index);
+                this.browse.open_game_menu();
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+                cx.stop_propagation();
+            }),
+        )
         .child(image)
         .child(caption);
     if game.favorite {
         card = card.child(favorite_badge());
     }
+    if let Some(cursor) = menu {
+        card = card.child(game_menu(cursor, frame.height, cx));
+    }
     card
+}
+
+fn game_menu(cursor: usize, art_height: f32, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let mut rows = div()
+        .id("game-menu")
+        .w(px(200.))
+        .flex()
+        .flex_col()
+        .bg(theme.background)
+        .border_1()
+        .border_color(theme.border)
+        .occlude()
+        .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_down_out(cx.listener(|this: &mut Shell, _: &MouseDownEvent, _, cx| {
+            if this.browse.menu_open() {
+                this.dismiss_overlay();
+                cx.notify();
+            }
+        }));
+    for (index, action) in crate::types::GameAction::ALL.into_iter().enumerate() {
+        let chosen = index == cursor;
+        let mut row = div()
+            .id(("game-menu-item", index))
+            .w_full()
+            .px(px(12.))
+            .py(px(8.))
+            .cursor_pointer()
+            .on_click(
+                cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                    this.browse.aim(Aim::Menu(index));
+                    this.confirm_overlay();
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                    cx.stop_propagation();
+                }),
+            );
+        if chosen {
+            row = row.bg(theme.selected_fill()).text_color(theme.accent);
+        } else {
+            row = row.hover(|style| style.bg(theme.hover_fill()));
+        }
+        rows = rows.child(row.child(action.label()));
+    }
+    div()
+        .absolute()
+        .top(px(art_height))
+        .left(px(0.))
+        .child(deferred(
+            anchored()
+                .snap_to_window_with_margin(Edges::all(px(8.)))
+                .child(rows),
+        ))
 }
 
 fn favorite_badge() -> impl IntoElement {
@@ -906,7 +1264,7 @@ fn status_line(
 ) -> impl IntoElement {
     let theme = cx.omarchy();
     let text = if browse.status.is_empty() {
-        "Import, scrape, and emulator setup stay on the GTK app."
+        "Import, bulk scrape, and emulator setup stay on the GTK app."
     } else {
         browse.status.as_str()
     };
@@ -957,6 +1315,395 @@ fn cover_width_control(
                 .flex_shrink_0()
                 .child(format!("{:.0}px", browse.cover_width)),
         )
+}
+
+fn game_dialog(
+    browse: &Browse,
+    scrape_scroll: &ScrollHandle,
+    cx: &Context<Shell>,
+) -> Option<gpui_kit::AnyElement> {
+    let page = match &browse.overlay {
+        Overlay::Rename(rename) => rename_dialog(rename, cx).into_any_element(),
+        Overlay::Delete(prompt) => delete_dialog(prompt, cx).into_any_element(),
+        Overlay::Scrape(prompt) => scrape_dialog(prompt, scrape_scroll, cx).into_any_element(),
+        Overlay::None | Overlay::Menu(_) => return None,
+    };
+    Some(modal(page).into_any_element())
+}
+
+fn modal(child: impl IntoElement) -> gpui_kit::Div {
+    div()
+        .absolute()
+        .top(px(0.))
+        .left(px(0.))
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui_kit::Hsla::from(rgb(0x000000)).opacity(0.45))
+        .occlude()
+        .child(child)
+}
+
+fn dialog_page(
+    id: &'static str,
+    title: &str,
+    width: f32,
+    cx: &Context<Shell>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let theme = cx.omarchy();
+    div()
+        .id(id)
+        .w(px(width))
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .p(px(16.))
+        .bg(theme.background)
+        .border_1()
+        .border_color(theme.border)
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+        })
+        .child(
+            div()
+                .font_weight(gpui_kit::FontWeight::BOLD)
+                .text_size(px(16.))
+                .child(title.to_string()),
+        )
+}
+
+fn hint(text: &str, cx: &Context<Shell>) -> impl IntoElement {
+    div()
+        .text_size(px(12.))
+        .text_color(cx.omarchy().secondary)
+        .whitespace_normal()
+        .child(text.to_string())
+}
+
+fn line_editor(
+    id: &'static str,
+    edit: &crate::game_menu::LineEdit,
+    focused: bool,
+    aim: Aim,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let line = edit.caret_line();
+    let mut text = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .overflow_hidden()
+        .min_h(px(18.));
+    if line.selected {
+        text = text.child(
+            div()
+                .bg(theme.selected_fill())
+                .text_color(theme.accent)
+                .child(line.head),
+        );
+    } else {
+        text = text.child(line.head);
+        if focused {
+            text = text.child(
+                div()
+                    .w(px(1.))
+                    .h(px(16.))
+                    .flex_shrink_0()
+                    .bg(theme.foreground),
+            );
+        }
+        text = text.child(line.tail);
+    }
+    div()
+        .id(id)
+        .flex_1()
+        .min_w(px(0.))
+        .px(px(8.))
+        .py(px(6.))
+        .border_1()
+        .border_color(if focused { theme.accent } else { theme.border })
+        .bg(theme.surface)
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                this.browse.aim(aim);
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+        .child(text)
+}
+
+fn aimed_button(
+    id: &'static str,
+    label: &'static str,
+    variant: ButtonVariant,
+    aimed: bool,
+    aim: Aim,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .border_1()
+        .border_color(if aimed {
+            theme.accent
+        } else {
+            theme.background
+        })
+        .child(button(id, label, variant, cx).on_click(cx.listener(
+            move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                this.browse.aim(aim);
+                this.confirm_overlay();
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            },
+        )))
+}
+
+fn rename_dialog(rename: &crate::game_menu::Rename, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let mut page = dialog_page("rename-dialog", "Rename", 420., cx)
+        .child(hint(
+            "Library title. This does not rename the ROM file.",
+            cx,
+        ))
+        .child(line_editor(
+            "rename-title",
+            &rename.edit,
+            rename.slot == RenameSlot::Title,
+            Aim::Rename(RenameSlot::Title),
+            cx,
+        ));
+    if let Some(error) = &rename.error {
+        page = page.child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme.danger)
+                .child(error.clone()),
+        );
+    }
+    page.child(
+        div()
+            .flex()
+            .justify_end()
+            .gap(px(8.))
+            .child(aimed_button(
+                "rename-cancel",
+                "Cancel",
+                ButtonVariant::Secondary,
+                rename.slot == RenameSlot::Cancel,
+                Aim::Rename(RenameSlot::Cancel),
+                cx,
+            ))
+            .child(aimed_button(
+                "rename-save",
+                "Save",
+                ButtonVariant::Primary,
+                rename.slot == RenameSlot::Save,
+                Aim::Rename(RenameSlot::Save),
+                cx,
+            )),
+    )
+}
+
+fn delete_dialog(prompt: &crate::game_menu::DeletePrompt, cx: &Context<Shell>) -> impl IntoElement {
+    dialog_page("delete-dialog", "Delete", 440., cx)
+        .child(
+            div()
+                .font_weight(gpui_kit::FontWeight::BOLD)
+                .text_size(px(18.))
+                .whitespace_normal()
+                .child(prompt.title.clone()),
+        )
+        .child(hint(
+            "Remove this game from the library. The ROM and scraped artwork stay on disk unless you check a box.",
+            cx,
+        ))
+        .child(delete_check(
+            false,
+            prompt.options.rom_file,
+            prompt.slot == DeleteSlot::Rom,
+            cx,
+        ))
+        .child(delete_check(
+            true,
+            prompt.options.scraped_assets,
+            prompt.slot == DeleteSlot::Assets,
+            cx,
+        ))
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(8.))
+                .child(aimed_button(
+                    "delete-cancel",
+                    "Cancel",
+                    ButtonVariant::Primary,
+                    prompt.slot == DeleteSlot::Cancel,
+                    Aim::Delete(DeleteSlot::Cancel),
+                    cx,
+                ))
+                .child(aimed_button(
+                    "delete-confirm",
+                    "Delete",
+                    ButtonVariant::Danger,
+                    prompt.slot == DeleteSlot::Confirm,
+                    Aim::Delete(DeleteSlot::Confirm),
+                    cx,
+                )),
+        )
+}
+
+fn delete_check(assets: bool, on: bool, aimed: bool, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let (id, label) = if assets {
+        ("delete-assets", "Delete scraped assets")
+    } else {
+        ("delete-rom", "Delete ROM file from disk")
+    };
+    let state = if on {
+        CheckboxState::Checked
+    } else {
+        CheckboxState::Unchecked
+    };
+    let entity = cx.entity();
+    div()
+        .border_1()
+        .border_color(if aimed {
+            theme.accent
+        } else {
+            theme.background
+        })
+        .child(
+            checkbox(id, label, state, cx).on_change(move |state, _, _, cx| {
+                entity.update(cx, |this, cx| {
+                    this.browse
+                        .set_delete_flag(assets, state == CheckboxState::Checked);
+                    cx.notify();
+                });
+            }),
+        )
+}
+
+fn scrape_dialog(
+    prompt: &crate::game_menu::ScrapePrompt,
+    scroll: &ScrollHandle,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let mut page = dialog_page("scrape-dialog", "Scrape", 480., cx)
+        .child(hint(
+            "Search by name, then pick a match. Box art and screenshot for this game are replaced.",
+            cx,
+        ))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(line_editor(
+                    "scrape-query",
+                    &prompt.edit,
+                    prompt.slot == ScrapeSlot::Query,
+                    Aim::ScrapeQuery,
+                    cx,
+                ))
+                .child(aimed_button(
+                    "scrape-search",
+                    "Search",
+                    ButtonVariant::Primary,
+                    prompt.slot == ScrapeSlot::Search,
+                    Aim::ScrapeSearch,
+                    cx,
+                )),
+        );
+    if !prompt.message.is_empty() {
+        page = page.child(hint(&prompt.message, cx));
+    }
+    let mut list = div()
+        .id("scrape-results")
+        .w_full()
+        .max_h(px(240.))
+        .overflow_y_scroll()
+        .track_scroll(scroll)
+        .flex()
+        .flex_col();
+    for (index, candidate) in prompt.candidates.iter().enumerate() {
+        let chosen = prompt.slot == ScrapeSlot::Results && prompt.cursor == index;
+        let subtitle = if candidate.system.is_empty() {
+            candidate.provider.label().to_string()
+        } else {
+            format!("{} · {}", candidate.provider.label(), candidate.system)
+        };
+        let mut row = div()
+            .id(("scrape-result", index))
+            .w_full()
+            .px(px(8.))
+            .py(px(6.))
+            .cursor_pointer()
+            .on_click(
+                cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                    this.browse.aim(Aim::ScrapeResult(index));
+                    this.confirm_overlay();
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                }),
+            );
+        if chosen {
+            row = row.bg(theme.selected_fill()).text_color(theme.accent);
+        } else {
+            row = row.hover(|style| style.bg(theme.hover_fill()));
+        }
+        list = list.child(
+            row.child(candidate.title.clone()).child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.secondary)
+                    .child(subtitle),
+            ),
+        );
+    }
+    page.child(list)
+}
+
+fn delete_notes(game: &Game, options: DeleteOptions) -> Vec<String> {
+    let mut notes = Vec::new();
+    if options.rom_file {
+        if let Err(err) = scraper::delete_rom_file(&game.rom) {
+            notes.push(format!("ROM file: {err}"));
+        }
+    }
+    if options.scraped_assets {
+        match scraper::media_root() {
+            Ok(root) => {
+                if let Err(err) = scraper::delete_cached_assets(&root, game) {
+                    notes.push(format!("artwork: {err}"));
+                }
+            }
+            Err(err) => notes.push(format!("artwork: {err}")),
+        }
+    }
+    notes
+}
+
+fn typed_text(keystroke: &Keystroke) -> Option<&str> {
+    if keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform {
+        return None;
+    }
+    if keystroke.key == "space" {
+        return Some(" ");
+    }
+    let text = keystroke.key_char.as_deref()?;
+    if text.is_empty() || text.chars().any(|ch| ch.is_control()) {
+        return None;
+    }
+    Some(text)
 }
 
 fn load_input() -> InputSettings {
