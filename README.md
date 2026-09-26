@@ -36,12 +36,13 @@ If the config has no consoles, the shell shows an in-memory demo and labels it *
 - `h` `j` `k` `l` step the grid.
 - Enter launches the selected game with the existing profile resolver. The status line names the error when the system has no profile. This shell does not write play time back to the database.
 - `d` shows or hides the details pane.
+- `f` toggles a favorite on the selected game. Gamepad Y (North) does the same. The header has an All / Favorites control for the current console. A filled heart on the card and in the details pane means favorited. Disk libraries write the flag through the SQLite library; the demo library keeps it in memory until you quit.
 - Escape clears the selected game.
 - `-` and `+` (or `=`, and the numpad equivalents) change the game-grid cover width by 10px. The same width is used for every system and saved as `cover_width` in the config. The range is 120–400. The status bar slider does the same thing.
 
 ## Not in this branch
 
-Import, scrape, rename, delete, emulator setup, the favorites filter, the LaunchBox theme toggle, and gamepad hold-repeat stay in the GTK app on `main`. `src/ui.rs` and `src/dialogs.rs` are that window. This binary does not compile them.
+Import, scrape, rename, delete, emulator setup, the LaunchBox theme toggle, and gamepad hold-repeat stay in the GTK app on `main`. This shell does read gamepad Y to toggle a favorite. `src/ui.rs` and `src/dialogs.rs` are that window. This binary does not compile them.
 
 Scan, config, the SQLite library, and launch command building are the library crate. `cargo test` runs those tests. The binary is the shell.
 
