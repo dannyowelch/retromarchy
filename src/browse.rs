@@ -292,13 +292,20 @@ pub fn cover_path(game: &Game, art: GridArt) -> Option<PathBuf> {
     None
 }
 
-pub const SIDEBAR_WIDTH: f32 = 220.0;
-pub const DETAILS_WIDTH: f32 = 280.0;
-pub const GRID_PAD: f32 = 16.0;
+pub const SIDEBAR_WIDTH: f32 = 260.0;
+pub const DETAILS_WIDTH: f32 = 264.0;
+pub const GRID_PAD: f32 = 8.0;
 pub const TILE_GAP: f32 = 12.0;
+/// Shared card width. Screenshot slots stay 4:3 at this width.
+pub const COVER_WIDTH: f32 = 236.0;
+/// Left and right borders of the games pane (`border_1`).
+const GRID_CHROME: f32 = 2.0;
 
 /// Fixed cover slot for one console grid. Every card in that grid uses the same
 /// size so keyboard columns and painted rows stay the same grid.
+///
+/// Box art keeps [`COVER_WIDTH`] and grows to 3:4, so a portrait cover fills
+/// that width under Contain. Screenshot slots stay 4:3.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TileFrame {
     pub width: f32,
@@ -307,16 +314,15 @@ pub struct TileFrame {
 
 impl TileFrame {
     pub fn for_art(art: GridArt) -> Self {
+        let width = COVER_WIDTH;
         match art {
-            // 4:3. A screenshot fills the slot. Anything else is letterboxed inside it.
             GridArt::Screenshot => Self {
-                width: 236.0,
-                height: 177.0,
+                width,
+                height: width * 3.0 / 4.0,
             },
-            // 3:4. A box fills the slot. A landscape fallback is letterboxed.
             GridArt::BoxArt => Self {
-                width: 168.0,
-                height: 224.0,
+                width,
+                height: width * 4.0 / 3.0,
             },
         }
     }
@@ -479,9 +485,8 @@ pub fn resolve_profile(library: &Library, game: &Game) -> Option<EmulatorProfile
 
 pub fn columns_for(width: f32, details_open: bool, tile_width: f32) -> usize {
     let tile_width = tile_width.max(1.0);
-    let reserved =
-        SIDEBAR_WIDTH + if details_open { DETAILS_WIDTH } else { 0.0 } + GRID_PAD * 2.0 + 16.0;
-    let grid = (width - reserved).max(tile_width);
+    let details = if details_open { DETAILS_WIDTH } else { 0.0 };
+    let grid = (width - SIDEBAR_WIDTH - details - GRID_PAD * 2.0 - GRID_CHROME).max(tile_width);
     let columns = ((grid + TILE_GAP) / (tile_width + TILE_GAP)).floor() as usize;
     columns.clamp(1, 8)
 }
@@ -621,11 +626,20 @@ mod tests {
         assert_eq!(format_play_time(5400), "1h 30m");
         let shot = TileFrame::for_art(GridArt::Screenshot);
         let box_art = TileFrame::for_art(GridArt::BoxArt);
+        assert_eq!(shot.width, COVER_WIDTH);
+        assert_eq!(shot.height, 177.0);
+        assert_eq!(box_art.width, shot.width);
         assert!((shot.ratio() - 4.0 / 3.0).abs() < 0.001);
         assert!((box_art.width / box_art.height - 3.0 / 4.0).abs() < 0.001);
-        assert!(shot.width > 148.0);
+        assert!(box_art.height > shot.height);
+        let grid = 1280.0 - SIDEBAR_WIDTH - DETAILS_WIDTH - GRID_PAD * 2.0 - GRID_CHROME;
+        let row = COVER_WIDTH * 3.0 + TILE_GAP * 2.0;
+        assert!(
+            grid >= row + 4.0,
+            "three covers need room in the default window: grid {grid} row {row}"
+        );
         assert_eq!(columns_for(1280.0, true, shot.width), 3);
-        assert_eq!(columns_for(1280.0, true, box_art.width), 4);
+        assert_eq!(columns_for(1280.0, true, box_art.width), 3);
         assert!(columns_for(1600.0, false, shot.width) > columns_for(1280.0, true, shot.width));
         assert_eq!(row_of(0, 3), 0);
         assert_eq!(row_of(5, 3), 1);
