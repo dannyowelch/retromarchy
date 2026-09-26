@@ -3442,14 +3442,15 @@ impl App {
                     }
                 }
                 PadTarget::Dialog(dialog) => {
+                    dialog.set_focus_visible(true);
                     if let Some(dir) = held_x {
                         for _ in 0..steps_x {
-                            dialog.child_focus(Self::nav_direction(dir));
+                            let _ = Self::move_dialog_focus(&dialog, dir);
                         }
                     }
                     if let Some(dir) = held_y {
                         for _ in 0..steps_y {
-                            dialog.child_focus(Self::nav_direction(dir));
+                            let _ = Self::move_dialog_focus(&dialog, dir);
                         }
                     }
                 }
@@ -3509,6 +3510,11 @@ impl App {
             PadAction::Confirm => Self::activate_menu(menu),
             PadAction::Favorite => {}
         }
+    }
+
+    fn move_dialog_focus(dialog: &gtk4::Window, dir: NavDir) -> bool {
+        dialog.set_focus_visible(true);
+        dialog.child_focus(Self::nav_direction(dir))
     }
 
     fn dialog_pad_action(dialog: &gtk4::Window, action: PadAction) {
@@ -4042,20 +4048,21 @@ mod tests {
                 let PadTarget::Dialog(dialog) = App::pad_target(&parent, &menu) else {
                     panic!("controller stayed on the grid while Delete was open");
                 };
-                assert!(dialog.child_focus(gtk4::DirectionType::Up));
+                assert!(App::move_dialog_focus(&dialog, NavDir::Up));
+                assert!(dialog.gets_focus_visible());
                 let assets = focused_check(&dialog);
                 assert_eq!(assets.label().as_deref(), Some("Delete scraped assets"));
                 assert!(!assets.is_active());
                 assert!(assets.activate());
                 assert!(assets.is_active());
-                assert!(dialog.child_focus(gtk4::DirectionType::Up));
+                assert!(App::move_dialog_focus(&dialog, NavDir::Up));
                 let rom = focused_check(&dialog);
                 assert_eq!(rom.label().as_deref(), Some("Delete ROM file from disk"));
                 assert!(!rom.is_active());
                 assert!(rom.activate());
                 assert!(rom.is_active());
-                assert!(dialog.child_focus(gtk4::DirectionType::Down));
-                assert!(dialog.child_focus(gtk4::DirectionType::Down));
+                assert!(App::move_dialog_focus(&dialog, NavDir::Down));
+                assert!(App::move_dialog_focus(&dialog, NavDir::Down));
                 let buttons =
                     gtk4::prelude::RootExt::focus(&dialog).expect("focus left the dialog");
                 assert!(
@@ -4069,18 +4076,18 @@ mod tests {
                 let PadTarget::Dialog(rename) = App::pad_target(&parent, &menu) else {
                     panic!("controller stayed on the grid while Rename was open");
                 };
-                assert!(rename.child_focus(gtk4::DirectionType::Down));
+                assert!(App::move_dialog_focus(&rename, NavDir::Down));
                 let cancel = gtk4::prelude::RootExt::focus(&rename).expect("rename lost focus");
                 let cancel = cancel
                     .downcast::<gtk4::Button>()
                     .expect("Down did not reach a button");
                 assert_eq!(cancel.label().as_deref(), Some("Cancel"));
-                assert!(rename.child_focus(gtk4::DirectionType::Right));
+                assert!(App::move_dialog_focus(&rename, NavDir::Right));
                 let save = gtk4::prelude::RootExt::focus(&rename)
                     .and_then(|widget| widget.downcast::<gtk4::Button>().ok())
                     .expect("Right did not reach Save");
                 assert_eq!(save.label().as_deref(), Some("Save"));
-                assert!(rename.child_focus(gtk4::DirectionType::Up));
+                assert!(App::move_dialog_focus(&rename, NavDir::Up));
                 let entry = gtk4::prelude::RootExt::focus(&rename).expect("Up left Rename");
                 assert!(
                     entry.ancestor(gtk4::Entry::static_type()).is_some()
@@ -4100,7 +4107,7 @@ mod tests {
                 let PadTarget::Dialog(scrape) = App::pad_target(&parent, &menu) else {
                     panic!("controller stayed on the grid while Scrape was open");
                 };
-                assert!(scrape.child_focus(gtk4::DirectionType::Right));
+                assert!(App::move_dialog_focus(&scrape, NavDir::Right));
                 let search = gtk4::prelude::RootExt::focus(&scrape)
                     .and_then(|widget| widget.downcast::<gtk4::Button>().ok())
                     .expect("Right did not reach Search");
