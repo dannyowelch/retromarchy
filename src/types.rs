@@ -119,12 +119,20 @@ impl GridFilter {
 }
 
 /// Title query plus [`GridFilter`]. `query` is matched case-insensitively.
+/// A blank or whitespace query does not narrow the list.
+pub fn game_matches(game: &Game, query: &str, filter: GridFilter) -> bool {
+    if !filter.matches(game) {
+        return false;
+    }
+    let query = query.trim();
+    query.is_empty() || game.title.to_lowercase().contains(&query.to_lowercase())
+}
+
+/// Title query plus [`GridFilter`]. `query` is matched case-insensitively.
 pub fn visible_games(games: &[Game], query: &str, filter: GridFilter) -> Vec<Game> {
-    let query = query.trim().to_lowercase();
     games
         .iter()
-        .filter(|game| filter.matches(game))
-        .filter(|game| query.is_empty() || game.title.to_lowercase().contains(&query))
+        .filter(|game| game_matches(game, query, filter))
         .cloned()
         .collect()
 }

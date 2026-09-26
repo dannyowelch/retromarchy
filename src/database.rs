@@ -147,6 +147,21 @@ pub fn upsert_game(conn: &Connection, game: &Game) -> Result<()> {
     Ok(())
 }
 
+/// Upsert a console scan and drop rows whose ROM is gone.
+/// Play counts, favorites, and custom titles stay on the rows that remain.
+pub fn replace_scanned_games(
+    conn: &Connection,
+    console: &ConsoleId,
+    scanned: &[Game],
+) -> Result<Vec<Game>> {
+    let ids: Vec<_> = scanned.iter().map(|game| game.id.clone()).collect();
+    for game in scanned {
+        upsert_game(conn, game)?;
+    }
+    remove_missing_games(conn, console, &ids)?;
+    load_games(conn, Some(console))
+}
+
 pub fn remove_missing_games(
     conn: &Connection,
     console: &ConsoleId,
@@ -414,6 +429,38 @@ mod tests {
             play_time: 0,
             favorite,
         }
+    }
+
+    #[test]
+    fn play_stats_survive_a_rescan_and_missing_roms_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(&dir.path().join("library.db")).unwrap();
+        upsert_game(&conn, &sample("keep", "Kept", false)).unwrap();
+        upsert_game(&conn, &sample("gone", "Gone", false)).unwrap();
+        increment_play_stats(&conn, &"keep".to_string(), 9).unwrap();
+        update_last_played(&conn, &"keep".to_string()).unwrap();
+
+        let games = replace_scanned_games(
+            &conn,
+            &"snes".to_string(),
+            &[
+                sample("keep", "Kept", false),
+                sample("new", "New Game", false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            games
+                .iter()
+                .map(|game| game.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep", "new"]
+        );
+        let keep = games.iter().find(|game| game.id == "keep").unwrap();
+        assert_eq!(keep.play_count, 1);
+        assert_eq!(keep.play_time, 9);
+        assert!(keep.last_played.is_some());
+        assert!(games.iter().all(|game| game.id != "gone"));
     }
 
     #[test]
