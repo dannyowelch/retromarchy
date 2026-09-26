@@ -22,6 +22,36 @@ fn default_ramp_ms() -> u32 {
     2000
 }
 
+/// Shared game-grid cover width. Screenshot and box-art cards both use it.
+pub const COVER_WIDTH_DEFAULT: f32 = 216.0;
+/// Narrowest cover that still leaves a readable caption.
+pub const COVER_WIDTH_MIN: f32 = 120.0;
+/// Widest cover. `columns_for` still keeps at least one column.
+pub const COVER_WIDTH_MAX: f32 = 400.0;
+/// Slider detents and `-` / `+` both move by this many pixels.
+pub const COVER_WIDTH_STEP: f32 = 10.0;
+
+fn default_cover_width() -> f32 {
+    COVER_WIDTH_DEFAULT
+}
+
+/// Keep a cover width inside the slider range. Non-finite values become the default.
+pub fn clamp_cover_width(width: f32) -> f32 {
+    if !width.is_finite() {
+        return COVER_WIDTH_DEFAULT;
+    }
+    width.round().clamp(COVER_WIDTH_MIN, COVER_WIDTH_MAX)
+}
+
+/// Move `steps` detents of [`COVER_WIDTH_STEP`] from the current width, then clamp.
+pub fn step_cover_width(width: f32, steps: i32) -> f32 {
+    let current = clamp_cover_width(width);
+    if steps == 0 {
+        return current;
+    }
+    clamp_cover_width(current + steps as f32 * COVER_WIDTH_STEP)
+}
+
 /// How long a direction repeats while it is held. Serialized as `[input]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputSettings {
@@ -90,6 +120,9 @@ pub struct Config {
     pub theme: String,
     #[serde(default = "default_true")]
     pub details_visible: bool,
+    /// One cover width for every system's game grid, in pixels.
+    #[serde(default = "default_cover_width")]
+    pub cover_width: f32,
     #[serde(default)]
     pub profiles: Vec<EmulatorProfile>,
     #[serde(default)]
@@ -113,6 +146,7 @@ impl Default for Config {
         Self {
             theme: default_theme(),
             details_visible: default_true(),
+            cover_width: default_cover_width(),
             profiles: Vec::new(),
             consoles: Vec::new(),
             scraper: ScraperConfig::default(),
@@ -150,17 +184,57 @@ pub fn load_config() -> Result<Config> {
         .with_context(|| format!("Failed to parse config from {}", path.display()))
 }
 
-/// Parse config text and clamp `[input]` so bad values cannot stall navigation.
+/// Parse config text. Clamps `[input]` and `cover_width`.
 pub fn config_from_toml(content: &str) -> Result<Config> {
     let mut config: Config = toml::from_str(content)?;
     config.input.sanitize();
+    config.cover_width = clamp_cover_width(config.cover_width);
     Ok(config)
+}
+
+/// Load config, store one global cover width, and write it back.
+pub fn save_cover_width(width: f32) -> Result<()> {
+    let mut config = load_config()?;
+    config.cover_width = clamp_cover_width(width);
+    save_config(&config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{Console, GridArt, MediaToggles};
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvLock {
+        key: &'static str,
+        prev: Option<String>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl EnvLock {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self {
+                key,
+                prev,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for EnvLock {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn grid_art_roundtrip_saves() {
@@ -247,6 +321,66 @@ screenshot = false
         assert_eq!(config.input.slow_interval_ms, 180);
         assert_eq!(config.input.fast_interval_ms, 50);
         assert_eq!(config.input.ramp_ms, 2000);
+        assert_eq!(config.cover_width, COVER_WIDTH_DEFAULT);
+    }
+
+    #[test]
+    fn cover_width_round_trips_and_clamps() {
+        let mut config = Config::default();
+        config.cover_width = 250.0;
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            text.contains("cover_width = 250") || text.contains("cover_width = 250.0"),
+            "{text}"
+        );
+        let back = config_from_toml(&text).unwrap();
+        assert_eq!(back.cover_width, 250.0);
+
+        assert_eq!(
+            config_from_toml("cover_width = 10\n").unwrap().cover_width,
+            COVER_WIDTH_MIN
+        );
+        assert_eq!(
+            config_from_toml("cover_width = 9999\n")
+                .unwrap()
+                .cover_width,
+            COVER_WIDTH_MAX
+        );
+        assert_eq!(clamp_cover_width(f32::NAN), COVER_WIDTH_DEFAULT);
+        assert_eq!(step_cover_width(COVER_WIDTH_DEFAULT, 1), 226.0);
+        assert_eq!(step_cover_width(COVER_WIDTH_DEFAULT, -1), 206.0);
+        assert_eq!(step_cover_width(COVER_WIDTH_MAX, 1), COVER_WIDTH_MAX);
+        assert_eq!(step_cover_width(COVER_WIDTH_MIN, -1), COVER_WIDTH_MIN);
+        assert_eq!(step_cover_width(217.4, 1), 227.0);
+    }
+
+    #[test]
+    fn save_cover_width_keeps_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvLock::set("XDG_CONFIG_HOME", dir.path());
+        let mut config = Config::default();
+        config.theme = "custom".into();
+        config.details_visible = false;
+        config.consoles.push(Console {
+            id: "nes".into(),
+            name: "NES".into(),
+            rom_dirs: Vec::new(),
+            extensions: vec!["nes".into()],
+            profile: None,
+            grid_art: GridArt::Screenshot,
+            media: MediaToggles::default(),
+        });
+        save_config(&config).unwrap();
+        save_cover_width(246.0).unwrap();
+        let loaded = load_config().unwrap();
+        assert_eq!(loaded.cover_width, 246.0);
+        assert_eq!(loaded.theme, "custom");
+        assert!(!loaded.details_visible);
+        assert_eq!(loaded.consoles.len(), 1);
+        assert_eq!(loaded.consoles[0].id, "nes");
+        assert_eq!(loaded.consoles[0].grid_art, GridArt::Screenshot);
+        // A second launch reads the same global width.
+        assert_eq!(load_config().unwrap().cover_width, 246.0);
     }
 
     #[test]

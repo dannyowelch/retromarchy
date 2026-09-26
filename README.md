@@ -37,6 +37,7 @@ If the config has no consoles, the shell shows an in-memory demo and labels it *
 - Enter launches the selected game with the existing profile resolver. The status line names the error when the system has no profile. This shell does not write play time back to the database.
 - `d` shows or hides the details pane.
 - Escape clears the selected game.
+- `-` and `+` (or `=`, and the numpad equivalents) change the game-grid cover width by 10px. The same width is used for every system and saved as `cover_width` in the config. The range is 120–400. The status bar slider does the same thing.
 
 ## Not in this branch
 

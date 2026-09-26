@@ -1,17 +1,22 @@
 use crate::browse::{
-    columns_for, cover_path, file_for, format_play_time, image_aspect, key_from_name,
-    resolve_profile, row_of, Browse, Key, LibraryKind, Pane, TileFrame, DETAILS_PAD, DETAILS_WIDTH,
-    GRID_PAD, SIDEBAR_WIDTH, TILE_GAP,
+    clamp_cover_width, columns_for, cover_path, file_for, format_play_time, image_aspect,
+    key_from_parts, resolve_profile, row_of, Browse, Key, LibraryKind, Pane, TileFrame,
+    COVER_WIDTH_MAX, COVER_WIDTH_MIN, COVER_WIDTH_STEP, DETAILS_PAD, DETAILS_WIDTH, GRID_PAD,
+    SIDEBAR_WIDTH, TILE_GAP,
 };
+use crate::config;
 use crate::launcher;
 use crate::types::{Game, GridArt, MediaKind};
+use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::{
-    div, img, point, px, App, ClickEvent, Context, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, ObjectFit, ParentElement, Render, ScrollHandle, StatefulInteractiveElement,
-    Styled, StyledImage, Window, WindowBounds, WindowDecorations, WindowOptions,
+    div, img, point, px, App, AppContext, ClickEvent, Context, Entity, FocusHandle,
+    InteractiveElement, IntoElement, KeyDownEvent, ObjectFit, ParentElement, Render, ScrollHandle,
+    StatefulInteractiveElement, Styled, StyledImage, Subscription, Window, WindowBounds,
+    WindowDecorations, WindowOptions,
 };
 use gpui_omarchy::{
-    badge, button, empty_state, focus_scope, keycap, separator, ActiveTheme, ButtonVariant, Status,
+    badge, button, empty_state, focus_scope, keycap, separator, slider, vertical_separator,
+    ActiveTheme, ButtonVariant, Status,
 };
 
 pub struct Shell {
@@ -23,10 +28,27 @@ pub struct Shell {
     revealed_console: Option<usize>,
     revealed_game: Option<usize>,
     revealed_columns: usize,
+    cover_slider: Entity<SliderState>,
+    _cover_slider_sub: Subscription,
 }
 
 impl Shell {
     pub fn new(browse: Browse, cx: &mut Context<Self>) -> Self {
+        let cover_slider = cx.new(|_| {
+            // max before min: the builder clamps against the previous max, which starts at 100.
+            SliderState::new()
+                .max(COVER_WIDTH_MAX)
+                .min(COVER_WIDTH_MIN)
+                .step(COVER_WIDTH_STEP)
+                .default_value(browse.cover_width)
+        });
+        let cover_slider_sub =
+            cx.subscribe(&cover_slider, |this, _slider, event: &SliderEvent, cx| {
+                let value = match event {
+                    SliderEvent::Change(value) | SliderEvent::Release(value) => value.end(),
+                };
+                this.apply_cover_width(value, cx);
+            });
         Self {
             browse,
             focus_handle: cx.focus_handle(),
@@ -36,23 +58,60 @@ impl Shell {
             revealed_console: None,
             revealed_game: None,
             revealed_columns: 0,
+            cover_slider,
+            _cover_slider_sub: cover_slider_sub,
         }
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let modified =
             keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
-        let Some(key) = key_from_name(keystroke.key.as_ref(), modified) else {
+        let Some(key) = key_from_parts(
+            keystroke.key.as_ref(),
+            keystroke.key_char.as_deref(),
+            modified,
+        ) else {
             return;
         };
+        let before = self.browse.cover_width;
         if key == Key::Launch {
             self.launch_selected();
         } else {
             self.browse.apply(key);
         }
+        if (self.browse.cover_width - before).abs() >= 0.5 {
+            let width = self.browse.cover_width;
+            self.cover_slider.update(cx, |state, cx| {
+                state.set_value(width, window, cx);
+            });
+            self.persist_cover_width();
+        }
         cx.notify();
         cx.stop_propagation();
+    }
+
+    fn apply_cover_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        let width = clamp_cover_width(width);
+        if (self.browse.cover_width - width).abs() < 0.5 {
+            return;
+        }
+        self.browse.cover_width = width;
+        self.persist_cover_width();
+        cx.notify();
+    }
+
+    fn persist_cover_width(&mut self) {
+        match config::save_cover_width(self.browse.cover_width) {
+            Ok(()) => {
+                if self.browse.status.starts_with("Could not save cover width") {
+                    self.browse.status.clear();
+                }
+            }
+            Err(err) => {
+                self.browse.status = format!("Could not save cover width ({err}).");
+            }
+        }
     }
 
     fn launch_selected(&mut self) {
@@ -130,8 +189,8 @@ impl Render for Shell {
             .bg(background)
             .text_color(foreground)
             .font_family(font)
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                this.on_key(event, cx);
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.on_key(event, window, cx);
             }))
             .child(header(&self.browse, &theme_name, cx))
             .children(note_bar(&self.browse.library.note, cx))
@@ -141,7 +200,7 @@ impl Render for Shell {
                 &self.sidebar_scroll,
                 cx,
             ))
-            .child(status_line(&self.browse.status, cx))
+            .child(status_line(&self.browse, &self.cover_slider, window, cx))
     }
 }
 
@@ -177,7 +236,9 @@ fn header(browse: &Browse, theme_name: &str, cx: &App) -> impl IntoElement {
             .child(keycap("d", cx))
             .child("details")
             .child(keycap("esc", cx))
-            .child("clear"),
+            .child("clear")
+            .child(keycap("-/+", cx))
+            .child("size"),
     )
 }
 
@@ -331,7 +392,15 @@ fn grid(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl Int
         let mut row = div().flex().flex_row().flex_shrink_0().gap(px(TILE_GAP));
         for index in start..end {
             let game = &shelf.games[index];
-            row = row.child(tile(index, game, art, browse.game == Some(index), demo, cx));
+            row = row.child(tile(
+                index,
+                game,
+                art,
+                browse.cover_width,
+                browse.game == Some(index),
+                demo,
+                cx,
+            ));
         }
         pane = pane.child(row);
     }
@@ -342,12 +411,13 @@ fn tile(
     index: usize,
     game: &Game,
     art: GridArt,
+    cover_width: f32,
     selected: bool,
     demo: bool,
     cx: &Context<Shell>,
 ) -> impl IntoElement {
     let theme = cx.omarchy();
-    let frame = TileFrame::for_art(art);
+    let frame = TileFrame::for_art(art, cover_width);
     let title = game.title.clone();
     let cover = cover_path(game, art);
     // An explicit ratio stops GPUI from resizing the tile to the file's own ratio.
@@ -572,24 +642,65 @@ fn meta(text: String, cx: &App) -> impl IntoElement {
         .child(text)
 }
 
-fn status_line(status: &str, cx: &App) -> impl IntoElement {
+fn status_line(
+    browse: &Browse,
+    cover_slider: &Entity<SliderState>,
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) -> impl IntoElement {
     let theme = cx.omarchy();
-    let text = if status.is_empty() {
+    let text = if browse.status.is_empty() {
         "Import, scrape, and emulator setup stay on the GTK app."
     } else {
-        status
+        browse.status.as_str()
     };
     div()
-        .h(px(32.))
+        .h(px(40.))
         .flex()
         .items_center()
+        .gap(px(12.))
         .px(px(16.))
         .bg(theme.inset)
         .border_t_1()
         .border_color(theme.border)
         .text_size(px(12.))
         .text_color(theme.secondary)
-        .child(text.to_string())
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .child(text.to_string()),
+        )
+        .child(vertical_separator(cx))
+        .child(cover_width_control(browse, cover_slider, window, cx))
+}
+
+fn cover_width_control(
+    browse: &Browse,
+    cover_slider: &Entity<SliderState>,
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) -> impl IntoElement {
+    div()
+        .id("cover-width")
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap(px(8.))
+        .child("Size")
+        .child(
+            div()
+                .w(px(160.))
+                .flex_shrink_0()
+                .child(slider(cover_slider, false, window, cx)),
+        )
+        .child(
+            div()
+                .w(px(48.))
+                .flex_shrink_0()
+                .child(format!("{:.0}px", browse.cover_width)),
+        )
 }
 
 pub fn window_options() -> WindowOptions {

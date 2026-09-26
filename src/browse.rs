@@ -48,6 +48,8 @@ pub struct Browse {
     pub game: Option<usize>,
     pub details_open: bool,
     pub columns: usize,
+    /// One cover width for every system, in pixels.
+    pub cover_width: f32,
     pub status: String,
 }
 
@@ -59,6 +61,8 @@ pub enum Key {
     Clear,
     ToggleDetails,
     Launch,
+    CoverSmaller,
+    CoverLarger,
 }
 
 pub fn open_library() -> Library {
@@ -466,8 +470,12 @@ pub const GRID_PAD: f32 = 16.0;
 pub const TILE_GAP: f32 = 12.0;
 
 /// Shared cover width. Screenshot and box-art cards use it, so a 1280px window
-/// with both panes open shows about three columns.
-pub const COVER_WIDTH: f32 = 216.0;
+/// with both panes open shows about three columns. The shell can change it;
+/// this remains the default stored in config.
+pub use crate::config::{
+    clamp_cover_width, step_cover_width, COVER_WIDTH_DEFAULT as COVER_WIDTH, COVER_WIDTH_MAX,
+    COVER_WIDTH_MIN, COVER_WIDTH_STEP,
+};
 
 /// Fixed cover slot for one console grid. Every card in that grid uses the same
 /// size so keyboard columns and painted rows stay the same grid.
@@ -478,17 +486,18 @@ pub struct TileFrame {
 }
 
 impl TileFrame {
-    pub fn for_art(art: GridArt) -> Self {
+    pub fn for_art(art: GridArt, width: f32) -> Self {
+        let width = clamp_cover_width(width);
         match art {
             // 4:3. A screenshot fills the slot. Anything else is letterboxed inside it.
             GridArt::Screenshot => Self {
-                width: COVER_WIDTH,
-                height: COVER_WIDTH * 3.0 / 4.0,
+                width,
+                height: width * 3.0 / 4.0,
             },
             // Same width, 3:4. A box fills the taller slot. Contain does not crop it.
             GridArt::BoxArt => Self {
-                width: COVER_WIDTH,
-                height: COVER_WIDTH * 4.0 / 3.0,
+                width,
+                height: width * 4.0 / 3.0,
             },
         }
     }
@@ -510,6 +519,10 @@ pub fn file_for(game: &Game, kind: MediaKind) -> Option<PathBuf> {
 
 impl Browse {
     pub fn new(library: Library) -> Self {
+        Self::with_cover_width(library, COVER_WIDTH)
+    }
+
+    pub fn with_cover_width(library: Library, cover_width: f32) -> Self {
         let details_open = library.details_open;
         Self {
             library,
@@ -518,8 +531,16 @@ impl Browse {
             game: None,
             details_open,
             columns: 4,
+            cover_width: clamp_cover_width(cover_width),
             status: String::new(),
         }
+    }
+
+    /// Cover width from disk. A missing or unreadable config keeps [`COVER_WIDTH`].
+    pub fn saved_cover_width() -> f32 {
+        config::load_config()
+            .map(|config| config.cover_width)
+            .unwrap_or(COVER_WIDTH)
     }
 
     pub fn shelf(&self) -> Option<&Shelf> {
@@ -534,6 +555,8 @@ impl Browse {
     pub fn apply(&mut self, key: Key) {
         match key {
             Key::ToggleDetails => self.details_open = !self.details_open,
+            Key::CoverSmaller => self.cover_width = step_cover_width(self.cover_width, -1),
+            Key::CoverLarger => self.cover_width = step_cover_width(self.cover_width, 1),
             Key::Clear => {
                 self.game = None;
                 self.pane = Pane::Sidebar;
@@ -551,8 +574,8 @@ impl Browse {
 
     pub fn tile_frame(&self) -> TileFrame {
         self.shelf()
-            .map(|shelf| TileFrame::for_art(shelf.console.grid_art))
-            .unwrap_or_else(|| TileFrame::for_art(GridArt::BoxArt))
+            .map(|shelf| TileFrame::for_art(shelf.console.grid_art, self.cover_width))
+            .unwrap_or_else(|| TileFrame::for_art(GridArt::BoxArt, self.cover_width))
     }
 
     pub fn select_console(&mut self, index: usize) {
@@ -659,9 +682,19 @@ pub fn columns_for(width: f32, details_open: bool, tile_width: f32) -> usize {
 }
 
 pub fn key_from_name(name: &str, modified: bool) -> Option<Key> {
+    key_from_parts(name, None, modified)
+}
+
+/// `name` is the GPUI key. `key_char` is the typed character, used when a
+/// layout reports numpad `-` / `+` only there.
+pub fn key_from_parts(name: &str, key_char: Option<&str>, modified: bool) -> Option<Key> {
     if modified {
         return None;
     }
+    map_key(name).or_else(|| key_char.and_then(map_key))
+}
+
+fn map_key(name: &str) -> Option<Key> {
     Some(match name {
         "up" => Key::Arrow(NavDir::Up),
         "down" => Key::Arrow(NavDir::Down),
@@ -675,6 +708,10 @@ pub fn key_from_name(name: &str, modified: bool) -> Option<Key> {
         "escape" => Key::Clear,
         "d" => Key::ToggleDetails,
         "enter" => Key::Launch,
+        "-" | "minus" | "subtract" | "kp_subtract" | "numpadsubtract" => Key::CoverSmaller,
+        "+" | "plus" | "=" | "equal" | "equals" | "add" | "kp_add" | "numpadadd" => {
+            Key::CoverLarger
+        }
         _ => return None,
     })
 }
@@ -791,16 +828,27 @@ mod tests {
         assert_eq!(format_play_time(45), "45s");
         assert_eq!(format_play_time(120), "2m");
         assert_eq!(format_play_time(5400), "1h 30m");
-        let shot = TileFrame::for_art(GridArt::Screenshot);
-        let box_art = TileFrame::for_art(GridArt::BoxArt);
+        let shot = TileFrame::for_art(GridArt::Screenshot, COVER_WIDTH);
+        let box_art = TileFrame::for_art(GridArt::BoxArt, COVER_WIDTH);
         assert_eq!(shot.width, box_art.width);
         assert_eq!(shot.width, COVER_WIDTH);
         assert!(box_art.height > shot.height);
         assert!((shot.ratio() - 4.0 / 3.0).abs() < 0.001);
         assert!((box_art.ratio() - 3.0 / 4.0).abs() < 0.001);
+        let wide = TileFrame::for_art(GridArt::Screenshot, 320.0);
+        let tall = TileFrame::for_art(GridArt::BoxArt, 320.0);
+        assert_eq!(wide.width, 320.0);
+        assert_eq!(tall.width, 320.0);
+        assert!((wide.ratio() - 4.0 / 3.0).abs() < 0.001);
+        assert!((tall.ratio() - 3.0 / 4.0).abs() < 0.001);
+        assert!(tall.height > wide.height);
         assert_eq!(columns_for(1280.0, true, shot.width), 3);
         assert_eq!(columns_for(1280.0, true, box_art.width), 3);
         assert!(columns_for(1600.0, false, shot.width) > columns_for(1280.0, true, shot.width));
+        assert!(columns_for(1400.0, true, COVER_WIDTH) > columns_for(1400.0, true, 320.0));
+        assert!(columns_for(1280.0, true, COVER_WIDTH_MAX) >= 1);
+        assert!(columns_for(700.0, true, COVER_WIDTH_MAX) >= 1);
+        assert!(columns_for(1280.0, true, COVER_WIDTH_MIN) >= 1);
         assert_eq!(row_of(0, 3), 0);
         assert_eq!(row_of(5, 3), 1);
     }
@@ -821,6 +869,57 @@ mod tests {
         assert_eq!(browse.console, 0);
         assert_eq!(browse.game, None);
         assert_eq!(browse.pane, Pane::Sidebar);
+    }
+
+    #[test]
+    fn cover_width_steps_and_stays_global() {
+        let mut browse = sample();
+        assert_eq!(browse.cover_width, COVER_WIDTH);
+        browse.apply(Key::CoverLarger);
+        assert_eq!(browse.cover_width, COVER_WIDTH + COVER_WIDTH_STEP);
+        browse.apply(Key::CoverSmaller);
+        assert_eq!(browse.cover_width, COVER_WIDTH);
+
+        browse.cover_width = 250.0;
+        let before = browse.tile_frame();
+        browse.select_console(1);
+        assert_eq!(browse.shelf().unwrap().console.id, "genesis");
+        assert_eq!(browse.cover_width, 250.0);
+        assert_eq!(browse.tile_frame().width, before.width);
+        browse.select_console(2);
+        assert_eq!(browse.cover_width, 250.0);
+        assert_eq!(browse.tile_frame().width, 250.0);
+        // Box art is taller than a screenshot at the same width.
+        browse.select_console(0);
+        assert!(browse.tile_frame().height > TileFrame::for_art(GridArt::Screenshot, 250.0).height);
+
+        browse.cover_width = COVER_WIDTH_MAX;
+        browse.apply(Key::CoverLarger);
+        assert_eq!(browse.cover_width, COVER_WIDTH_MAX);
+        browse.cover_width = COVER_WIDTH_MIN;
+        browse.apply(Key::CoverSmaller);
+        assert_eq!(browse.cover_width, COVER_WIDTH_MIN);
+    }
+
+    #[test]
+    fn minus_and_plus_resize_covers() {
+        assert_eq!(key_from_name("-", false), Some(Key::CoverSmaller));
+        assert_eq!(key_from_name("+", false), Some(Key::CoverLarger));
+        assert_eq!(key_from_name("=", false), Some(Key::CoverLarger));
+        assert_eq!(key_from_name("subtract", false), Some(Key::CoverSmaller));
+        assert_eq!(key_from_name("add", false), Some(Key::CoverLarger));
+        assert_eq!(key_from_name("kp_subtract", false), Some(Key::CoverSmaller));
+        assert_eq!(key_from_name("kp_add", false), Some(Key::CoverLarger));
+        assert_eq!(
+            key_from_parts("unknown", Some("-"), false),
+            Some(Key::CoverSmaller)
+        );
+        assert_eq!(
+            key_from_parts("unknown", Some("+"), false),
+            Some(Key::CoverLarger)
+        );
+        assert_eq!(key_from_name("-", true), None);
+        assert_eq!(key_from_name("d", false), Some(Key::ToggleDetails));
     }
 
     #[test]

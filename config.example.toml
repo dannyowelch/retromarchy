@@ -1,6 +1,10 @@
 # Retromarchy Configuration Example
 # Copy this to ~/.config/retromarchy/config.toml and adjust paths
 
+# One cover width for every system's game grid, in pixels.
+# The GPUI shell slider and - / + keys step by 10 between 120 and 400.
+# cover_width = 216
+
 # Emulator profiles define how to launch games
 [[profiles]]
 type = "RetroArch"
