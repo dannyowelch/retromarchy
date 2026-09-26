@@ -55,6 +55,15 @@ pub struct Browse {
     pub status: String,
 }
 
+/// South (A) on the browse shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirm {
+    /// The system list entered the grid.
+    Entered,
+    /// The grid is focused and a game is selected. The shell launches it.
+    Launch,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Arrow(NavDir),
@@ -572,6 +581,31 @@ impl Browse {
         self.visible_games().count()
     }
 
+    /// South (A). An empty grid leaves the system list focused.
+    /// On the grid, this does not move; the shell launches when it returns [`Confirm::Launch`].
+    pub fn confirm(&mut self) -> Option<Confirm> {
+        match self.pane {
+            Pane::Sidebar => {
+                if self.visible_len() == 0 {
+                    return None;
+                }
+                self.enter_grid();
+                Some(Confirm::Entered)
+            }
+            Pane::Grid => self.game.map(|_| Confirm::Launch),
+        }
+    }
+
+    /// East (B). Focus returns to the system list. The game index stays,
+    /// so a later South re-enters on the same game. Escape still clears it.
+    pub fn back(&mut self) -> bool {
+        if self.pane != Pane::Grid {
+            return false;
+        }
+        self.pane = Pane::Sidebar;
+        true
+    }
+
     pub fn apply(&mut self, key: Key) {
         match key {
             Key::ToggleDetails => self.details_open = !self.details_open,
@@ -805,6 +839,79 @@ mod tests {
 
     fn sample() -> Browse {
         Browse::new(demo_library("Demo library."))
+    }
+
+    #[test]
+    fn south_enters_or_launches_and_east_keeps_the_game() {
+        let mut browse = sample();
+        assert!(!browse.back());
+        assert_eq!(browse.confirm(), Some(Confirm::Entered));
+        assert_eq!(browse.pane, Pane::Grid);
+        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        assert_eq!(browse.confirm(), Some(Confirm::Launch));
+        assert_eq!(browse.game, Some(0));
+        assert!(browse.back());
+        assert_eq!(browse.pane, Pane::Sidebar);
+        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        assert_eq!(browse.confirm(), Some(Confirm::Entered));
+        assert_eq!(browse.game, Some(0));
+        browse.apply(Key::Clear);
+        assert_eq!(browse.game, None);
+        assert_eq!(browse.pane, Pane::Sidebar);
+    }
+
+    #[test]
+    fn south_on_an_empty_grid_stays_on_the_system_list() {
+        let mut browse = sample();
+        browse.set_filter(GridFilter::Favorites);
+        assert_eq!(browse.visible_len(), 0);
+        assert_eq!(browse.confirm(), None);
+        assert_eq!(browse.pane, Pane::Sidebar);
+        assert_eq!(browse.game, None);
+    }
+
+    #[test]
+    fn a_held_direction_accelerates_across_the_grid() {
+        use crate::config::InputSettings;
+        use crate::gamepad::PadHeld;
+        use crate::input_repeat::HoldRepeat;
+        use gilrs::Button;
+
+        let mut browse = sample();
+        let extra: Vec<_> = (0..40)
+            .map(|index| demo_game("snes", &format!("Extra {index}"), 0, 0, None))
+            .collect();
+        browse.library.shelves[0].games.extend(extra);
+        browse.set_columns(8);
+        assert_eq!(browse.confirm(), Some(Confirm::Entered));
+
+        let mut pad = PadHeld::default();
+        assert_eq!(pad.apply_button(Button::DPadRight, true), None);
+        let mut hold = HoldRepeat::default();
+        let settings = InputSettings::default();
+        let mut gaps = Vec::new();
+        let mut last = None;
+        for now in (0..4_000u64).step_by(16) {
+            let before = browse.game;
+            let (step_x, step_y) = hold.poll(&settings, pad.horizontal(), pad.vertical(), now);
+            if let Some(dir) = step_x {
+                browse.apply(Key::Arrow(dir));
+            }
+            if let Some(dir) = step_y {
+                browse.apply(Key::Arrow(dir));
+            }
+            if browse.game != before {
+                if let Some(prev) = last {
+                    gaps.push(now - prev);
+                }
+                last = Some(now);
+            }
+        }
+        assert!(browse.game.unwrap() >= 25, "game {:?}", browse.game);
+        assert!(gaps.len() >= 20, "{gaps:?}");
+        assert!(gaps[0] >= 384, "{gaps:?}");
+        assert!(*gaps.last().unwrap() <= 80, "{gaps:?}");
+        assert!(gaps[0] > *gaps.last().unwrap() * 2, "{gaps:?}");
     }
 
     #[test]
