@@ -657,6 +657,19 @@ impl Browse {
         }
     }
 
+    /// Grid artwork for the console on screen. Other consoles stay as they are.
+    /// Returns whether the value changed.
+    pub fn set_grid_art(&mut self, art: GridArt) -> bool {
+        let Some(shelf) = self.library.shelves.get_mut(self.console) else {
+            return false;
+        };
+        if shelf.console.grid_art == art {
+            return false;
+        }
+        shelf.console.grid_art = art;
+        true
+    }
+
     pub fn set_filter(&mut self, filter: GridFilter) {
         if self.filter == filter {
             return;
@@ -861,6 +874,23 @@ pub fn scrape_chord(
         Some(ScrapeChord::Missing)
     } else {
         Some(ScrapeChord::Selected)
+    }
+}
+
+/// `1` is the first [`GridArt::ALL`] kind, `2` the next. Numpad and `digitN`
+/// names count. A digit past the enum is not a shortcut.
+pub fn grid_art_key(name: &str) -> Option<GridArt> {
+    let bare = name
+        .strip_prefix("digit")
+        .or_else(|| name.strip_prefix("numpad"))
+        .or_else(|| name.strip_prefix("kp_"))
+        .or_else(|| name.strip_prefix("kp"))
+        .unwrap_or(name);
+    let digit: usize = bare.parse().ok()?;
+    if (1..=9).contains(&digit) {
+        GridArt::ALL.get(digit - 1).copied()
+    } else {
+        None
     }
 }
 
@@ -1185,6 +1215,43 @@ mod tests {
         assert_eq!(key_from_name("d", false), Some(Key::ToggleDetails));
         assert_eq!(key_from_name("f", false), Some(Key::ToggleFavorite));
         assert_eq!(key_from_name("f", true), None);
+        assert_eq!(grid_art_key("1"), Some(GridArt::ALL[0]));
+        assert_eq!(grid_art_key("2"), Some(GridArt::ALL[1]));
+        assert_eq!(grid_art_key("digit1"), Some(GridArt::BoxArt));
+        assert_eq!(grid_art_key("kp_2"), Some(GridArt::Screenshot));
+        assert_eq!(grid_art_key("numpad2"), Some(GridArt::Screenshot));
+        assert_eq!(grid_art_key("3"), None);
+        assert_eq!(GridArt::default(), GridArt::ALL[0]);
+    }
+
+    #[test]
+    fn set_grid_art_is_per_console_and_changes_card_height() {
+        let mut browse = sample();
+        assert_eq!(browse.shelf().unwrap().console.grid_art, GridArt::BoxArt);
+        let tall = browse.tile_frame().height;
+        assert!(browse.set_grid_art(GridArt::Screenshot));
+        assert_eq!(
+            browse.shelf().unwrap().console.grid_art,
+            GridArt::Screenshot
+        );
+        assert!(browse.tile_frame().height < tall);
+        assert!(!browse.set_grid_art(GridArt::Screenshot));
+
+        browse.select_console(1);
+        assert_eq!(
+            browse.shelf().unwrap().console.grid_art,
+            GridArt::Screenshot
+        );
+        assert!(browse.set_grid_art(GridArt::BoxArt));
+        let genesis = browse.tile_frame().height;
+        browse.select_console(0);
+        assert_eq!(
+            browse.shelf().unwrap().console.grid_art,
+            GridArt::Screenshot
+        );
+        assert!(browse.tile_frame().height < genesis);
+        browse.select_console(1);
+        assert_eq!(browse.shelf().unwrap().console.grid_art, GridArt::BoxArt);
     }
 
     #[test]

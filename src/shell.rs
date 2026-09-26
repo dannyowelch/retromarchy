@@ -1,9 +1,9 @@
 use crate::appearance::{self, launchbox_theme, theme_key};
 use crate::browse::{
-    clamp_cover_width, columns_for, cover_path, file_for, format_play_time, image_aspect,
-    key_from_parts, resolve_profile, row_of, scrape_chord, Browse, Confirm, Key, LibraryKind, Pane,
-    ScrapeChord, TileFrame, COVER_WIDTH_MAX, COVER_WIDTH_MIN, COVER_WIDTH_STEP, DETAILS_PAD,
-    DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH, TILE_GAP,
+    clamp_cover_width, columns_for, cover_path, file_for, format_play_time, grid_art_key,
+    image_aspect, key_from_parts, resolve_profile, row_of, scrape_chord, Browse, Confirm, Key,
+    LibraryKind, Pane, ScrapeChord, TileFrame, COVER_WIDTH_MAX, COVER_WIDTH_MIN, COVER_WIDTH_STEP,
+    DETAILS_PAD, DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH, TILE_GAP,
 };
 use crate::config::{self, InputSettings};
 use crate::cores;
@@ -402,6 +402,18 @@ impl Shell {
         let keystroke = &event.keystroke;
         let modified =
             keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
+        if !modified {
+            if let Some(art) = grid_art_key(keystroke.key.as_str())
+                .or_else(|| keystroke.key_char.as_deref().and_then(grid_art_key))
+            {
+                if !event.is_held && self.browse.set_grid_art(art) {
+                    self.persist_grid_art();
+                    cx.notify();
+                }
+                cx.stop_propagation();
+                return;
+            }
+        }
         let Some(key) = key_from_parts(
             keystroke.key.as_ref(),
             keystroke.key_char.as_deref(),
@@ -1539,6 +1551,27 @@ impl Shell {
         cx.notify();
     }
 
+    fn persist_grid_art(&mut self) {
+        if self.browse.library.kind != LibraryKind::Disk {
+            return;
+        }
+        let Some(shelf) = self.browse.shelf() else {
+            return;
+        };
+        let id = shelf.console.id.clone();
+        let art = shelf.console.grid_art;
+        match config::save_console_grid_art(&id, art) {
+            Ok(()) => {
+                if self.browse.status.starts_with("Could not save grid art") {
+                    self.browse.status.clear();
+                }
+            }
+            Err(err) => {
+                self.browse.status = format!("Could not save grid art ({err}).");
+            }
+        }
+    }
+
     fn persist_cover_width(&mut self) {
         match config::save_cover_width(self.browse.cover_width) {
             Ok(()) => {
@@ -2480,7 +2513,84 @@ fn status_line(
                 .child(text.to_string()),
         )
         .child(vertical_separator(cx))
+        .child(grid_art_control(browse, cx))
+        .child(vertical_separator(cx))
         .child(cover_width_control(browse, cover_slider, window, cx))
+}
+
+fn grid_art_control(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let current = browse
+        .shelf()
+        .map(|shelf| shelf.console.grid_art)
+        .unwrap_or_default();
+    let mut segments = div()
+        .id("grid-art")
+        .flex()
+        .flex_shrink_0()
+        .border_1()
+        .border_color(theme.border);
+    for (index, art) in GridArt::ALL.into_iter().enumerate() {
+        segments = segments.child(grid_art_segment(art, index, art == current, index > 0, cx));
+    }
+    with_tooltip(
+        div()
+            .id("grid-art-control")
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(8.))
+            .child("Art")
+            .child(segments),
+        grid_art_tip(),
+    )
+}
+
+fn grid_art_tip() -> String {
+    let keys = GridArt::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, art)| format!("{} {}", index + 1, art.label()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Grid artwork for this system ({keys})")
+}
+
+fn grid_art_segment(
+    art: GridArt,
+    index: usize,
+    on: bool,
+    divider: bool,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let mut segment = div()
+        .id(("grid-art", index))
+        .px(px(8.))
+        .py(px(4.))
+        .text_size(px(12.))
+        .cursor_pointer()
+        .bg(if on {
+            theme.selected_fill()
+        } else {
+            theme.background
+        })
+        .text_color(if on { theme.accent } else { theme.foreground })
+        .hover(|style| style.bg(theme.hover_fill()))
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                if this.browse.set_grid_art(art) {
+                    this.persist_grid_art();
+                }
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+        .child(format!("{} {}", index + 1, art.label()));
+    if divider {
+        segment = segment.border_l_1().border_color(theme.border);
+    }
+    segment
 }
 
 fn cover_width_control(

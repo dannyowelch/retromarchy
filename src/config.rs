@@ -1,4 +1,4 @@
-use crate::types::{Console, EmulatorProfile, ScraperConfig};
+use crate::types::{Console, EmulatorProfile, GridArt, ScraperConfig};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -190,6 +190,21 @@ pub fn config_from_toml(content: &str) -> Result<Config> {
     config.input.sanitize();
     config.cover_width = clamp_cover_width(config.cover_width);
     Ok(config)
+}
+
+/// Load config, store one console's `grid_art`, and write the file back.
+/// Other consoles, cover width, theme, and scraper settings stay as they were.
+pub fn save_console_grid_art(console_id: &str, art: GridArt) -> Result<()> {
+    let mut config = load_config()?;
+    {
+        let console = config
+            .consoles
+            .iter_mut()
+            .find(|console| console.id == console_id)
+            .with_context(|| format!("No console {console_id} in config"))?;
+        console.grid_art = art;
+    }
+    save_config(&config)
 }
 
 /// Load config, store one global cover width, and write it back.
@@ -447,6 +462,44 @@ screenshot = false
         assert_eq!(loaded.input.initial_delay_ms, 250);
         assert_eq!(loaded.cover_width, 250.0);
         assert_eq!(loaded.consoles[0].grid_art, GridArt::Screenshot);
+    }
+
+    #[test]
+    fn save_console_grid_art_writes_one_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvLock::set("XDG_CONFIG_HOME", dir.path());
+        let mut config = Config::default();
+        config.cover_width = 180.0;
+        config.consoles.push(Console {
+            id: "snes".into(),
+            name: "Super Nintendo".into(),
+            rom_dirs: Vec::new(),
+            extensions: vec!["sfc".into()],
+            profile: None,
+            grid_art: GridArt::BoxArt,
+            media: MediaToggles::default(),
+        });
+        config.consoles.push(Console {
+            id: "genesis".into(),
+            name: "Sega Genesis".into(),
+            rom_dirs: Vec::new(),
+            extensions: vec!["md".into()],
+            profile: None,
+            grid_art: GridArt::BoxArt,
+            media: MediaToggles::default(),
+        });
+        save_config(&config).unwrap();
+
+        save_console_grid_art("snes", GridArt::Screenshot).unwrap();
+        let loaded = load_config().unwrap();
+        assert_eq!(loaded.consoles[0].grid_art, GridArt::Screenshot);
+        assert_eq!(loaded.consoles[1].grid_art, GridArt::BoxArt);
+        assert_eq!(loaded.cover_width, 180.0);
+        assert_eq!(loaded.consoles[0].name, "Super Nintendo");
+
+        let err = save_console_grid_art("missing", GridArt::Screenshot).unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
+        assert_eq!(load_config().unwrap().consoles[1].id, "genesis");
     }
 
     #[test]
