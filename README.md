@@ -35,7 +35,7 @@ If the config has no consoles, the center pane is empty and offers **Import ROMs
 - Arrow keys, the d-pad, and the left stick move the focused pane. Right, or Tab, or A (South) enters the grid. Left on the first column of a row returns to the console list and clears the game. B (East) returns to the console list and keeps the selected game.
 - Holding a direction repeats on one clock. The first step is immediate. The next waits `initial_delay_ms`, then the gap eases from `slow_interval_ms` to `fast_interval_ms` over `ramp_ms`. A held arrow wins over the pad on that axis. A, B, and Y do not repeat. The shell reads `[input]` from the config at startup, the same keys GTK Options → Input writes. Missing fields use 400, 180, 50, and 2000.
 - `h` `j` `k` `l` step the grid. They are not on the hold-repeat clock.
-- Enter, or A on a selected game, launches it with the existing profile resolver. The status line names the error when the system has no profile. This shell does not write play time back to the database.
+- Enter, or A on a selected game, launches it with the profile resolver. The status line names the error when the system has no profile. This shell does not write play time back to the database.
 - `d` shows or hides the details pane.
 - `f` toggles a favorite on the selected game. Gamepad Y (North) does the same. The header has an All / Favorites control for the current console. A filled heart on the card and in the details pane means favorited. Disk libraries write the flag through the SQLite library; the demo library keeps it in memory until you quit.
 - The Menu key, Shift+F10, or Select (Back / View) opens the game menu on the selected game. Right-click a card does the same. The rows are Scrape, Rename, and Delete. Arrows or `j` / `k` move, Enter or A chooses, Escape or B closes. A click outside the menu closes it.
@@ -44,10 +44,11 @@ If the config has no consoles, the center pane is empty and offers **Import ROMs
 - Escape clears the selected game when the menu is closed. B does not.
 - `-` and `+` (or `=`, and the numpad equivalents) change the game-grid cover width by 10px. The same width is used for every system and saved as `cover_width` in the config. The range is 120–400. The status bar slider does the same thing.
 - Ctrl+I opens the ROM import wizard. The header **Import ROMs** button does the same, and so does the button on an empty library. The steps match GTK: an ES-DE / EmulationStation root, or one system. Arrows, Tab, and Enter move. Esc closes. Gamepad A confirms and B closes. Scan runs off the UI thread. **Browse…** uses GPUI's folder prompt (`prompt_for_paths`, the XDG desktop portal). The path field is always there, prefilled with `~/ROMs`, when the portal is unavailable.
+- Ctrl+M or Ctrl+E opens Manage Emulators. The header button and the empty-library button do the same. The dialog lists discovered RetroArch cores when `retroarch` is on `PATH`, adds a core profile or a standalone command, deletes a profile, and sets each console's default profile. Changes are written to `config.toml` as you confirm them. Arrows, Tab, and Enter move. Esc closes. Gamepad A confirms and B closes. Launching a game uses the new assignment without restarting.
 
 ## Not in this branch
 
-Emulator setup and the LaunchBox theme toggle stay in the GTK app on `main`. The import wizard does not assign emulator profiles. GTK keeps that in Manage Emulators, which this shell does not open. This shell reads the d-pad, the left stick, A, B, Y, and Select. `src/ui.rs` and `src/dialogs.rs` are the GTK window. This binary does not compile them.
+The LaunchBox theme toggle stays in the GTK app on `main`. The import wizard does not assign emulator profiles. This shell reads the d-pad, the left stick, A, B, Y, and Select. `src/ui.rs` and `src/dialogs.rs` are the GTK window. This binary does not compile them.
 
 Scan, config, the SQLite library, and launch command building are the library crate. `cargo test` runs those tests. The binary is the shell.
 

@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod config;
 pub mod cores;
 pub mod database;
+pub mod emulators;
 pub mod game_menu;
 pub mod gamepad;
 pub mod import_wizard;
