@@ -1,10 +1,8 @@
-use crate::types::EmulatorProfile;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// A libretro `.so` found on disk. [`DiscoveredCore::to_profile`] is the only
-/// way a discovered core becomes a RetroArch profile.
+/// A libretro `.so` found on disk. The Systems tab lists these as core choices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredCore {
     /// File name with `_libretro` and `.so` removed (`stella_libretro.so` → `stella`).
@@ -12,42 +10,11 @@ pub struct DiscoveredCore {
     pub path: PathBuf,
 }
 
-/// Discovered core → RetroArch profile, given the profiles already saved.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CoreProfile {
-    /// Some RetroArch profile already points at this core file.
-    AlreadyAdded { id: String },
-    /// New profile. The id is the core name, or `name-2`, `name-3`, … when taken.
-    New(EmulatorProfile),
-}
-
 impl DiscoveredCore {
     pub fn from_path(path: PathBuf) -> Option<Self> {
         let file_name = path.file_name()?.to_str()?;
         let name = display_name(file_name)?;
         Some(Self { name, path })
-    }
-
-    pub fn to_profile(&self, existing: &[EmulatorProfile]) -> CoreProfile {
-        if let Some(id) = existing.iter().find_map(|profile| match profile {
-            EmulatorProfile::RetroArch { id, core, .. } if same_file(core, &self.path) => {
-                Some(id.clone())
-            }
-            _ => None,
-        }) {
-            return CoreProfile::AlreadyAdded { id };
-        }
-        CoreProfile::New(EmulatorProfile::RetroArch {
-            id: unique_id(&self.name, existing),
-            core: self.path.clone(),
-            config: None,
-        })
-    }
-
-    /// Catalog system ids this core clearly runs. Callers may assign only
-    /// systems that are already present in the user's config.
-    pub fn system_ids(&self) -> &'static [&'static str] {
-        system_ids_for_core(&self.name)
     }
 }
 
@@ -202,99 +169,10 @@ fn display_name(file_name: &str) -> Option<String> {
     }
 }
 
-fn unique_id(base: &str, existing: &[EmulatorProfile]) -> String {
-    if !existing.iter().any(|profile| profile.id() == base) {
-        return base.to_string();
-    }
-    let mut n = 2u32;
-    loop {
-        let candidate = format!("{base}-{n}");
-        if !existing.iter().any(|profile| profile.id() == &candidate) {
-            return candidate;
-        }
-        n += 1;
-    }
-}
-
-fn same_file(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
-    }
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
-}
-
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
-}
-
-/// Core stem → catalog system ids. Longest matching stem wins.
-const CORE_SYSTEMS: &[(&str, &[&str])] = &[
-    ("nestopia", &["nes"]),
-    ("fceumm", &["nes"]),
-    ("quicknes", &["nes"]),
-    ("mesen", &["nes"]),
-    ("snes9x", &["snes"]),
-    ("bsnes", &["snes"]),
-    ("mesen-s", &["snes"]),
-    ("stella", &["atari2600"]),
-    ("stella2014", &["atari2600"]),
-    ("prosystem", &["atari7800"]),
-    ("a5200", &["atari5200"]),
-    ("gambatte", &["gb", "gbc"]),
-    ("sameboy", &["gb", "gbc"]),
-    ("gearboy", &["gb", "gbc"]),
-    ("mgba", &["gba"]),
-    ("vbam", &["gba"]),
-    ("gpsp", &["gba"]),
-    ("mednafen_gba", &["gba"]),
-    ("mupen64plus_next", &["n64"]),
-    ("mupen64plus", &["n64"]),
-    ("parallel_n64", &["n64"]),
-    ("genesis_plus_gx", &["genesis", "megadrive"]),
-    ("picodrive", &["genesis", "megadrive"]),
-    ("pcsx_rearmed", &["psx"]),
-    ("swanstation", &["psx"]),
-    ("beetle_psx_hw", &["psx"]),
-    ("beetle_psx", &["psx"]),
-    ("mednafen_pce", &["pcengine"]),
-    ("melonds", &["nds"]),
-    ("desmume", &["nds"]),
-    ("flycast", &["dreamcast"]),
-    ("ppsspp", &["psp"]),
-    ("handy", &["atarilynx"]),
-    ("mednafen_wswan", &["wonderswan", "wonderswancolor"]),
-    ("fbneo", &["fbneo", "neogeo", "arcade"]),
-    ("opera", &["3do"]),
-    ("virtualjaguar", &["atarijaguar"]),
-];
-
-fn system_ids_for_core(name: &str) -> &'static [&'static str] {
-    let key = name.to_ascii_lowercase();
-    let mut best: Option<(usize, &'static [&'static str])> = None;
-    for &(core, systems) in CORE_SYSTEMS {
-        if !core_name_matches(&key, core) {
-            continue;
-        }
-        if best.map(|(len, _)| core.len() > len).unwrap_or(true) {
-            best = Some((core.len(), systems));
-        }
-    }
-    best.map(|(_, systems)| systems).unwrap_or(&[])
-}
-
-fn core_name_matches(key: &str, core: &str) -> bool {
-    let Some(rest) = key.strip_prefix(core) else {
-        return false;
-    };
-    rest.is_empty()
-        || rest.starts_with('_')
-        || rest.starts_with('-')
-        || rest.chars().all(|c| c.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -309,62 +187,6 @@ mod tests {
         assert_eq!(core.name, "snes9x");
         assert!(DiscoveredCore::from_path(PathBuf::from("/tmp/readme.txt")).is_none());
         assert!(DiscoveredCore::from_path(PathBuf::from("/tmp/_libretro.so")).is_none());
-    }
-
-    #[test]
-    fn discovered_core_becomes_retroarch_profile() {
-        let core = DiscoveredCore::from_path(PathBuf::from("/usr/lib/libretro/stella_libretro.so"))
-            .unwrap();
-        let CoreProfile::New(profile) = core.to_profile(&[]) else {
-            panic!("expected a new profile");
-        };
-        match &profile {
-            EmulatorProfile::RetroArch { id, core, config } => {
-                assert_eq!(id, "stella");
-                assert_eq!(core, &PathBuf::from("/usr/lib/libretro/stella_libretro.so"));
-                assert!(config.is_none());
-            }
-            EmulatorProfile::Standalone { .. } => panic!("expected RetroArch"),
-        }
-
-        #[derive(serde::Serialize)]
-        struct Profiles {
-            profiles: Vec<EmulatorProfile>,
-        }
-        let text = toml::to_string_pretty(&Profiles {
-            profiles: vec![profile],
-        })
-        .unwrap();
-        assert!(text.contains("type = 'RetroArch'"), "{text}");
-        assert!(text.contains("id = 'stella'"), "{text}");
-        assert!(
-            text.contains("core = '/usr/lib/libretro/stella_libretro.so'"),
-            "{text}"
-        );
-        assert!(!text.contains("config"), "{text}");
-    }
-
-    #[test]
-    fn profile_id_is_unique_and_same_file_is_already_added() {
-        let core = DiscoveredCore::from_path(PathBuf::from("/cores/nestopia_libretro.so")).unwrap();
-        let taken = EmulatorProfile::Standalone {
-            id: "nestopia".to_string(),
-            command: "echo {rom}".to_string(),
-        };
-        let CoreProfile::New(profile) = core.to_profile(&[taken]) else {
-            panic!("expected a new profile");
-        };
-        assert_eq!(profile.id(), "nestopia-2");
-
-        let existing = EmulatorProfile::RetroArch {
-            id: "nes-core".to_string(),
-            core: PathBuf::from("/cores/nestopia_libretro.so"),
-            config: None,
-        };
-        match core.to_profile(&[existing]) {
-            CoreProfile::AlreadyAdded { id } => assert_eq!(id, "nes-core"),
-            CoreProfile::New(_) => panic!("expected the existing profile"),
-        }
     }
 
     #[test]
@@ -436,17 +258,5 @@ libretro_directory = "local-cores" # trailing comment
     fn unreadable_cfg_is_skipped() {
         let missing = Path::new("/this/config/does/not/exist/retroarch.cfg");
         assert!(libretro_directory(missing, Some(Path::new("/home/player"))).is_none());
-    }
-
-    #[test]
-    fn core_names_map_to_known_systems_only() {
-        assert_eq!(system_ids_for_core("nestopia"), &["nes"]);
-        assert_eq!(system_ids_for_core("fceumm"), &["nes"]);
-        assert_eq!(system_ids_for_core("snes9x"), &["snes"]);
-        assert_eq!(system_ids_for_core("snes9x2010"), &["snes"]);
-        assert_eq!(system_ids_for_core("stella"), &["atari2600"]);
-        assert_eq!(system_ids_for_core("mesen"), &["nes"]);
-        assert_eq!(system_ids_for_core("mesen-s"), &["snes"]);
-        assert!(system_ids_for_core("not_a_core").is_empty());
     }
 }

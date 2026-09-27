@@ -761,7 +761,9 @@ mod tests {
             name: "Super Nintendo".into(),
             rom_dirs: vec![],
             extensions: vec!["sfc".into()],
-            profile: Some("snes9x".into()),
+            emulator: Some("snes9x".into()),
+            core: None,
+            extra_args: String::new(),
             grid_art: GridArt::BoxArt,
             media: MediaToggles::default(),
         });
@@ -796,7 +798,7 @@ mod tests {
         assert_eq!(loaded.cover_width, 220.0);
         assert_eq!(loaded.input.initial_delay_ms, 500);
         assert_eq!(loaded.consoles[0].name, "Super Nintendo");
-        assert_eq!(loaded.consoles[0].profile.as_deref(), Some("snes9x"));
+        assert_eq!(loaded.consoles[0].emulator.as_deref(), Some("snes9x"));
         assert!(loaded.scraper.box_art);
         assert!(!loaded.scraper.screenshot);
         assert_eq!(

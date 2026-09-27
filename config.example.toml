@@ -15,27 +15,29 @@
 # The GPUI shell slider and - / + keys step by 10 between 120 and 400.
 # cover_width = 216
 
-# Emulator profiles define how to launch games
-[[profiles]]
-type = "RetroArch"
-id = "retroarch-snes9x"
-core = "/usr/lib/libretro/snes9x_libretro.so"
-# config = "/home/user/.config/retroarch/snes.cfg"  # Optional
+# Emulators are installed programs. RetroArch is one entry. Cores are per system.
+# Launch is: path, global_args, then `-L <core>` for RetroArch, then extra_args, then the ROM.
+# `{rom}` in global_args or extra_args is replaced, and the ROM is not added again.
+[[emulators]]
+id = "retroarch"
+name = "RetroArch"
+kind = "RetroArch"
+path = "retroarch"
+global_args = ""
 
-[[profiles]]
-type = "RetroArch"
-id = "retroarch-genesis-plus-gx"
-core = "/usr/lib/libretro/genesis_plus_gx_libretro.so"
-
-[[profiles]]
-type = "Standalone"
+[[emulators]]
 id = "dolphin"
-command = "dolphin-emu -b -e {rom}"
+name = "Dolphin"
+kind = "Standalone"
+path = "dolphin-emu"
+global_args = "-b -e {rom}"
 
-[[profiles]]
-type = "Standalone"
+[[emulators]]
 id = "pcsx2"
-command = "pcsx2 --fullscreen {rom}"
+name = "PCSX2"
+kind = "Standalone"
+path = "pcsx2"
+global_args = "--fullscreen"
 
 # Console definitions
 [[consoles]]
@@ -43,7 +45,9 @@ id = "snes"
 name = "Super Nintendo"
 rom_dirs = ["/home/user/roms/snes"]
 extensions = ["sfc", "smc", "zip"]
-profile = "retroarch-snes9x"
+emulator = "retroarch"
+core = "/usr/lib/libretro/snes9x_libretro.so"
+extra_args = ""
 grid_art = "box_art"
 
 [consoles.media]
@@ -57,7 +61,8 @@ id = "genesis"
 name = "Sega Genesis"
 rom_dirs = ["/home/user/roms/genesis"]
 extensions = ["md", "bin", "zip"]
-profile = "retroarch-genesis-plus-gx"
+emulator = "retroarch"
+core = "/usr/lib/libretro/genesis_plus_gx_libretro.so"
 
 [consoles.media]
 box_art = true
@@ -70,7 +75,7 @@ id = "gamecube"
 name = "Nintendo GameCube"
 rom_dirs = ["/home/user/roms/gamecube"]
 extensions = ["iso", "gcm"]
-profile = "dolphin"
+emulator = "dolphin"
 
 [consoles.media]
 box_art = true

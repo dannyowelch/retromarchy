@@ -1,10 +1,11 @@
-use crate::types::{Console, EmulatorProfile, GridArt, ScraperConfig};
+use crate::types::{Console, Emulator, EmulatorKind, GridArt, ScraperConfig};
 use anyhow::{Context, Result};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const INPUT_MS_MAX: u32 = 60_000;
@@ -177,7 +178,7 @@ pub struct Config {
     #[serde(default)]
     pub system_sort: SystemSort,
     #[serde(default)]
-    pub profiles: Vec<EmulatorProfile>,
+    pub emulators: Vec<Emulator>,
     #[serde(default)]
     pub consoles: Vec<Console>,
     #[serde(default)]
@@ -201,7 +202,7 @@ impl Default for Config {
             details_visible: default_true(),
             cover_width: default_cover_width(),
             system_sort: SystemSort::Name,
-            profiles: Vec::new(),
+            emulators: Vec::new(),
             consoles: Vec::new(),
             scraper: ScraperConfig::default(),
             input: InputSettings::default(),
@@ -254,18 +255,340 @@ pub fn load_config() -> Result<Config> {
         save_config(&config)?;
         return Ok(config);
     }
-    let content = fs::read_to_string(&path)
+    let bytes = fs::read(&path)
         .with_context(|| format!("Failed to read config from {}", path.display()))?;
-    config_from_toml(&content)
-        .with_context(|| format!("Failed to parse config from {}", path.display()))
+    let content = String::from_utf8(bytes.clone())
+        .with_context(|| format!("Failed to read config from {}", path.display()))?;
+    let (config, migrated) = parse_config(&content)
+        .with_context(|| format!("Failed to parse config from {}", path.display()))?;
+    if migrated {
+        preserve_pre_migration(&path, &bytes)?;
+        save_config(&config)?;
+    }
+    Ok(config)
 }
 
-/// Parse config text. Clamps `[input]` and `cover_width`.
+fn migration_backup_path(path: &Path) -> PathBuf {
+    path.with_file_name("config.toml.pre-emulators.bak")
+}
+
+/// Copy the pre-migration bytes beside `path`. An existing backup stays.
+fn preserve_pre_migration(path: &Path, original: &[u8]) -> Result<()> {
+    let backup = migration_backup_path(path);
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&backup)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("Failed to back up config to {}", backup.display()))
+        }
+    };
+    file.write_all(original)
+        .with_context(|| format!("Failed to back up config to {}", backup.display()))?;
+    Ok(())
+}
+
+/// Parse config text. An old `[[profiles]]` file is migrated in memory.
+/// Clamps `[input]` and `cover_width`.
 pub fn config_from_toml(content: &str) -> Result<Config> {
-    let mut config: Config = toml::from_str(content)?;
+    Ok(parse_config(content)?.0)
+}
+
+fn parse_config(content: &str) -> Result<(Config, bool)> {
+    let mut value: toml::Value = toml::from_str(content)?;
+    let migrated = migrate_profiles(&mut value);
+    let rendered = toml::to_string(&value)?;
+    let mut config: Config = toml::from_str(&rendered)?;
     config.input.sanitize();
     config.cover_width = clamp_cover_width(config.cover_width);
-    Ok(config)
+    Ok((config, migrated))
+}
+
+/// Collapse per-core RetroArch profiles into one RetroArch emulator and turn
+/// each standalone profile into an emulator. Console `profile` ids become
+/// `emulator`, `core`, and `extra_args`.
+fn migrate_profiles(value: &mut toml::Value) -> bool {
+    let Some(root) = value.as_table_mut() else {
+        return false;
+    };
+    let profiles = match root.remove("profiles") {
+        Some(toml::Value::Array(items)) => items,
+        Some(other) => {
+            root.insert("profiles".into(), other);
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    let mut changed = !profiles.is_empty();
+    let mut taken = emulator_ids(root.get("emulators"));
+    let mut retro_id = existing_retroarch_id(root.get("emulators"));
+    let mut assignments: Vec<(String, Assignment)> = Vec::new();
+
+    for profile in &profiles {
+        let Some(table) = profile.as_table() else {
+            continue;
+        };
+        let Some(id) = table.get("id").and_then(|item| item.as_str()) else {
+            continue;
+        };
+        let kind = table
+            .get("type")
+            .and_then(|item| item.as_str())
+            .and_then(EmulatorKind::parse);
+        match kind {
+            Some(EmulatorKind::RetroArch) => {
+                let core = table
+                    .get("core")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let extra_args = table
+                    .get("config")
+                    .and_then(|item| item.as_str())
+                    .filter(|path| !path.is_empty())
+                    .map(|path| shell_words::join(["--config", path]))
+                    .unwrap_or_default();
+                if retro_id.is_none() {
+                    let id = fresh_id("retroarch", &mut taken);
+                    push_emulator(
+                        root,
+                        &id,
+                        "RetroArch",
+                        EmulatorKind::RetroArch,
+                        "retroarch",
+                        "",
+                    );
+                    retro_id = Some(id);
+                }
+                if let Some(emulator_id) = &retro_id {
+                    assignments.push((
+                        id.to_string(),
+                        Assignment {
+                            emulator_id: emulator_id.clone(),
+                            core,
+                            extra_args,
+                        },
+                    ));
+                }
+            }
+            Some(EmulatorKind::Standalone) => {
+                let command = table
+                    .get("command")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("");
+                let (path, global_args) = split_command(command);
+                let emulator_id = if taken.contains(id) {
+                    id.to_string()
+                } else {
+                    let emulator_id = fresh_id(id, &mut taken);
+                    let name = if id.is_empty() {
+                        path.clone()
+                    } else {
+                        id.to_string()
+                    };
+                    push_emulator(
+                        root,
+                        &emulator_id,
+                        &name,
+                        EmulatorKind::Standalone,
+                        &path,
+                        &global_args,
+                    );
+                    emulator_id
+                };
+                assignments.push((
+                    id.to_string(),
+                    Assignment {
+                        emulator_id,
+                        core: String::new(),
+                        extra_args: String::new(),
+                    },
+                ));
+            }
+            None => {}
+        }
+    }
+
+    if let Some(consoles) = root
+        .get_mut("consoles")
+        .and_then(|item| item.as_array_mut())
+    {
+        for console in consoles.iter_mut() {
+            let Some(table) = console.as_table_mut() else {
+                continue;
+            };
+            let Some(profile) = table
+                .remove("profile")
+                .and_then(|item| item.as_str().map(str::to_string))
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            changed = true;
+            if table
+                .get("emulator")
+                .and_then(|item| item.as_str())
+                .is_some_and(|id| !id.is_empty())
+            {
+                continue;
+            }
+            if let Some(assignment) = assignments.iter().find(|(id, _)| id == &profile) {
+                table.insert(
+                    "emulator".into(),
+                    toml::Value::String(assignment.1.emulator_id.clone()),
+                );
+                if !assignment.1.core.is_empty()
+                    && table.get("core").and_then(|item| item.as_str()).is_none()
+                {
+                    table.insert(
+                        "core".into(),
+                        toml::Value::String(assignment.1.core.clone()),
+                    );
+                }
+                if !assignment.1.extra_args.is_empty()
+                    && table
+                        .get("extra_args")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("")
+                        .is_empty()
+                {
+                    table.insert(
+                        "extra_args".into(),
+                        toml::Value::String(assignment.1.extra_args.clone()),
+                    );
+                }
+            } else {
+                table.insert("emulator".into(), toml::Value::String(profile));
+            }
+        }
+    }
+    changed
+}
+
+struct Assignment {
+    emulator_id: String,
+    core: String,
+    extra_args: String,
+}
+
+fn emulator_ids(value: Option<&toml::Value>) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    let Some(items) = value.and_then(|item| item.as_array()) else {
+        return ids;
+    };
+    for item in items {
+        if let Some(id) = item
+            .as_table()
+            .and_then(|table| table.get("id"))
+            .and_then(|id| id.as_str())
+            .filter(|id| !id.is_empty())
+        {
+            ids.insert(id.to_string());
+        }
+    }
+    ids
+}
+
+fn existing_retroarch_id(value: Option<&toml::Value>) -> Option<String> {
+    let items = value?.as_array()?;
+    items.iter().find_map(|item| {
+        let table = item.as_table()?;
+        let kind = table.get("kind")?.as_str()?;
+        if EmulatorKind::parse(kind) == Some(EmulatorKind::RetroArch) {
+            table
+                .get("id")
+                .and_then(|id| id.as_str())
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        } else {
+            None
+        }
+    })
+}
+
+fn fresh_id(base: &str, taken: &mut std::collections::BTreeSet<String>) -> String {
+    let base = if base.is_empty() { "emulator" } else { base };
+    let mut id = base.to_string();
+    let mut n = 2u32;
+    while taken.contains(&id) {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+    taken.insert(id.clone());
+    id
+}
+
+fn push_emulator(
+    root: &mut toml::value::Table,
+    id: &str,
+    name: &str,
+    kind: EmulatorKind,
+    path: &str,
+    global_args: &str,
+) {
+    let mut table = toml::value::Table::new();
+    table.insert("id".into(), toml::Value::String(id.to_string()));
+    table.insert("name".into(), toml::Value::String(name.to_string()));
+    table.insert("kind".into(), toml::Value::String(kind.label().to_string()));
+    table.insert("path".into(), toml::Value::String(path.to_string()));
+    if !global_args.is_empty() {
+        table.insert(
+            "global_args".into(),
+            toml::Value::String(global_args.to_string()),
+        );
+    }
+    let list = root
+        .entry("emulators")
+        .or_insert(toml::Value::Array(Vec::new()));
+    if let Some(items) = list.as_array_mut() {
+        items.push(toml::Value::Table(table));
+    }
+}
+
+/// Program token, then the rest of the command with its original quoting.
+fn split_command(command: &str) -> (String, String) {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return (String::new(), String::new());
+    }
+    let path = shell_words::split(trimmed)
+        .ok()
+        .and_then(|parts| parts.into_iter().next())
+        .unwrap_or_else(|| trimmed.to_string());
+    (path, raw_after_first(trimmed))
+}
+
+fn raw_after_first(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if index >= bytes.len() {
+        return String::new();
+    }
+    let mut quoted = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' && index + 1 < bytes.len() {
+            index += 2;
+            continue;
+        }
+        if byte == b'"' || byte == b'\'' {
+            quoted = !quoted;
+            index += 1;
+            continue;
+        }
+        if byte.is_ascii_whitespace() && !quoted {
+            break;
+        }
+        index += 1;
+    }
+    input[index..].trim().to_string()
 }
 
 /// Load config, store one console's `grid_art`, and write the file back.
@@ -298,7 +621,7 @@ pub fn save_input_settings(input: InputSettings) -> Result<()> {
 }
 
 /// Load config, replace `[scraper]`, and write the file back.
-/// Theme, input, consoles, and profiles stay as they were.
+/// Theme, input, consoles, and emulators stay as they were.
 pub fn save_scraper_settings(scraper: ScraperConfig) -> Result<()> {
     let mut config = load_config()?;
     config.scraper = scraper;
@@ -365,7 +688,9 @@ mod tests {
                 name: "Super Nintendo".into(),
                 rom_dirs: vec![],
                 extensions: vec!["sfc".into()],
-                profile: None,
+                emulator: None,
+                core: None,
+                extra_args: String::new(),
                 grid_art: GridArt::Screenshot,
                 media: MediaToggles::default(),
             }],
@@ -487,7 +812,9 @@ screenshot = false
             name: "NES".into(),
             rom_dirs: Vec::new(),
             extensions: vec!["nes".into()],
-            profile: None,
+            emulator: None,
+            core: None,
+            extra_args: String::new(),
             grid_art: GridArt::Screenshot,
             media: MediaToggles::default(),
         });
@@ -517,7 +844,9 @@ screenshot = false
             name: "NES".into(),
             rom_dirs: Vec::new(),
             extensions: vec!["nes".into()],
-            profile: None,
+            emulator: None,
+            core: None,
+            extra_args: String::new(),
             grid_art: GridArt::Screenshot,
             media: MediaToggles::default(),
         });
@@ -597,7 +926,9 @@ screenshot = false
             name: "Sega Genesis".into(),
             rom_dirs: Vec::new(),
             extensions: vec!["md".into()],
-            profile: None,
+            emulator: None,
+            core: None,
+            extra_args: String::new(),
             grid_art: GridArt::BoxArt,
             media: MediaToggles::default(),
         });
@@ -606,7 +937,9 @@ screenshot = false
             name: "Atari 2600".into(),
             rom_dirs: Vec::new(),
             extensions: vec!["a26".into()],
-            profile: None,
+            emulator: None,
+            core: None,
+            extra_args: String::new(),
             grid_art: GridArt::Screenshot,
             media: MediaToggles::default(),
         });
@@ -667,7 +1000,9 @@ screenshot = false
             name: "Super Nintendo".into(),
             rom_dirs: Vec::new(),
             extensions: vec!["sfc".into()],
-            profile: None,
+            emulator: None,
+            core: None,
+            extra_args: String::new(),
             grid_art: GridArt::BoxArt,
             media: MediaToggles::default(),
         });
@@ -676,7 +1011,9 @@ screenshot = false
             name: "Sega Genesis".into(),
             rom_dirs: Vec::new(),
             extensions: vec!["md".into()],
-            profile: None,
+            emulator: None,
+            core: None,
+            extra_args: String::new(),
             grid_art: GridArt::BoxArt,
             media: MediaToggles::default(),
         });
@@ -745,6 +1082,293 @@ ramp_ms = 800000
         .sanitized();
         assert_eq!(swapped.fast_interval_ms, 40);
         assert_eq!(swapped.slow_interval_ms, 40);
+    }
+
+    fn console(id: &str, name: &str, profile: &str) -> String {
+        format!(
+            r#"
+[[consoles]]
+id = "{id}"
+name = "{name}"
+rom_dirs = ["/roms/{id}"]
+extensions = ["bin"]
+profile = "{profile}"
+grid_art = "box_art"
+
+[consoles.media]
+box_art = true
+screenshot = true
+manual = false
+video = false
+"#
+        )
+    }
+
+    #[test]
+    fn old_profiles_collapse_to_one_retroarch_and_keep_launch_args() {
+        let raw = format!(
+            r#"
+[[profiles]]
+type = "RetroArch"
+id = "stella"
+core = "/home/dwelch/.config/retroarch/cores/stella_libretro.so"
+
+[[profiles]]
+type = "RetroArch"
+id = "nestopia"
+core = "/home/dwelch/.config/retroarch/cores/nestopia_libretro.so"
+config = "/home/dwelch/.config/retroarch/nes.cfg"
+
+[[profiles]]
+type = "RetroArch"
+id = "gambatte"
+core = "/home/dwelch/.config/retroarch/cores/gambatte_libretro.so"
+
+[[profiles]]
+type = "RetroArch"
+id = "picodrive"
+core = "/home/dwelch/.config/retroarch/cores/picodrive_libretro.so"
+
+[[profiles]]
+type = "RetroArch"
+id = "a5200"
+core = "/home/dwelch/.config/retroarch/cores/a5200_libretro.so"
+
+[[profiles]]
+type = "Standalone"
+id = "yabause"
+command = "yabause -a -i {{rom}}"
+
+{}
+{}
+{}
+"#,
+            console("atari2600", "Atari 2600", "stella"),
+            console("nes", "NES", "nestopia"),
+            console("saturn", "Saturn", "yabause"),
+        );
+        let config = config_from_toml(&raw).unwrap();
+        assert_eq!(config.emulators.len(), 2);
+        let retroarch = config
+            .emulators
+            .iter()
+            .find(|emulator| emulator.kind == crate::types::EmulatorKind::RetroArch)
+            .unwrap();
+        assert_eq!(retroarch.id, "retroarch");
+        assert_eq!(retroarch.name, "RetroArch");
+        assert_eq!(retroarch.path, "retroarch");
+        assert!(retroarch.global_args.is_empty());
+        let yabause = config
+            .emulators
+            .iter()
+            .find(|emulator| emulator.id == "yabause")
+            .unwrap();
+        assert_eq!(yabause.kind, crate::types::EmulatorKind::Standalone);
+        assert_eq!(yabause.path, "yabause");
+        assert_eq!(yabause.global_args, "-a -i {rom}");
+
+        let atari = config
+            .consoles
+            .iter()
+            .find(|c| c.id == "atari2600")
+            .unwrap();
+        assert_eq!(atari.emulator.as_deref(), Some("retroarch"));
+        assert_eq!(
+            atari.core.as_deref(),
+            Some(Path::new(
+                "/home/dwelch/.config/retroarch/cores/stella_libretro.so"
+            ))
+        );
+        assert!(atari.extra_args.is_empty());
+
+        let nes = config.consoles.iter().find(|c| c.id == "nes").unwrap();
+        assert_eq!(nes.emulator.as_deref(), Some("retroarch"));
+        assert_eq!(
+            nes.core.as_deref(),
+            Some(Path::new(
+                "/home/dwelch/.config/retroarch/cores/nestopia_libretro.so"
+            ))
+        );
+        assert_eq!(
+            nes.extra_args,
+            "--config /home/dwelch/.config/retroarch/nes.cfg"
+        );
+
+        let saturn = config.consoles.iter().find(|c| c.id == "saturn").unwrap();
+        assert_eq!(saturn.emulator.as_deref(), Some("yabause"));
+        assert!(saturn.core.is_none());
+
+        let (program, args) = crate::launcher::build_launch_command(
+            retroarch,
+            atari.core.as_deref(),
+            &atari.extra_args,
+            Path::new("/roms/Pitfall.bin"),
+        )
+        .unwrap();
+        assert_eq!(program, "retroarch");
+        assert_eq!(
+            args,
+            vec![
+                "-L",
+                "/home/dwelch/.config/retroarch/cores/stella_libretro.so",
+                "/roms/Pitfall.bin",
+            ]
+        );
+        let (program, args) = crate::launcher::build_launch_command(
+            retroarch,
+            nes.core.as_deref(),
+            &nes.extra_args,
+            Path::new("/roms/Mario.nes"),
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "-L",
+                "/home/dwelch/.config/retroarch/cores/nestopia_libretro.so",
+                "--config",
+                "/home/dwelch/.config/retroarch/nes.cfg",
+                "/roms/Mario.nes",
+            ]
+        );
+        assert_eq!(program, "retroarch");
+        let (program, args) = crate::launcher::build_launch_command(
+            yabause,
+            None,
+            &saturn.extra_args,
+            Path::new("/roms/game.cue"),
+        )
+        .unwrap();
+        assert_eq!(program, "yabause");
+        assert_eq!(args, vec!["-a", "-i", "/roms/game.cue"]);
+
+        let again = config_from_toml(&toml::to_string_pretty(&config).unwrap()).unwrap();
+        assert_eq!(again.emulators, config.emulators);
+        assert_eq!(again.consoles[0].emulator, config.consoles[0].emulator);
+        assert_eq!(again.consoles[0].core, config.consoles[0].core);
+        assert_eq!(again.consoles[1].extra_args, config.consoles[1].extra_args);
+        assert!(!toml::to_string(&config).unwrap().contains("profiles"));
+    }
+
+    #[test]
+    fn quoted_standalone_command_keeps_its_rom_placeholder() {
+        let raw = r#"
+[[profiles]]
+type = "Standalone"
+id = "pcsx2"
+command = "pcsx2 --fullscreen \"{rom}\""
+
+[[consoles]]
+id = "ps2"
+name = "PlayStation 2"
+rom_dirs = ["/roms/ps2"]
+extensions = ["iso"]
+profile = "pcsx2"
+
+[consoles.media]
+box_art = true
+screenshot = false
+manual = false
+video = false
+"#;
+        let config = config_from_toml(raw).unwrap();
+        let emulator = &config.emulators[0];
+        assert_eq!(emulator.path, "pcsx2");
+        assert_eq!(emulator.global_args, "--fullscreen \"{rom}\"");
+        let (program, args) = crate::launcher::build_launch_command(
+            emulator,
+            None,
+            "",
+            Path::new("/roms/game with spaces.iso"),
+        )
+        .unwrap();
+        assert_eq!(program, "pcsx2");
+        assert_eq!(args, vec!["--fullscreen", "/roms/game with spaces.iso"]);
+    }
+
+    #[test]
+    fn loading_an_old_file_rewrites_it_without_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = XdgEnv::sandbox(dir.path());
+        let path = config_path().unwrap();
+        fs::write(
+            &path,
+            r#"
+[[profiles]]
+type = "Standalone"
+id = "dolphin"
+command = "dolphin-emu -b -e {rom}"
+
+[[consoles]]
+id = "gc"
+name = "GameCube"
+rom_dirs = ["/roms/gc"]
+extensions = ["iso"]
+profile = "dolphin"
+
+[consoles.media]
+box_art = true
+screenshot = false
+manual = false
+video = false
+"#,
+        )
+        .unwrap();
+        let config = load_config().unwrap();
+        assert_eq!(config.emulators[0].id, "dolphin");
+        assert_eq!(config.consoles[0].emulator.as_deref(), Some("dolphin"));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[[emulators]]"), "{text}");
+        assert!(!text.contains("[[profiles]]"), "{text}");
+        assert!(!text.contains("profile ="), "{text}");
+        let before = fs::read(&path).unwrap();
+        let _ = load_config().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn migration_backs_up_the_original_and_a_second_load_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = XdgEnv::sandbox(dir.path());
+        let path = config_path().unwrap();
+        let original = b"\
+[[profiles]]
+type = \"Standalone\"
+id = \"dolphin\"
+command = \"dolphin-emu -b -e {rom}\"
+
+[[consoles]]
+id = \"gc\"
+name = \"GameCube\"
+rom_dirs = [\"/roms/gc\"]
+extensions = [\"iso\"]
+profile = \"dolphin\"
+
+[consoles.media]
+box_art = true
+screenshot = false
+manual = false
+video = false
+";
+        fs::write(&path, original).unwrap();
+        load_config().unwrap();
+        let backup = path.with_file_name("config.toml.pre-emulators.bak");
+        assert_eq!(fs::read(&backup).unwrap(), original);
+
+        let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        for file in [&path, &backup] {
+            fs::File::options()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+        }
+        load_config().unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        for file in [&path, &backup] {
+            assert_eq!(fs::metadata(file).unwrap().modified().unwrap(), stamp);
+        }
     }
 }
 

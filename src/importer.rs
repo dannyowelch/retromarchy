@@ -183,7 +183,9 @@ fn upsert_console(config: &mut Config, system: &SystemEntry, path: &Path) {
         name: system.display_name.clone(),
         rom_dirs: vec![path.to_path_buf()],
         extensions: system.extensions.clone(),
-        profile: None,
+        emulator: None,
+        core: None,
+        extra_args: String::new(),
         grid_art: crate::types::GridArt::default(),
         media: MediaToggles::default(),
     });
@@ -269,7 +271,7 @@ mod tests {
         assert!(config.consoles[0].extensions.iter().any(|ext| ext == "nes"));
         assert_eq!(config.consoles[1].id, "snes");
         assert_eq!(config.consoles[1].name, "Nintendo SNES (Super Nintendo)");
-        assert!(config.consoles[1].profile.is_none());
+        assert!(config.consoles[1].emulator.is_none());
 
         let conn = database::init_db().unwrap();
         let loaded = database::load_games(&conn, None).unwrap();

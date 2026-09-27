@@ -1,13 +1,12 @@
-//! Manage Emulators. The draft is `profiles`, and
-//! each console's `profile`. RetroArch profiles are a core path (optional
-//! `config` stays unset). Standalone profiles are one command string with
-//! `{rom}`. The shell paints this and calls [`apply_assignments`] on save.
+//! Manage Emulators. Two tabs share one scroll region.
+//! Emulators are installed programs. Systems assign one emulator, a RetroArch
+//! core, and extra arguments.
 
 use crate::config::Config;
-use crate::cores::{CoreProfile, DiscoveredCore};
+use crate::cores::DiscoveredCore;
 use crate::game_menu::LineEdit;
 use crate::gamepad::NavDir;
-use crate::types::EmulatorProfile;
+use crate::types::{Console, Emulator, EmulatorKind};
 use std::path::PathBuf;
 
 /// Ctrl+E and Ctrl+M, including the shifted keysyms. The control mask must be set.
@@ -21,58 +20,36 @@ pub fn emulator_key(key: &str, key_char: Option<&str>, control: bool) -> bool {
     hit("e") || hit("m")
 }
 
-/// Discovered cores are listed only when `retroarch` is a file on `PATH`.
-pub fn retroarch_on_path() -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("retroarch").is_file()))
-        .unwrap_or(false)
-}
+pub const HINT: &str = "Tab, 1, and 2 switch tabs. Arrows move. Left and right change a choice. Enter confirms. Esc closes.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Standalone,
-    RetroArch,
+pub enum Tab {
+    Emulators,
+    Systems,
 }
 
-impl Kind {
+impl Tab {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Standalone => "Standalone",
-            Self::RetroArch => "RetroArch",
+            Self::Emulators => "Emulators",
+            Self::Systems => "Systems",
         }
     }
-
-    fn cycle(self, delta: isize) -> Self {
-        let kinds = [Self::Standalone, Self::RetroArch];
-        let pos = kinds.iter().position(|kind| *kind == self).unwrap_or(0);
-        kinds[wrap(pos, kinds.len(), delta)]
-    }
-}
-
-/// One console row in the dialog. `profile` is that console's default.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConsoleSlot {
-    pub id: String,
-    pub name: String,
-    pub profile: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Action {
-    Add,
-    Assign(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
-    Core { index: usize, action: usize },
+    Tabs,
+    Row(usize),
     Delete(usize),
+    Name,
     Kind,
-    Id,
-    Detail,
-    Browse,
-    Add,
-    Console(usize),
+    Path,
+    GlobalArgs,
+    Save,
+    SystemEmulator(usize),
+    SystemCore(usize),
+    SystemArgs(usize),
     Close,
 }
 
@@ -87,146 +64,126 @@ struct Stop {
 pub enum EmulatorCommand {
     None,
     Close,
-    Browse,
     Write,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoreButton {
-    pub label: String,
-    pub enabled: bool,
-    pub aimed: bool,
-    pub slot: Option<Slot>,
-    pub primary: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoreLine {
+pub struct EmulatorLine {
     pub index: usize,
     pub name: String,
-    pub path: String,
-    pub buttons: Vec<CoreButton>,
+    pub detail: String,
+    pub row_aimed: bool,
+    pub delete_aimed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProfileLine {
-    pub index: usize,
-    pub label: String,
-    pub aimed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConsoleLine {
+pub struct SystemLine {
     pub index: usize,
     pub name: String,
-    pub value: String,
-    pub aimed: bool,
+    pub emulator: String,
+    pub emulator_aimed: bool,
+    pub core: String,
+    pub core_enabled: bool,
+    pub core_aimed: bool,
+    pub args: LineEdit,
+    pub args_aimed: bool,
 }
-
-/// Painted above the scroller. The dialog title sits on top of a scrollport,
-/// and this heading was clipped under that title when it was the first row.
-pub const PROFILES_HEADING: &str = "Emulator profiles";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
-    Heading(&'static str),
     Note(&'static str),
-    Core(CoreLine),
-    Profile(ProfileLine),
-    Kind {
-        kind: Kind,
-        aimed: bool,
-    },
-    Id {
-        edit: LineEdit,
-        aimed: bool,
-    },
-    Detail {
-        edit: LineEdit,
-        field_aimed: bool,
-        browse_aimed: bool,
-    },
-    Add {
-        aimed: bool,
-    },
-    Console(ConsoleLine),
-    Close {
-        aimed: bool,
-    },
     Error(String),
+    Emulator(EmulatorLine),
+    Label(&'static str),
+    Field {
+        edit: LineEdit,
+        aimed: bool,
+        placeholder: &'static str,
+        slot: Slot,
+    },
+    Kind {
+        kind: EmulatorKind,
+        aimed: bool,
+    },
+    Save {
+        label: &'static str,
+        aimed: bool,
+    },
+    System(SystemLine),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemRow {
+    pub id: String,
+    pub name: String,
+    pub emulator_id: Option<String>,
+    pub core: Option<PathBuf>,
+    pub args: LineEdit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Draft {
+    editing: Option<usize>,
+    name: LineEdit,
+    kind: EmulatorKind,
+    path: LineEdit,
+    args: LineEdit,
+}
+
+impl Draft {
+    fn blank() -> Self {
+        Self {
+            editing: None,
+            name: LineEdit::plain(String::new()),
+            kind: EmulatorKind::Standalone,
+            path: LineEdit::plain(String::new()),
+            args: LineEdit::plain(String::new()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Emulators {
-    profiles: Vec<EmulatorProfile>,
-    consoles: Vec<ConsoleSlot>,
+    emulators: Vec<Emulator>,
+    systems: Vec<SystemRow>,
     cores: Vec<DiscoveredCore>,
-    show_cores: bool,
-    kind: Kind,
-    id: LineEdit,
-    detail: LineEdit,
+    tab: Tab,
+    draft: Draft,
     focus: Slot,
     error: Option<String>,
 }
 
 impl Emulators {
-    pub fn open(config: &Config, mut cores: Vec<DiscoveredCore>, show_cores: bool) -> Self {
-        if !show_cores {
-            cores.clear();
-        }
+    pub fn open(config: &Config, cores: Vec<DiscoveredCore>) -> Self {
         Self {
-            profiles: config.profiles.clone(),
-            consoles: config
-                .consoles
-                .iter()
-                .map(|console| ConsoleSlot {
-                    id: console.id.clone(),
-                    name: console.name.clone(),
-                    profile: console.profile.clone().filter(|id| !id.is_empty()),
-                })
-                .collect(),
+            emulators: config.emulators.clone(),
+            systems: config.consoles.iter().map(system_row).collect(),
             cores,
-            show_cores,
-            kind: Kind::Standalone,
-            id: LineEdit::plain(String::new()),
-            detail: LineEdit::plain(String::new()),
-            focus: Slot::Id,
+            tab: Tab::Emulators,
+            draft: Draft::blank(),
+            focus: Slot::Tabs,
             error: None,
         }
     }
 
-    pub fn profiles(&self) -> &[EmulatorProfile] {
-        &self.profiles
+    pub fn emulators(&self) -> &[Emulator] {
+        &self.emulators
     }
 
-    pub fn consoles(&self) -> &[ConsoleSlot] {
-        &self.consoles
+    pub fn systems(&self) -> &[SystemRow] {
+        &self.systems
     }
 
     pub fn focus(&self) -> Slot {
         self.focus
     }
 
+    pub fn tab(&self) -> Tab {
+        self.tab
+    }
+
     pub fn set_error(&mut self, message: String) {
         self.error = Some(message);
-    }
-
-    pub fn set_kind(&mut self, kind: Kind) {
-        self.kind = kind;
-        self.focus = Slot::Kind;
-    }
-
-    /// A chosen core file fills the path, switches the kind to RetroArch,
-    /// and uses the file name as the id when that field is still empty.
-    pub fn set_core_path(&mut self, path: PathBuf) {
-        if self.id.text.is_empty() {
-            if let Some(core) = DiscoveredCore::from_path(path.clone()) {
-                self.id = LineEdit::plain(core.name);
-            }
-        }
-        self.detail = LineEdit::plain(path.display().to_string());
-        self.kind = Kind::RetroArch;
-        self.focus = Slot::Detail;
     }
 
     pub fn aim(&mut self, slot: Slot) -> bool {
@@ -238,46 +195,72 @@ impl Emulators {
         }
     }
 
-    /// `true` when a console's default profile changed and should be saved.
+    pub fn show(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.focus = Slot::Tabs;
+    }
+
+    pub fn set_kind(&mut self, kind: EmulatorKind) {
+        self.draft.kind = kind;
+        self.focus = Slot::Kind;
+        if kind == EmulatorKind::RetroArch && self.draft.path.text.trim().is_empty() {
+            self.draft.path = LineEdit::plain("retroarch".to_string());
+        }
+    }
+
+    pub fn cycle_tab(&mut self) {
+        self.tab = match self.tab {
+            Tab::Emulators => Tab::Systems,
+            Tab::Systems => Tab::Emulators,
+        };
+        self.focus = Slot::Tabs;
+    }
+
+    /// `true` when a system assignment changed and should be saved.
     pub fn move_dir(&mut self, dir: NavDir) -> bool {
-        if let Slot::Console(index) = self.focus {
+        if matches!(dir, NavDir::Left | NavDir::Right) {
+            if let Some(edit) = self.edit_mut() {
+                let delta = if dir == NavDir::Left { -1 } else { 1 };
+                edit.move_caret(delta);
+                return false;
+            }
+        }
+        if self.focus == Slot::Tabs && matches!(dir, NavDir::Left | NavDir::Right) {
+            self.step_tab(if dir == NavDir::Left { -1 } else { 1 });
+            return false;
+        }
+        if self.focus == Slot::Kind && matches!(dir, NavDir::Left | NavDir::Right) {
+            self.cycle_kind(if dir == NavDir::Left { -1 } else { 1 });
+            return false;
+        }
+        if let Slot::SystemEmulator(index) = self.focus {
             if matches!(dir, NavDir::Left | NavDir::Right) {
-                self.cycle_console(index, if dir == NavDir::Left { -1 } else { 1 });
+                self.cycle_emulator(index, if dir == NavDir::Left { -1 } else { 1 });
                 return true;
             }
         }
-        if self.focus == Slot::Kind && matches!(dir, NavDir::Left | NavDir::Right) {
-            let delta = if dir == NavDir::Left { -1 } else { 1 };
-            self.kind = self.kind.cycle(delta);
-            return false;
-        }
-        if self.focus == Slot::Detail && matches!(dir, NavDir::Left | NavDir::Right) {
-            if dir == NavDir::Right && caret_at_end(&self.detail) {
-                self.focus = Slot::Browse;
-            } else if !(dir == NavDir::Left && caret_at_start(&self.detail)) {
-                let delta = if dir == NavDir::Left { -1 } else { 1 };
-                self.detail.move_caret(delta);
+        if let Slot::SystemCore(index) = self.focus {
+            if matches!(dir, NavDir::Left | NavDir::Right) {
+                self.cycle_core(index, if dir == NavDir::Left { -1 } else { 1 });
+                return true;
             }
-            return false;
-        }
-        if self.focus == Slot::Browse && dir == NavDir::Left {
-            self.focus = Slot::Detail;
-            return false;
-        }
-        if self.focus == Slot::Id && matches!(dir, NavDir::Left | NavDir::Right) {
-            let delta = if dir == NavDir::Left { -1 } else { 1 };
-            self.id.move_caret(delta);
-            return false;
         }
 
+        let leaving_args = matches!(self.focus, Slot::SystemArgs(_));
         let stops = self.stops();
         let Some(current) = stops.iter().find(|stop| stop.slot == self.focus) else {
-            self.focus = Slot::Id;
+            self.focus = Slot::Tabs;
             return false;
         };
-        let delta: isize = match dir {
-            NavDir::Left => -1,
-            NavDir::Right => 1,
+        match dir {
+            NavDir::Left | NavDir::Right => {
+                let delta: isize = if dir == NavDir::Left { -1 } else { 1 };
+                if let Some(next) = stops.iter().find(|stop| {
+                    stop.row == current.row && stop.col as isize == current.col as isize + delta
+                }) {
+                    self.focus = next.slot;
+                }
+            }
             NavDir::Up | NavDir::Down => {
                 let target = if dir == NavDir::Up {
                     stops
@@ -304,37 +287,16 @@ impl Emulators {
                         self.focus = next.slot;
                     }
                 }
-                return false;
             }
-        };
-        if let Some(next) = stops.iter().find(|stop| {
-            stop.row == current.row && stop.col as isize == current.col as isize + delta
-        }) {
-            self.focus = next.slot;
         }
-        false
-    }
-
-    pub fn tab(&mut self, backward: bool) {
-        let stops = self.stops();
-        let len = stops.len();
-        if len == 0 {
-            return;
-        }
-        let pos = stops
-            .iter()
-            .position(|stop| stop.slot == self.focus)
-            .unwrap_or(0);
-        let next = if backward {
-            (pos + len - 1) % len
-        } else {
-            (pos + 1) % len
-        };
-        self.focus = stops[next].slot;
+        leaving_args && !matches!(self.focus, Slot::SystemArgs(_))
     }
 
     pub fn accepts_text(&self) -> bool {
-        matches!(self.focus, Slot::Id | Slot::Detail)
+        matches!(
+            self.focus,
+            Slot::Name | Slot::Path | Slot::GlobalArgs | Slot::SystemArgs(_)
+        )
     }
 
     pub fn type_text(&mut self, text: &str) {
@@ -356,113 +318,65 @@ impl Emulators {
     }
 
     pub fn confirm(&mut self) -> EmulatorCommand {
-        let focus = self.focus;
-        let command = match focus {
-            Slot::Core { index, action } => {
-                let Some(action) = self.enabled_actions(index).get(action).copied() else {
-                    return EmulatorCommand::None;
-                };
-                match action {
-                    Action::Add => self.add_core(index, None),
-                    Action::Assign(console) => self.add_core(index, Some(console)),
-                }
-                EmulatorCommand::Write
+        let command = match self.focus {
+            Slot::Tabs => {
+                self.enter_tab();
+                EmulatorCommand::None
+            }
+            Slot::Row(index) => {
+                self.begin_edit(index);
+                EmulatorCommand::None
             }
             Slot::Delete(index) => {
-                if index < self.profiles.len() {
-                    self.profiles.remove(index);
+                if index < self.emulators.len() {
+                    self.delete_at(index);
                     EmulatorCommand::Write
                 } else {
                     EmulatorCommand::None
                 }
             }
             Slot::Kind => {
-                self.kind = self.kind.cycle(1);
+                self.cycle_kind(1);
                 EmulatorCommand::None
             }
-            Slot::Id | Slot::Detail => EmulatorCommand::None,
-            Slot::Browse => EmulatorCommand::Browse,
-            Slot::Add => self.add_typed(),
-            Slot::Console(index) => {
-                self.cycle_console(index, 1);
+            Slot::Name | Slot::Path | Slot::GlobalArgs => {
+                self.focus_next();
+                EmulatorCommand::None
+            }
+            Slot::Save => self.save(),
+            Slot::SystemEmulator(index) => {
+                self.cycle_emulator(index, 1);
                 EmulatorCommand::Write
             }
+            Slot::SystemCore(index) => {
+                self.cycle_core(index, 1);
+                EmulatorCommand::Write
+            }
+            Slot::SystemArgs(_) => EmulatorCommand::Write,
             Slot::Close => EmulatorCommand::Close,
         };
         if command == EmulatorCommand::Write {
             self.error = None;
-            self.settle();
         }
         command
     }
 
     pub fn blocks(&self) -> Vec<Block> {
-        let mut blocks = vec![Block::Heading(PROFILES_HEADING)];
-        if self.show_cores {
-            blocks.push(Block::Note(
-                "retroarch is on PATH. Pick a discovered core or a core file to make a RetroArch profile. Cores are not downloaded.",
-            ));
-            blocks.push(Block::Heading("Discovered cores"));
-            if self.cores.is_empty() {
-                blocks.push(Block::Note(
-                    "No cores found in the usual directories. Paste a core path or browse for a .so file. Cores are not downloaded.",
-                ));
-            }
-            for (index, core) in self.cores.iter().enumerate() {
-                blocks.push(Block::Core(self.core_line(index, core)));
-            }
+        let mut blocks = Vec::new();
+        match self.tab {
+            Tab::Emulators => self.emulator_blocks(&mut blocks),
+            Tab::Systems => self.system_blocks(&mut blocks),
         }
-        for (index, profile) in self.profiles.iter().enumerate() {
-            blocks.push(Block::Profile(ProfileLine {
-                index,
-                label: profile_label(profile),
-                aimed: self.focus == Slot::Delete(index),
-            }));
-        }
-        blocks.push(Block::Kind {
-            kind: self.kind,
-            aimed: self.focus == Slot::Kind,
-        });
-        blocks.push(Block::Id {
-            edit: self.id.clone(),
-            aimed: self.focus == Slot::Id,
-        });
-        blocks.push(Block::Detail {
-            edit: self.detail.clone(),
-            field_aimed: self.focus == Slot::Detail,
-            browse_aimed: self.focus == Slot::Browse,
-        });
-        blocks.push(Block::Add {
-            aimed: self.focus == Slot::Add,
-        });
         if let Some(error) = &self.error {
-            blocks.push(Block::Error(error.clone()));
+            if self.tab == Tab::Emulators {
+                blocks.push(Block::Error(error.clone()));
+            }
         }
-        blocks.push(Block::Heading("Default profile per system"));
-        for (index, console) in self.consoles.iter().enumerate() {
-            blocks.push(Block::Console(ConsoleLine {
-                index,
-                name: console.name.clone(),
-                value: console
-                    .profile
-                    .clone()
-                    .unwrap_or_else(|| "None".to_string()),
-                aimed: self.focus == Slot::Console(index),
-            }));
-        }
-        blocks.push(Block::Close {
-            aimed: self.focus == Slot::Close,
-        });
         blocks
     }
 
-    /// Rows inside the scroller. [`PROFILES_HEADING`] is painted above it.
     pub fn scroll_blocks(&self) -> Vec<Block> {
-        let mut blocks = self.blocks();
-        if matches!(blocks.first(), Some(Block::Heading(PROFILES_HEADING))) {
-            blocks.remove(0);
-        }
-        blocks
+        self.blocks()
     }
 
     pub fn scroll_index(&self) -> usize {
@@ -472,169 +386,300 @@ impl Emulators {
             .unwrap_or(0)
     }
 
-    fn core_line(&self, index: usize, core: &DiscoveredCore) -> CoreLine {
-        let resolved = core.to_profile(&self.profiles);
-        let added_id = match &resolved {
-            CoreProfile::AlreadyAdded { id } => Some(id.clone()),
-            CoreProfile::New(_) => None,
-        };
-        let mut buttons = Vec::new();
-        let mut action = 0usize;
-        match &resolved {
-            CoreProfile::AlreadyAdded { .. } => buttons.push(CoreButton {
-                label: "Added".to_string(),
-                enabled: false,
-                aimed: false,
-                slot: None,
-                primary: false,
-            }),
-            CoreProfile::New(_) => {
-                let slot = Slot::Core { index, action };
-                buttons.push(CoreButton {
-                    label: "Add profile".to_string(),
-                    enabled: true,
-                    aimed: self.focus == slot,
-                    slot: Some(slot),
-                    primary: false,
-                });
-                action += 1;
-            }
+    fn emulator_blocks(&self, blocks: &mut Vec<Block>) {
+        if self.emulators.is_empty() {
+            blocks.push(Block::Note("No emulators yet."));
         }
-        for system_id in core.system_ids() {
-            let Some(console_index) = self
-                .consoles
-                .iter()
-                .position(|console| console.id == *system_id)
-            else {
-                continue;
-            };
-            let console = &self.consoles[console_index];
-            let assigned = added_id
-                .as_ref()
-                .is_some_and(|id| console.profile.as_ref() == Some(id));
-            let label = if assigned {
-                format!("Assigned to {}", console.name)
-            } else if added_id.is_some() {
-                format!("Assign to {}", console.name)
-            } else {
-                format!("Add & assign to {}", console.name)
-            };
-            if assigned {
-                buttons.push(CoreButton {
-                    label,
-                    enabled: false,
-                    aimed: false,
-                    slot: None,
-                    primary: true,
-                });
-            } else {
-                let slot = Slot::Core { index, action };
-                buttons.push(CoreButton {
-                    label,
-                    enabled: true,
-                    aimed: self.focus == slot,
-                    slot: Some(slot),
-                    primary: true,
-                });
-                action += 1;
-            }
+        for (index, emulator) in self.emulators.iter().enumerate() {
+            blocks.push(Block::Emulator(EmulatorLine {
+                index,
+                name: emulator.name.clone(),
+                detail: emulator_detail(emulator),
+                row_aimed: self.focus == Slot::Row(index),
+                delete_aimed: self.focus == Slot::Delete(index),
+            }));
         }
-        CoreLine {
-            index,
-            name: core.name.clone(),
-            path: core.path.display().to_string(),
-            buttons,
+        let editing = self.draft.editing.is_some();
+        blocks.push(Block::Label(if editing {
+            "Edit emulator"
+        } else {
+            "Add emulator"
+        }));
+        blocks.push(Block::Label("Name"));
+        blocks.push(Block::Field {
+            edit: self.draft.name.clone(),
+            aimed: self.focus == Slot::Name,
+            placeholder: "Name",
+            slot: Slot::Name,
+        });
+        blocks.push(Block::Label("Kind"));
+        blocks.push(Block::Kind {
+            kind: self.draft.kind,
+            aimed: self.focus == Slot::Kind,
+        });
+        blocks.push(Block::Label("Executable"));
+        blocks.push(Block::Field {
+            edit: self.draft.path.clone(),
+            aimed: self.focus == Slot::Path,
+            placeholder: "Executable path",
+            slot: Slot::Path,
+        });
+        blocks.push(Block::Label("Global arguments"));
+        blocks.push(Block::Field {
+            edit: self.draft.args.clone(),
+            aimed: self.focus == Slot::GlobalArgs,
+            placeholder: "Global arguments",
+            slot: Slot::GlobalArgs,
+        });
+        blocks.push(Block::Save {
+            label: if editing { "Save" } else { "Add" },
+            aimed: self.focus == Slot::Save,
+        });
+    }
+
+    fn system_blocks(&self, blocks: &mut Vec<Block>) {
+        if self.systems.is_empty() {
+            blocks.push(Block::Note(
+                "No systems in the library. Import ROMs, then assign an emulator here.",
+            ));
+            return;
+        }
+        if self.emulators.is_empty() {
+            blocks.push(Block::Note(
+                "Add an emulator on the Emulators tab, then assign it here.",
+            ));
+        }
+        for (index, system) in self.systems.iter().enumerate() {
+            let retroarch = self.retroarch_selected(index);
+            blocks.push(Block::System(SystemLine {
+                index,
+                name: system.name.clone(),
+                emulator: self.emulator_label(system.emulator_id.as_deref()),
+                emulator_aimed: self.focus == Slot::SystemEmulator(index),
+                core: core_label(&self.cores, system.core.as_deref()),
+                core_enabled: retroarch,
+                core_aimed: self.focus == Slot::SystemCore(index),
+                args: system.args.clone(),
+                args_aimed: self.focus == Slot::SystemArgs(index),
+            }));
         }
     }
 
-    fn enabled_actions(&self, index: usize) -> Vec<Action> {
-        let Some(core) = self.cores.get(index) else {
-            return Vec::new();
+    fn emulator_label(&self, id: Option<&str>) -> String {
+        let Some(id) = id else {
+            return "None".to_string();
         };
-        let resolved = core.to_profile(&self.profiles);
-        let mut actions = Vec::new();
-        if matches!(resolved, CoreProfile::New(_)) {
-            actions.push(Action::Add);
-        }
-        let added_id = match &resolved {
-            CoreProfile::AlreadyAdded { id } => Some(id.as_str()),
-            CoreProfile::New(_) => None,
-        };
-        for system_id in core.system_ids() {
-            let Some(console_index) = self
-                .consoles
-                .iter()
-                .position(|console| console.id == *system_id)
-            else {
-                continue;
-            };
-            let assigned = added_id
-                .is_some_and(|id| self.consoles[console_index].profile.as_deref() == Some(id));
-            if !assigned {
-                actions.push(Action::Assign(console_index));
-            }
-        }
-        actions
+        self.emulators
+            .iter()
+            .find(|emulator| emulator.id == id)
+            .map(|emulator| emulator.name.clone())
+            .unwrap_or_else(|| id.to_string())
     }
 
-    fn add_core(&mut self, index: usize, assign: Option<usize>) {
-        let Some(core) = self.cores.get(index).cloned() else {
+    fn step_tab(&mut self, delta: isize) {
+        let next = match (self.tab, delta) {
+            (Tab::Emulators, 1) => Tab::Systems,
+            (Tab::Systems, -1) => Tab::Emulators,
+            _ => self.tab,
+        };
+        self.tab = next;
+        self.focus = Slot::Tabs;
+    }
+
+    fn enter_tab(&mut self) {
+        let stops = self.stops();
+        if let Some(next) = stops.iter().find(|stop| stop.slot != Slot::Tabs) {
+            self.focus = next.slot;
+        }
+    }
+
+    fn focus_next(&mut self) {
+        let stops = self.stops();
+        let Some(pos) = stops.iter().position(|stop| stop.slot == self.focus) else {
             return;
         };
-        let id = match core.to_profile(&self.profiles) {
-            CoreProfile::AlreadyAdded { id } => id,
-            CoreProfile::New(profile) => {
-                let id = profile.id().clone();
-                self.profiles.push(profile);
-                id
-            }
-        };
-        if let Some(console_index) = assign {
-            if let Some(console) = self.consoles.get_mut(console_index) {
-                console.profile = Some(id);
-            }
+        if let Some(next) = stops.get(pos + 1) {
+            self.focus = next.slot;
         }
     }
 
-    fn add_typed(&mut self) -> EmulatorCommand {
-        if self.id.text.is_empty() || self.detail.text.is_empty() {
-            self.error = Some("Enter a profile id and a command or core path.".to_string());
+    fn begin_edit(&mut self, index: usize) {
+        let Some(emulator) = self.emulators.get(index) else {
+            return;
+        };
+        self.draft = Draft {
+            editing: Some(index),
+            name: LineEdit::plain(emulator.name.clone()),
+            kind: emulator.kind,
+            path: LineEdit::plain(emulator.path.clone()),
+            args: LineEdit::plain(emulator.global_args.clone()),
+        };
+        self.tab = Tab::Emulators;
+        self.focus = Slot::Name;
+        self.error = None;
+    }
+
+    fn save(&mut self) -> EmulatorCommand {
+        let name = self.draft.name.text.trim().to_string();
+        let path = self.draft.path.text.trim().to_string();
+        if name.is_empty() || path.is_empty() {
+            self.error = Some("Enter a name and an executable path.".to_string());
             return EmulatorCommand::None;
         }
-        let profile = match self.kind {
-            Kind::RetroArch => EmulatorProfile::RetroArch {
-                id: self.id.text.clone(),
-                core: PathBuf::from(&self.detail.text),
-                config: None,
-            },
-            Kind::Standalone => EmulatorProfile::Standalone {
-                id: self.id.text.clone(),
-                command: self.detail.text.clone(),
-            },
-        };
-        self.profiles.push(profile);
-        self.id = LineEdit::plain(String::new());
-        self.detail = LineEdit::plain(String::new());
-        self.error = None;
-        EmulatorCommand::Write
+        let kind = self.draft.kind;
+        let global_args = self.draft.args.text.trim().to_string();
+        if let Some(index) = self.draft.editing {
+            let Some(emulator) = self.emulators.get_mut(index) else {
+                return EmulatorCommand::None;
+            };
+            let id = emulator.id.clone();
+            let was = emulator.kind;
+            emulator.name = name;
+            emulator.kind = kind;
+            emulator.path = path;
+            emulator.global_args = global_args;
+            if was == EmulatorKind::RetroArch && kind != EmulatorKind::RetroArch {
+                self.clear_cores(&id);
+            }
+            self.draft = Draft::blank();
+            self.error = None;
+            self.focus = Slot::Row(index);
+            EmulatorCommand::Write
+        } else {
+            let id = fresh_id(&slug(&name), &self.emulators);
+            self.emulators.push(Emulator {
+                id,
+                name,
+                kind,
+                path,
+                global_args,
+            });
+            let index = self.emulators.len() - 1;
+            self.draft = Draft::blank();
+            self.error = None;
+            self.focus = Slot::Row(index);
+            EmulatorCommand::Write
+        }
     }
 
-    fn cycle_console(&mut self, index: usize, delta: isize) {
+    fn delete_at(&mut self, index: usize) {
+        let id = self.emulators[index].id.clone();
+        self.emulators.remove(index);
+        for system in &mut self.systems {
+            if system.emulator_id.as_ref() == Some(&id) {
+                system.emulator_id = None;
+                system.core = None;
+            }
+        }
+        if self.draft.editing == Some(index) {
+            self.draft = Draft::blank();
+        } else if let Some(editing) = self.draft.editing.as_mut() {
+            if *editing > index {
+                *editing -= 1;
+            }
+        }
+        self.settle();
+    }
+
+    fn clear_cores(&mut self, id: &str) {
+        for system in &mut self.systems {
+            if system.emulator_id.as_deref() == Some(id) {
+                system.core = None;
+            }
+        }
+    }
+
+    fn cycle_kind(&mut self, delta: isize) {
+        let kinds = [EmulatorKind::Standalone, EmulatorKind::RetroArch];
+        let pos = kinds
+            .iter()
+            .position(|kind| *kind == self.draft.kind)
+            .unwrap_or(0);
+        self.draft.kind = kinds[wrap(pos, kinds.len(), delta)];
+        if self.draft.kind == EmulatorKind::RetroArch && self.draft.path.text.trim().is_empty() {
+            self.draft.path = LineEdit::plain("retroarch".to_string());
+        }
+    }
+
+    fn cycle_emulator(&mut self, index: usize, delta: isize) {
         let ids: Vec<Option<String>> = std::iter::once(None)
             .chain(
-                self.profiles
+                self.emulators
                     .iter()
-                    .map(|profile| Some(profile.id().clone())),
+                    .map(|emulator| Some(emulator.id.clone())),
             )
             .collect();
-        let Some(console) = self.consoles.get_mut(index) else {
+        let Some(current) = self
+            .systems
+            .get(index)
+            .map(|system| system.emulator_id.clone())
+        else {
             return;
         };
-        let pos = ids
+        let pos = ids.iter().position(|id| *id == current).unwrap_or(0);
+        let chosen = ids[wrap(pos, ids.len(), delta)].clone();
+        let retroarch = chosen.as_ref().is_some_and(|id| {
+            self.emulators
+                .iter()
+                .any(|emulator| emulator.id == *id && emulator.kind == EmulatorKind::RetroArch)
+        });
+        let Some(system) = self.systems.get_mut(index) else {
+            return;
+        };
+        system.emulator_id = chosen;
+        if !retroarch {
+            system.core = None;
+        }
+        if !retroarch && self.focus == Slot::SystemCore(index) {
+            self.focus = Slot::SystemEmulator(index);
+        }
+    }
+
+    fn cycle_core(&mut self, index: usize, delta: isize) {
+        if !self.retroarch_selected(index) {
+            return;
+        }
+        let choices = self.core_choices(index);
+        let Some(system) = self.systems.get_mut(index) else {
+            return;
+        };
+        let pos = choices
             .iter()
-            .position(|id| *id == console.profile)
+            .position(|path| *path == system.core)
             .unwrap_or(0);
-        console.profile = ids[wrap(pos, ids.len(), delta)].clone();
+        system.core = choices[wrap(pos, choices.len(), delta)].clone();
+    }
+
+    fn core_choices(&self, index: usize) -> Vec<Option<PathBuf>> {
+        let mut choices = vec![None];
+        for core in &self.cores {
+            if !choices.iter().any(|path| path.as_ref() == Some(&core.path)) {
+                choices.push(Some(core.path.clone()));
+            }
+        }
+        if let Some(path) = self
+            .systems
+            .get(index)
+            .and_then(|system| system.core.clone())
+        {
+            if !choices.iter().any(|choice| choice.as_ref() == Some(&path)) {
+                choices.push(Some(path));
+            }
+        }
+        choices
+    }
+
+    fn retroarch_selected(&self, index: usize) -> bool {
+        let Some(id) = self
+            .systems
+            .get(index)
+            .and_then(|system| system.emulator_id.clone())
+        else {
+            return false;
+        };
+        self.emulators
+            .iter()
+            .any(|emulator| emulator.id == id && emulator.kind == EmulatorKind::RetroArch)
     }
 
     fn settle(&mut self) {
@@ -642,63 +687,70 @@ impl Emulators {
         if stops.iter().any(|stop| stop.slot == self.focus) {
             return;
         }
-        self.focus = [Slot::Add, Slot::Id, Slot::Close]
-            .into_iter()
-            .find(|slot| stops.iter().any(|stop| stop.slot == *slot))
+        self.focus = stops
+            .iter()
+            .find(|stop| stop.slot != Slot::Tabs)
+            .map(|stop| stop.slot)
             .unwrap_or(Slot::Close);
     }
 
     fn stops(&self) -> Vec<Stop> {
-        let mut stops = Vec::new();
-        let mut row = 0usize;
-        if self.show_cores {
-            for index in 0..self.cores.len() {
-                for (col, _) in self.enabled_actions(index).iter().enumerate() {
+        let mut stops = vec![Stop {
+            slot: Slot::Tabs,
+            row: 0,
+            col: 0,
+        }];
+        let mut row = 1usize;
+        match self.tab {
+            Tab::Emulators => {
+                for index in 0..self.emulators.len() {
                     stops.push(Stop {
-                        slot: Slot::Core { index, action: col },
+                        slot: Slot::Row(index),
                         row,
-                        col,
+                        col: 0,
                     });
+                    stops.push(Stop {
+                        slot: Slot::Delete(index),
+                        row,
+                        col: 1,
+                    });
+                    row += 1;
                 }
-                row += 1;
+                for slot in [
+                    Slot::Name,
+                    Slot::Kind,
+                    Slot::Path,
+                    Slot::GlobalArgs,
+                    Slot::Save,
+                ] {
+                    stops.push(Stop { slot, row, col: 0 });
+                    row += 1;
+                }
             }
-        }
-        for index in 0..self.profiles.len() {
-            stops.push(Stop {
-                slot: Slot::Delete(index),
-                row,
-                col: 0,
-            });
-            row += 1;
-        }
-        for slot in [Slot::Kind, Slot::Id] {
-            stops.push(Stop { slot, row, col: 0 });
-            row += 1;
-        }
-        stops.push(Stop {
-            slot: Slot::Detail,
-            row,
-            col: 0,
-        });
-        stops.push(Stop {
-            slot: Slot::Browse,
-            row,
-            col: 1,
-        });
-        row += 1;
-        stops.push(Stop {
-            slot: Slot::Add,
-            row,
-            col: 0,
-        });
-        row += 1;
-        for index in 0..self.consoles.len() {
-            stops.push(Stop {
-                slot: Slot::Console(index),
-                row,
-                col: 0,
-            });
-            row += 1;
+            Tab::Systems => {
+                for index in 0..self.systems.len() {
+                    stops.push(Stop {
+                        slot: Slot::SystemEmulator(index),
+                        row,
+                        col: 0,
+                    });
+                    row += 1;
+                    if self.retroarch_selected(index) {
+                        stops.push(Stop {
+                            slot: Slot::SystemCore(index),
+                            row,
+                            col: 0,
+                        });
+                        row += 1;
+                    }
+                    stops.push(Stop {
+                        slot: Slot::SystemArgs(index),
+                        row,
+                        col: 0,
+                    });
+                    row += 1;
+                }
+            }
         }
         stops.push(Stop {
             slot: Slot::Close,
@@ -710,57 +762,122 @@ impl Emulators {
 
     fn edit_mut(&mut self) -> Option<&mut LineEdit> {
         match self.focus {
-            Slot::Id => Some(&mut self.id),
-            Slot::Detail => Some(&mut self.detail),
+            Slot::Name => Some(&mut self.draft.name),
+            Slot::Path => Some(&mut self.draft.path),
+            Slot::GlobalArgs => Some(&mut self.draft.args),
+            Slot::SystemArgs(index) => self.systems.get_mut(index).map(|system| &mut system.args),
             _ => None,
         }
     }
 }
 
-/// Copy the dialog onto a config. Other fields (theme, cover width, scraper)
-/// stay as they were. Console rows the dialog does not know about are left alone.
-pub fn apply_assignments(
-    config: &mut Config,
-    profiles: &[EmulatorProfile],
-    consoles: &[ConsoleSlot],
-) {
-    config.profiles = profiles.to_vec();
+pub fn apply_assignments(config: &mut Config, emulators: &[Emulator], systems: &[SystemRow]) {
+    config.emulators = emulators.to_vec();
     for console in &mut config.consoles {
-        if let Some(slot) = consoles.iter().find(|slot| slot.id == console.id) {
-            console.profile = slot.profile.clone().filter(|id| !id.is_empty());
-        }
+        let Some(row) = systems.iter().find(|row| row.id == console.id) else {
+            continue;
+        };
+        let retroarch = row.emulator_id.as_ref().is_some_and(|id| {
+            emulators
+                .iter()
+                .any(|emulator| emulator.id == *id && emulator.kind == EmulatorKind::RetroArch)
+        });
+        console.emulator = row.emulator_id.clone().filter(|id| !id.is_empty());
+        console.core = if retroarch { row.core.clone() } else { None };
+        console.extra_args = row.args.text.clone();
     }
+}
+
+fn system_row(console: &Console) -> SystemRow {
+    SystemRow {
+        id: console.id.clone(),
+        name: console.name.clone(),
+        emulator_id: console.emulator.clone().filter(|id| !id.trim().is_empty()),
+        core: console.core.clone(),
+        args: LineEdit::plain(console.extra_args.clone()),
+    }
+}
+
+fn emulator_detail(emulator: &Emulator) -> String {
+    if emulator.global_args.trim().is_empty() {
+        format!("{} · {}", emulator.kind.label(), emulator.path)
+    } else {
+        format!(
+            "{} · {} · {}",
+            emulator.kind.label(),
+            emulator.path,
+            emulator.global_args.trim()
+        )
+    }
+}
+
+fn core_label(cores: &[DiscoveredCore], path: Option<&std::path::Path>) -> String {
+    let Some(path) = path else {
+        return "No core".to_string();
+    };
+    cores
+        .iter()
+        .find(|core| core.path == path)
+        .map(|core| core.name.clone())
+        .unwrap_or_else(|| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("core")
+                .to_string()
+        })
 }
 
 fn block_has_focus(block: &Block, focus: Slot) -> bool {
     match block {
-        Block::Core(line) => line.buttons.iter().any(|button| button.slot == Some(focus)),
-        Block::Profile(line) => focus == Slot::Delete(line.index),
-        Block::Kind { .. } => focus == Slot::Kind,
-        Block::Id { .. } => focus == Slot::Id,
-        Block::Detail { .. } => matches!(focus, Slot::Detail | Slot::Browse),
-        Block::Add { .. } => focus == Slot::Add,
-        Block::Console(line) => focus == Slot::Console(line.index),
-        Block::Close { .. } => focus == Slot::Close,
-        Block::Heading(_) | Block::Note(_) | Block::Error(_) => false,
-    }
-}
-
-fn profile_label(profile: &EmulatorProfile) -> String {
-    match profile {
-        EmulatorProfile::RetroArch { id, core, .. } => {
-            format!("{id} · RetroArch · {}", core.display())
+        Block::Emulator(line) => {
+            focus == Slot::Row(line.index) || focus == Slot::Delete(line.index)
         }
-        EmulatorProfile::Standalone { id, command } => format!("{id} · {command}"),
+        Block::Field { slot, .. } => focus == *slot,
+        Block::Kind { .. } => focus == Slot::Kind,
+        Block::Save { .. } => focus == Slot::Save,
+        Block::System(line) => {
+            focus == Slot::SystemEmulator(line.index)
+                || focus == Slot::SystemCore(line.index)
+                || focus == Slot::SystemArgs(line.index)
+        }
+        Block::Note(_) | Block::Error(_) | Block::Label(_) => false,
     }
 }
 
-fn caret_at_end(edit: &LineEdit) -> bool {
-    edit.replace || edit.caret >= edit.text.chars().count()
+fn slug(name: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "emulator".to_string()
+    } else {
+        out
+    }
 }
 
-fn caret_at_start(edit: &LineEdit) -> bool {
-    !edit.replace && edit.caret == 0
+fn fresh_id(base: &str, emulators: &[Emulator]) -> String {
+    if !emulators.iter().any(|emulator| emulator.id == base) {
+        return base.to_string();
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !emulators.iter().any(|emulator| emulator.id == candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 fn wrap(pos: usize, len: usize, delta: isize) -> usize {
@@ -773,8 +890,8 @@ fn wrap(pos: usize, len: usize, delta: isize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{self, Config};
-    use crate::types::{Console, GridArt, MediaToggles};
+    use crate::config::Config;
+    use crate::types::{EmulatorKind, GridArt, MediaToggles};
 
     fn snes() -> Console {
         Console {
@@ -782,7 +899,9 @@ mod tests {
             name: "Super Nintendo".into(),
             rom_dirs: vec![PathBuf::from("/tmp/roms/snes")],
             extensions: vec!["sfc".into()],
-            profile: None,
+            emulator: None,
+            core: None,
+            extra_args: String::new(),
             grid_art: GridArt::BoxArt,
             media: MediaToggles::default(),
         }
@@ -795,23 +914,17 @@ mod tests {
     fn dialog() -> Emulators {
         let mut config = Config::default();
         config.consoles.push(snes());
-        Emulators::open(&config, vec![snes9x()], true)
+        Emulators::open(&config, vec![snes9x()])
     }
 
-    #[test]
-    fn profiles_heading_is_not_inside_the_scroller() {
-        let dialog = dialog();
-        assert_eq!(dialog.blocks()[0], Block::Heading(PROFILES_HEADING));
-        assert!(dialog
-            .scroll_blocks()
-            .iter()
-            .all(|block| block != &Block::Heading(PROFILES_HEADING)));
-        let id = dialog
-            .scroll_blocks()
-            .iter()
-            .position(|block| matches!(block, Block::Id { aimed: true, .. }))
-            .unwrap();
-        assert_eq!(dialog.scroll_index(), id);
+    fn retroarch() -> Emulator {
+        Emulator {
+            id: "retroarch".into(),
+            name: "RetroArch".into(),
+            kind: EmulatorKind::RetroArch,
+            path: "retroarch".into(),
+            global_args: String::new(),
+        }
     }
 
     #[test]
@@ -825,220 +938,185 @@ mod tests {
     }
 
     #[test]
-    fn hidden_cores_are_not_stops_when_retroarch_is_absent() {
-        let mut config = Config::default();
-        config.consoles.push(snes());
-        let mut dialog = Emulators::open(&config, vec![snes9x()], false);
-        assert!(dialog
-            .blocks()
-            .iter()
-            .all(|block| !matches!(block, Block::Core(_))));
-        dialog.move_dir(NavDir::Up);
-        assert_eq!(dialog.focus(), Slot::Kind);
-    }
-
-    #[test]
-    fn add_and_assign_uses_the_discovered_core_profile() {
-        let mut dialog = dialog();
-        assert_eq!(dialog.focus(), Slot::Id);
-        assert!(!dialog.move_dir(NavDir::Up));
-        assert!(!dialog.move_dir(NavDir::Up));
-        assert_eq!(
-            dialog.focus(),
-            Slot::Core {
-                index: 0,
-                action: 0
-            }
-        );
-        dialog.move_dir(NavDir::Right);
-        assert_eq!(
-            dialog.focus(),
-            Slot::Core {
-                index: 0,
-                action: 1
-            }
-        );
-        assert_eq!(dialog.confirm(), EmulatorCommand::Write);
-        match &dialog.profiles()[0] {
-            EmulatorProfile::RetroArch { id, core, config } => {
-                assert_eq!(id, "snes9x");
-                assert_eq!(core, &PathBuf::from("/tmp/cores/snes9x_libretro.so"));
-                assert!(config.is_none());
-            }
-            EmulatorProfile::Standalone { .. } => panic!("expected RetroArch"),
-        }
-        assert_eq!(dialog.consoles()[0].profile.as_deref(), Some("snes9x"));
-        let line = dialog.blocks().into_iter().find_map(|block| match block {
-            Block::Core(line) => Some(line),
-            _ => None,
-        });
-        let line = line.unwrap();
-        assert_eq!(line.buttons[0].label, "Added");
-        assert!(!line.buttons[0].enabled);
-        assert_eq!(line.buttons[1].label, "Assigned to Super Nintendo");
-        assert!(!line.buttons[1].enabled);
-    }
-
-    #[test]
-    fn core_then_standalone_then_console_assignment() {
-        let mut dialog = dialog();
-        dialog.move_dir(NavDir::Up);
-        dialog.move_dir(NavDir::Up);
-        assert_eq!(dialog.confirm(), EmulatorCommand::Write);
-        assert_eq!(
-            dialog.focus(),
-            Slot::Core {
-                index: 0,
-                action: 0
-            }
-        );
-        dialog.tab(false);
-        dialog.tab(false);
-        dialog.tab(false);
-        assert_eq!(dialog.focus(), Slot::Id);
-        dialog.type_text("stub");
-        dialog.tab(false);
-        assert_eq!(dialog.focus(), Slot::Detail);
-        dialog.type_text("/tmp/stub.sh {rom}");
-        dialog.tab(false);
-        dialog.tab(false);
-        assert_eq!(dialog.focus(), Slot::Add);
-        assert_eq!(dialog.confirm(), EmulatorCommand::Write);
-        dialog.tab(false);
-        assert_eq!(dialog.focus(), Slot::Console(0));
-        assert_eq!(dialog.consoles()[0].profile, None);
-        assert!(dialog.move_dir(NavDir::Right));
-        assert_eq!(dialog.consoles()[0].profile.as_deref(), Some("snes9x"));
-        assert!(dialog.move_dir(NavDir::Right));
-        assert_eq!(dialog.consoles()[0].profile.as_deref(), Some("stub"));
-        match &dialog.profiles()[1] {
-            EmulatorProfile::Standalone { id, command } => {
-                assert_eq!(id, "stub");
-                assert_eq!(command, "/tmp/stub.sh {rom}");
-            }
-            EmulatorProfile::RetroArch { .. } => panic!("expected standalone"),
-        }
-    }
-
-    #[test]
-    fn delete_keeps_the_console_profile_id() {
-        let mut dialog = dialog();
-        dialog.move_dir(NavDir::Up);
-        dialog.move_dir(NavDir::Up);
-        dialog.move_dir(NavDir::Right);
-        dialog.confirm();
-        assert!(dialog.aim(Slot::Delete(0)));
-        assert_eq!(dialog.confirm(), EmulatorCommand::Write);
-        assert!(dialog.profiles().is_empty());
-        assert_eq!(dialog.consoles()[0].profile.as_deref(), Some("snes9x"));
-    }
-
-    #[test]
-    fn empty_add_does_not_write() {
-        let mut dialog = dialog();
-        assert!(dialog.aim(Slot::Add));
-        assert_eq!(dialog.confirm(), EmulatorCommand::None);
-        assert!(dialog.profiles().is_empty());
-        assert!(dialog
-            .blocks()
-            .iter()
-            .any(|block| matches!(block, Block::Error(_))));
-    }
-
-    #[test]
-    fn browse_fills_a_retroarch_id_from_the_file_name() {
-        let mut dialog = dialog();
-        dialog.set_core_path(PathBuf::from("/tmp/cores/fceumm_libretro.so"));
-        assert_eq!(dialog.focus(), Slot::Detail);
-        assert!(dialog.blocks().iter().any(|block| matches!(
+    fn the_scroller_is_one_tab_and_has_no_profile_id() {
+        let dialog = dialog();
+        assert_eq!(dialog.tab(), Tab::Emulators);
+        assert_eq!(dialog.focus(), Slot::Tabs);
+        let blocks = dialog.scroll_blocks();
+        assert!(blocks.iter().any(|block| matches!(
             block,
-            Block::Kind {
-                kind: Kind::RetroArch,
+            Block::Field {
+                slot: Slot::Name,
                 ..
             }
         )));
-        dialog.aim(Slot::Add);
-        assert_eq!(dialog.confirm(), EmulatorCommand::Write);
-        match &dialog.profiles()[0] {
-            EmulatorProfile::RetroArch { id, core, config } => {
-                assert_eq!(id, "fceumm");
-                assert_eq!(core, &PathBuf::from("/tmp/cores/fceumm_libretro.so"));
-                assert!(config.is_none());
-            }
-            EmulatorProfile::Standalone { .. } => panic!("expected RetroArch"),
-        }
+        assert!(blocks.iter().all(|block| !matches!(
+            block,
+            Block::Label(label) if label.contains("Profile")
+        )));
     }
 
     #[test]
-    fn manual_kind_cycle_writes_a_retroarch_profile() {
+    fn tab_keys_switch_tabs_and_leave_one_list() {
         let mut dialog = dialog();
-        dialog.move_dir(NavDir::Up);
-        assert_eq!(dialog.focus(), Slot::Kind);
-        assert!(!dialog.move_dir(NavDir::Right));
-        dialog.move_dir(NavDir::Down);
-        dialog.type_text("handy");
-        dialog.move_dir(NavDir::Down);
-        dialog.type_text("/tmp/cores/handy_libretro.so");
-        dialog.aim(Slot::Add);
-        dialog.confirm();
-        match &dialog.profiles()[0] {
-            EmulatorProfile::RetroArch { id, core, .. } => {
-                assert_eq!(id, "handy");
-                assert_eq!(core, &PathBuf::from("/tmp/cores/handy_libretro.so"));
-            }
-            EmulatorProfile::Standalone { .. } => panic!("expected RetroArch"),
-        }
+        dialog.cycle_tab();
+        assert_eq!(dialog.tab(), Tab::Systems);
+        assert_eq!(dialog.focus(), Slot::Tabs);
+        assert!(dialog
+            .scroll_blocks()
+            .iter()
+            .any(|block| matches!(block, Block::System(_))));
+        assert!(dialog
+            .scroll_blocks()
+            .iter()
+            .all(|block| !matches!(block, Block::Emulator(_))));
+        dialog.show(Tab::Emulators);
+        assert!(dialog
+            .scroll_blocks()
+            .iter()
+            .all(|block| !matches!(block, Block::System(_))));
     }
 
     #[test]
-    fn save_round_trips_profiles_and_leaves_the_rest_of_the_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let _env = config::XdgEnv::sandbox(dir.path());
+    fn add_edit_and_delete_an_emulator() {
+        let mut dialog = dialog();
+        dialog.aim(Slot::Name);
+        dialog.type_text("Dolphin");
+        dialog.aim(Slot::Path);
+        dialog.type_text("dolphin-emu");
+        dialog.aim(Slot::GlobalArgs);
+        dialog.type_text("-b -e {rom}");
+        assert_eq!(dialog.confirm(), EmulatorCommand::None);
+        dialog.aim(Slot::Save);
+        assert_eq!(dialog.confirm(), EmulatorCommand::Write);
+        assert_eq!(dialog.emulators().len(), 1);
+        assert_eq!(dialog.emulators()[0].id, "dolphin");
+        assert_eq!(dialog.emulators()[0].kind, EmulatorKind::Standalone);
+        assert_eq!(dialog.emulators()[0].global_args, "-b -e {rom}");
+
+        assert_eq!(dialog.focus(), Slot::Row(0));
+        dialog.confirm();
+        assert_eq!(dialog.focus(), Slot::Name);
+        dialog.aim(Slot::Path);
+        dialog.type_text(" --batch");
+        dialog.aim(Slot::Save);
+        assert_eq!(dialog.confirm(), EmulatorCommand::Write);
+        assert_eq!(dialog.emulators()[0].path, "dolphin-emu --batch");
+        assert_eq!(dialog.emulators()[0].id, "dolphin");
+
+        dialog.aim(Slot::Delete(0));
+        assert_eq!(dialog.confirm(), EmulatorCommand::Write);
+        assert!(dialog.emulators().is_empty());
+    }
+
+    #[test]
+    fn retroarch_kind_fills_an_empty_path() {
+        let mut dialog = dialog();
+        dialog.aim(Slot::Kind);
+        dialog.move_dir(NavDir::Right);
+        assert_eq!(dialog.focus(), Slot::Kind);
+        let kind = dialog
+            .blocks()
+            .into_iter()
+            .find_map(|block| match block {
+                Block::Kind { kind, .. } => Some(kind),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(kind, EmulatorKind::RetroArch);
+        dialog.aim(Slot::Path);
+        assert!(dialog.accepts_text());
+        let path = dialog
+            .blocks()
+            .into_iter()
+            .find_map(|block| match block {
+                Block::Field {
+                    slot: Slot::Path,
+                    edit,
+                    ..
+                } => Some(edit.text),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(path, "retroarch");
+    }
+
+    #[test]
+    fn system_core_is_enabled_only_for_retroarch() {
         let mut config = Config::default();
-        config.theme = "custom".into();
-        config.cover_width = 250.0;
+        config.emulators.push(retroarch());
+        config.emulators.push(Emulator {
+            id: "dolphin".into(),
+            name: "Dolphin".into(),
+            kind: EmulatorKind::Standalone,
+            path: "dolphin-emu".into(),
+            global_args: String::new(),
+        });
         config.consoles.push(snes());
-        config::save_config(&config).unwrap();
-
-        let mut dialog = Emulators::open(&config::load_config().unwrap(), vec![snes9x()], true);
-        dialog.move_dir(NavDir::Up);
-        dialog.move_dir(NavDir::Up);
-        dialog.confirm();
-        dialog.tab(false);
-        dialog.tab(false);
-        dialog.tab(false);
-        dialog.type_text("stub");
-        dialog.tab(false);
-        dialog.type_text("stub.sh {rom}");
-        dialog.tab(false);
-        dialog.tab(false);
-        dialog.confirm();
-        dialog.tab(false);
-        dialog.move_dir(NavDir::Right);
-        dialog.move_dir(NavDir::Right);
-
-        let mut stored = config::load_config().unwrap();
-        apply_assignments(&mut stored, dialog.profiles(), dialog.consoles());
-        config::save_config(&stored).unwrap();
-        let loaded = config::load_config().unwrap();
-        assert_eq!(loaded.theme, "custom");
-        assert_eq!(loaded.cover_width, 250.0);
+        let mut dialog = Emulators::open(&config, vec![snes9x()]);
+        dialog.show(Tab::Systems);
+        dialog.aim(Slot::SystemEmulator(0));
+        assert!(dialog.move_dir(NavDir::Right));
         assert_eq!(
-            loaded.consoles[0].rom_dirs,
-            vec![PathBuf::from("/tmp/roms/snes")]
+            dialog.systems()[0].emulator_id.as_deref(),
+            Some("retroarch")
         );
-        assert_eq!(loaded.consoles[0].profile.as_deref(), Some("stub"));
-        assert_eq!(loaded.profiles.len(), 2);
-        let text = std::fs::read_to_string(config::config_path().unwrap()).unwrap();
-        assert!(
-            text.contains("type = 'RetroArch'") || text.contains("type = \"RetroArch\""),
-            "{text}"
+        assert!(dialog.aim(Slot::SystemCore(0)));
+        assert!(dialog.move_dir(NavDir::Right));
+        assert_eq!(
+            dialog.systems()[0].core.as_deref(),
+            Some(std::path::Path::new("/tmp/cores/snes9x_libretro.so"))
         );
-        assert!(text.contains("snes9x_libretro.so"), "{text}");
-        assert!(
-            text.contains("stub.sh {{rom}}") || text.contains("stub.sh {rom}"),
-            "{text}"
+        dialog.aim(Slot::SystemEmulator(0));
+        assert!(!dialog.move_dir(NavDir::Down));
+        assert_eq!(dialog.focus(), Slot::SystemCore(0));
+        assert_eq!(
+            dialog.systems()[0].emulator_id.as_deref(),
+            Some("retroarch")
         );
-        assert!(!text.contains("\nconfig ="), "{text}");
+        assert!(!dialog.move_dir(NavDir::Down));
+        assert_eq!(dialog.focus(), Slot::SystemArgs(0));
+        dialog.type_text("--verbose");
+        assert!(dialog.move_dir(NavDir::Up));
+        assert_eq!(dialog.focus(), Slot::SystemCore(0));
+        assert_eq!(dialog.systems()[0].args.text, "--verbose");
+
+        dialog.aim(Slot::SystemEmulator(0));
+        dialog.move_dir(NavDir::Right);
+        assert_eq!(dialog.systems()[0].emulator_id.as_deref(), Some("dolphin"));
+        assert!(dialog.systems()[0].core.is_none());
+        assert!(!dialog.aim(Slot::SystemCore(0)));
+    }
+
+    #[test]
+    fn save_round_trips_emulators_and_leaves_the_rest_of_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = crate::config::XdgEnv::sandbox(dir.path());
+        let mut stored = Config::default();
+        stored.theme = "launchbox".into();
+        stored.cover_width = 240.0;
+        stored.consoles.push(snes());
+        crate::config::save_config(&stored).unwrap();
+
+        let mut dialog = Emulators::open(&stored, vec![snes9x()]);
+        dialog.emulators.push(retroarch());
+        dialog.systems[0].emulator_id = Some("retroarch".into());
+        dialog.systems[0].core = Some(PathBuf::from("/tmp/cores/snes9x_libretro.so"));
+        dialog.systems[0].args = LineEdit::plain("--verbose".into());
+        let mut loaded = crate::config::load_config().unwrap();
+        apply_assignments(&mut loaded, dialog.emulators(), dialog.systems());
+        crate::config::save_config(&loaded).unwrap();
+
+        let loaded = crate::config::load_config().unwrap();
+        assert_eq!(loaded.theme, "launchbox");
+        assert_eq!(loaded.cover_width, 240.0);
+        assert_eq!(loaded.emulators.len(), 1);
+        assert_eq!(loaded.emulators[0].id, "retroarch");
+        assert_eq!(loaded.consoles[0].emulator.as_deref(), Some("retroarch"));
+        assert_eq!(
+            loaded.consoles[0].core.as_deref(),
+            Some(std::path::Path::new("/tmp/cores/snes9x_libretro.so"))
+        );
+        assert_eq!(loaded.consoles[0].extra_args, "--verbose");
     }
 }

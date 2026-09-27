@@ -12,8 +12,15 @@ pub struct Console {
     pub name: String,
     pub rom_dirs: Vec<PathBuf>,
     pub extensions: Vec<String>,
-    #[serde(default)]
-    pub profile: Option<ProfileId>,
+    /// Emulator id from [`Config::emulators`]. Empty means this system is unassigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emulator: Option<String>,
+    /// Libretro core. Read when the assigned emulator is RetroArch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core: Option<PathBuf>,
+    /// Appended after the emulator's global arguments.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extra_args: String,
     /// Which cached artwork the game grid prefers for this console.
     /// Serialized before `media` so it stays a key on the console table.
     #[serde(default)]
@@ -397,25 +404,105 @@ pub enum Source {
     Local,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum EmulatorProfile {
-    RetroArch {
-        id: ProfileId,
-        core: PathBuf,
-        config: Option<PathBuf>,
-    },
-    Standalone {
-        id: ProfileId,
-        command: String,
-    },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmulatorKind {
+    RetroArch,
+    Standalone,
 }
 
-impl EmulatorProfile {
-    pub fn id(&self) -> &ProfileId {
+impl EmulatorKind {
+    pub fn label(self) -> &'static str {
         match self {
-            EmulatorProfile::RetroArch { id, .. } => id,
-            EmulatorProfile::Standalone { id, .. } => id,
+            Self::RetroArch => "RetroArch",
+            Self::Standalone => "Standalone",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        if text.eq_ignore_ascii_case("retroarch") {
+            Some(Self::RetroArch)
+        } else if text.eq_ignore_ascii_case("standalone") {
+            Some(Self::Standalone)
+        } else {
+            None
+        }
+    }
+}
+
+impl Serialize for EmulatorKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.label())
+    }
+}
+
+impl<'de> Deserialize<'de> for EmulatorKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown emulator kind {text:?} (expected RetroArch or Standalone)"
+            ))
+        })
+    }
+}
+
+/// One installed emulator. RetroArch is a single entry. Cores live on systems.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Emulator {
+    pub id: String,
+    pub name: String,
+    pub kind: EmulatorKind,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub global_args: String,
+}
+
+/// Which emulator launches one library system, and the args added for that system.
+/// `core` is used only when that emulator's kind is RetroArch.
+/// Stored on the console as `emulator`, `core`, and `extra_args`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemEmulator {
+    pub system: ConsoleId,
+    pub emulator_id: String,
+    pub core: Option<PathBuf>,
+    pub extra_args: String,
+}
+
+/// Emulator plus the system-specific core and args used to launch one game.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLaunch {
+    pub emulator: Emulator,
+    pub core: Option<PathBuf>,
+    pub extra_args: String,
+}
+
+impl Console {
+    pub fn system_emulator(&self) -> Option<SystemEmulator> {
+        let emulator_id = self
+            .emulator
+            .as_ref()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())?;
+        Some(SystemEmulator {
+            system: self.id.clone(),
+            emulator_id: emulator_id.to_string(),
+            core: self.core.clone(),
+            extra_args: self.extra_args.clone(),
+        })
+    }
+
+    pub fn set_system_emulator(&mut self, assignment: Option<SystemEmulator>) {
+        match assignment {
+            Some(assignment) => {
+                self.emulator = Some(assignment.emulator_id);
+                self.core = assignment.core;
+                self.extra_args = assignment.extra_args;
+            }
+            None => {
+                self.emulator = None;
+                self.core = None;
+                self.extra_args.clear();
+            }
         }
     }
 }

@@ -1,102 +1,157 @@
-use crate::types::EmulatorProfile;
+use crate::types::{Emulator, EmulatorKind, ResolvedLaunch};
 use anyhow::{anyhow, Result};
 use std::path::Path;
 use std::process::{Child, Command};
 
-pub fn build_launch_command(profile: &EmulatorProfile, rom: &Path) -> Result<(String, Vec<String>)> {
-    match profile {
-        EmulatorProfile::RetroArch { core, config, .. } => {
-            let mut args = vec!["-L".to_string(), core.to_string_lossy().to_string()];
-            if let Some(cfg) = config {
-                args.push("--config".to_string());
-                args.push(cfg.to_string_lossy().to_string());
-            }
-            args.push(rom.to_string_lossy().to_string());
-            Ok(("retroarch".to_string(), args))
-        }
-        EmulatorProfile::Standalone { command, .. } => {
-            let substituted = command.replace("{rom}", &rom.to_string_lossy());
-            let parts = shell_words::split(&substituted)
-                .map_err(|e| anyhow!("Failed to parse command: {}", e))?;
-            if parts.is_empty() {
-                return Err(anyhow!("Empty command"));
-            }
-            let (program, args) = parts.split_first().unwrap();
-            Ok((program.to_string(), args.to_vec()))
-        }
+/// `program` is the emulator path. Arguments are global args, then `-L <core>`
+/// for RetroArch, then the system's extra args, then the ROM.
+/// `{rom}` inside either argument string is replaced and the ROM is not appended again.
+pub fn build_launch_command(
+    emulator: &Emulator,
+    core: Option<&Path>,
+    extra_args: &str,
+    rom: &Path,
+) -> Result<(String, Vec<String>)> {
+    let program = emulator.path.trim();
+    if program.is_empty() {
+        return Err(anyhow!(
+            "Emulator \"{}\" has no executable path.",
+            emulator.name
+        ));
     }
+    let rom_text = rom.to_string_lossy();
+    let (global, global_rom) = tokenize(&emulator.global_args, &rom_text)?;
+    let (extra, extra_rom) = tokenize(extra_args, &rom_text)?;
+    let mut args = global;
+    if emulator.kind == EmulatorKind::RetroArch {
+        let core = core.ok_or_else(|| {
+            anyhow!("RetroArch needs a core for this system. Set one in Manage Emulators.")
+        })?;
+        args.push("-L".to_string());
+        args.push(core.to_string_lossy().into_owned());
+    }
+    args.extend(extra);
+    if !(global_rom || extra_rom) {
+        args.push(rom_text.into_owned());
+    }
+    Ok((program.to_string(), args))
 }
 
-
-pub fn launch_game_tracked(profile: &EmulatorProfile, rom: &Path) -> Result<Child> {
-    let (program, args) = build_launch_command(profile, rom)?;
+pub fn launch_game_tracked(launch: &ResolvedLaunch, rom: &Path) -> Result<Child> {
+    let (program, args) = build_launch_command(
+        &launch.emulator,
+        launch.core.as_deref(),
+        &launch.extra_args,
+        rom,
+    )?;
     Command::new(&program)
         .args(&args)
         .spawn()
-        .map_err(|e| anyhow!("Failed to launch {}: {}", program, e))
+        .map_err(|err| anyhow!("Failed to launch {program}: {err}"))
+}
+
+fn tokenize(args: &str, rom: &str) -> Result<(Vec<String>, bool)> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let used = trimmed.contains("{rom}");
+    let substituted = trimmed.replace("{rom}", rom);
+    let parts = shell_words::split(&substituted)
+        .map_err(|err| anyhow!("Failed to parse command: {err}"))?;
+    Ok((parts, used))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::EmulatorKind;
     use std::path::PathBuf;
 
-    #[test]
-    fn test_retroarch_command() {
-        let profile = EmulatorProfile::RetroArch {
-            id: "snes9x".to_string(),
-            core: PathBuf::from("/usr/lib/libretro/snes9x_libretro.so"),
-            config: None,
-        };
-        let rom = PathBuf::from("/roms/game.sfc");
-        let (program, args) = build_launch_command(&profile, &rom).unwrap();
-        assert_eq!(program, "retroarch");
-        assert_eq!(args, vec!["-L", "/usr/lib/libretro/snes9x_libretro.so", "/roms/game.sfc"]);
+    fn retroarch(global_args: &str) -> Emulator {
+        Emulator {
+            id: "retroarch".into(),
+            name: "RetroArch".into(),
+            kind: EmulatorKind::RetroArch,
+            path: "/usr/bin/retroarch".into(),
+            global_args: global_args.into(),
+        }
     }
 
     #[test]
-    fn test_retroarch_with_config() {
-        let profile = EmulatorProfile::RetroArch {
-            id: "snes9x".to_string(),
-            core: PathBuf::from("/usr/lib/libretro/snes9x_libretro.so"),
-            config: Some(PathBuf::from("/home/user/.config/retroarch/snes.cfg")),
-        };
+    fn retroarch_command_is_path_global_core_extra_and_rom() {
+        let emulator = retroarch("--verbose");
         let rom = PathBuf::from("/roms/game.sfc");
-        let (program, args) = build_launch_command(&profile, &rom).unwrap();
-        assert_eq!(program, "retroarch");
+        let core = PathBuf::from("/usr/lib/libretro/snes9x_libretro.so");
+        let (program, args) =
+            build_launch_command(&emulator, Some(&core), "--config /cfg/snes.cfg", &rom).unwrap();
+        assert_eq!(program, "/usr/bin/retroarch");
         assert_eq!(
             args,
             vec![
+                "--verbose",
                 "-L",
                 "/usr/lib/libretro/snes9x_libretro.so",
                 "--config",
-                "/home/user/.config/retroarch/snes.cfg",
-                "/roms/game.sfc"
+                "/cfg/snes.cfg",
+                "/roms/game.sfc",
             ]
         );
     }
 
     #[test]
-    fn test_standalone_command() {
-        let profile = EmulatorProfile::Standalone {
-            id: "dolphin".to_string(),
-            command: "dolphin-emu -b -e {rom}".to_string(),
+    fn retroarch_without_a_core_fails() {
+        let emulator = retroarch("");
+        let err =
+            build_launch_command(&emulator, None, "", Path::new("/roms/game.sfc")).unwrap_err();
+        assert!(err.to_string().contains("needs a core"), "{err}");
+    }
+
+    #[test]
+    fn standalone_substitutes_rom_placeholder_and_does_not_append_it() {
+        let emulator = Emulator {
+            id: "dolphin".into(),
+            name: "Dolphin".into(),
+            kind: EmulatorKind::Standalone,
+            path: "dolphin-emu".into(),
+            global_args: "-b -e {rom}".into(),
         };
         let rom = PathBuf::from("/roms/game.iso");
-        let (program, args) = build_launch_command(&profile, &rom).unwrap();
+        let (program, args) = build_launch_command(&emulator, None, "", &rom).unwrap();
         assert_eq!(program, "dolphin-emu");
         assert_eq!(args, vec!["-b", "-e", "/roms/game.iso"]);
     }
 
     #[test]
-    fn test_standalone_with_quotes() {
-        let profile = EmulatorProfile::Standalone {
-            id: "pcsx2".to_string(),
-            command: "pcsx2 --fullscreen \"{rom}\"".to_string(),
+    fn standalone_appends_the_rom_when_no_placeholder_is_present() {
+        let emulator = Emulator {
+            id: "pcsx2".into(),
+            name: "PCSX2".into(),
+            kind: EmulatorKind::Standalone,
+            path: "pcsx2".into(),
+            global_args: "--fullscreen".into(),
         };
         let rom = PathBuf::from("/roms/game with spaces.iso");
-        let (program, args) = build_launch_command(&profile, &rom).unwrap();
+        let (program, args) = build_launch_command(&emulator, None, "", &rom).unwrap();
         assert_eq!(program, "pcsx2");
         assert_eq!(args, vec!["--fullscreen", "/roms/game with spaces.iso"]);
+    }
+
+    #[test]
+    fn quoted_rom_placeholder_keeps_spaces() {
+        let emulator = Emulator {
+            id: "pcsx2".into(),
+            name: "PCSX2".into(),
+            kind: EmulatorKind::Standalone,
+            path: "pcsx2".into(),
+            global_args: "--fullscreen \"{rom}\"".into(),
+        };
+        let rom = PathBuf::from("/roms/game with spaces.iso");
+        let (program, args) = build_launch_command(&emulator, None, "-f", &rom).unwrap();
+        assert_eq!(program, "pcsx2");
+        assert_eq!(
+            args,
+            vec!["--fullscreen", "/roms/game with spaces.iso", "-f"]
+        );
     }
 }
