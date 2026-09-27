@@ -21,12 +21,22 @@ pub struct Console {
     pub media: MediaToggles,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GameMetadata {
+    pub title: Option<String>,
+    pub publisher: Option<String>,
+    pub year: Option<u32>,
+    pub genre: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Game {
     pub id: GameId,
     pub console: ConsoleId,
     pub rom: PathBuf,
-    pub title: String,
+    pub file_title: String,
+    pub user_title: Option<String>,
+    pub metadata: Option<GameMetadata>,
     pub crc32: Option<u32>,
     pub profile: Option<ProfileId>,
     pub media: Vec<Media>,
@@ -37,7 +47,26 @@ pub struct Game {
     pub favorite: bool,
 }
 
-/// Context menu on a selected game tile.
+impl Game {
+    pub fn display_title(&self) -> &str {
+        if let Some(title) = nonempty(self.user_title.as_deref()) {
+            return title;
+        }
+        if let Some(title) = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| nonempty(metadata.title.as_deref()))
+        {
+            return title;
+        }
+        &self.file_title
+    }
+}
+
+fn nonempty(text: Option<&str>) -> Option<&str> {
+    text.map(str::trim).filter(|text| !text.is_empty())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameAction {
     Scrape,
@@ -125,10 +154,13 @@ pub fn game_matches(game: &Game, query: &str, filter: GridFilter) -> bool {
         return false;
     }
     let query = query.trim();
-    query.is_empty() || game.title.to_lowercase().contains(&query.to_lowercase())
+    query.is_empty()
+        || game
+            .display_title()
+            .to_lowercase()
+            .contains(&query.to_lowercase())
 }
 
-/// Title query plus [`GridFilter`]. `query` is matched case-insensitively.
 pub fn visible_games(games: &[Game], query: &str, filter: GridFilter) -> Vec<Game> {
     games
         .iter()
@@ -397,7 +429,9 @@ mod tests {
             id: title.to_string(),
             console: "snes".to_string(),
             rom: PathBuf::from(title),
-            title: title.to_string(),
+            file_title: title.to_string(),
+            user_title: None,
+            metadata: None,
             crc32: None,
             profile: None,
             media: Vec::new(),
@@ -419,17 +453,46 @@ mod tests {
         assert_eq!(
             favorites
                 .iter()
-                .map(|g| g.title.as_str())
+                .map(|g| g.display_title())
                 .collect::<Vec<_>>(),
             vec!["Alpha", "Alpine"]
         );
         let queried = visible_games(&games, "alp", GridFilter::All);
         assert_eq!(
-            queried.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(),
+            queried
+                .iter()
+                .map(|g| g.display_title())
+                .collect::<Vec<_>>(),
             vec!["Alpha", "Alpine"]
         );
         let both = visible_games(&games, "beta", GridFilter::Favorites);
         assert!(both.is_empty());
+    }
+
+    #[test]
+    fn display_title_prefers_rename_then_scraped_then_file() {
+        let mut game = game("chrono trigger", false);
+        assert_eq!(game.display_title(), "chrono trigger");
+        game.metadata = Some(GameMetadata {
+            title: Some("Chrono Trigger".into()),
+            ..GameMetadata::default()
+        });
+        assert_eq!(game.display_title(), "Chrono Trigger");
+        game.user_title = Some("My Chrono".into());
+        assert_eq!(game.display_title(), "My Chrono");
+        game.user_title = Some("   ".into());
+        assert_eq!(game.display_title(), "Chrono Trigger");
+    }
+
+    #[test]
+    fn filter_matches_scraped_name_when_file_title_does_not() {
+        let mut game = game("zzz", false);
+        game.metadata = Some(GameMetadata {
+            title: Some("Chrono Trigger".into()),
+            ..GameMetadata::default()
+        });
+        assert!(game_matches(&game, "Chrono", GridFilter::All));
+        assert!(!game.file_title.to_lowercase().contains("chrono"));
     }
 
     #[test]
