@@ -1,4 +1,4 @@
-//! GTK Scraper settings.
+//! Scraper settings.
 //!
 //! The draft is [`ScraperConfig`]: `box_art`, `screenshot`, `providers` in
 //! priority order (`id` + `enabled`), and `credentials` (`screenscraper_user`,
@@ -20,7 +20,7 @@ pub const PROVIDERS_NOTE: &str =
 pub const CREDS_HEADING: &str = "Credentials";
 pub const CREDS_NOTE: &str = "Stored in config.toml. ScreenScraper needs your free member username and password. The application Softname is built in. TheGamesDB needs an API key.";
 
-/// Ctrl+G, including Ctrl+Shift+G. GTK checks the control mask and `g` / `G`.
+/// Ctrl+G, including Ctrl+Shift+G. The control mask must be set.
 pub fn scraper_key(key: &str, key_char: Option<&str>, control: bool) -> bool {
     if !control {
         return false;
@@ -553,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_g_matches_the_gtk_chord() {
+    fn ctrl_g_opens_scraper_settings() {
         assert!(scraper_key("g", None, true));
         assert!(scraper_key("G", None, true));
         assert!(scraper_key("g", Some("G"), true));
@@ -562,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn opens_on_box_art_with_the_gtk_rows() {
+    fn opens_on_box_art_with_the_settings_rows() {
         let mut dialog = ScraperSettings::open(ScraperConfig::default());
         assert_eq!(dialog.focus(), Slot::BoxArt);
         let blocks = dialog.blocks();

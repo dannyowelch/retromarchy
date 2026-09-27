@@ -1,4 +1,4 @@
-//! GTK Options → Input. Four millisecond spins, saved to `[input]` as they change.
+//! Options → Input. Four millisecond spins, saved to `[input]` as they change.
 //!
 //! The window title is Options. The group is Input. Each spin steps by 10 and
 //! stops at 60_000. Starting pause and the transition may be 0. The repeat
@@ -8,9 +8,8 @@
 use crate::config::InputSettings;
 use crate::gamepad::NavDir;
 
-/// GTK spin step. `with_range(..., 10.0)`.
 pub const STEP_MS: u32 = 10;
-/// GTK spin upper bound, and the cap in [`InputSettings::sanitize`].
+/// Spin upper bound, and the cap in [`InputSettings::sanitize`].
 pub const MAX_MS: u32 = 60_000;
 
 pub const SECTION: &str = "Input";
@@ -210,7 +209,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn opens_on_the_gtk_defaults() {
+    fn opens_on_the_input_defaults() {
         let dialog = InputOptions::open(InputSettings::default());
         assert_eq!(dialog.focus(), Slot::Starting);
         let rows = dialog.rows();
@@ -227,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn steps_stay_inside_the_gtk_spin_range() {
+    fn steps_stay_inside_the_spin_range() {
         let mut dialog = InputOptions::open(InputSettings::default());
         assert!(dialog.move_dir(NavDir::Left));
         assert_eq!(dialog.input().initial_delay_ms, 390);

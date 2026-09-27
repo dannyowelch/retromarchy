@@ -1,4 +1,4 @@
-//! ROM import steps from the GTK dialog: ES-DE root, or one system.
+//! ROM import steps: an ES-DE root, or one system.
 //! The shell paints this. Folder discovery and the library write live in [`crate::importer`].
 
 use crate::catalog;
@@ -146,7 +146,7 @@ pub struct ImportWizard {
     stash: Option<Page>,
 }
 
-/// Ctrl+I, including Ctrl+Shift+I. GTK checks the control mask and `i` / `I`.
+/// Ctrl+I, including Ctrl+Shift+I. The control mask must be set.
 pub fn import_key(key: &str, key_char: Option<&str>, control: bool) -> bool {
     if !control {
         return false;
@@ -752,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_i_matches_the_gtk_chord() {
+    fn ctrl_i_opens_import() {
         assert!(import_key("i", None, true));
         assert!(import_key("I", None, true));
         assert!(import_key("i", Some("I"), true));
