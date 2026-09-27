@@ -1,12 +1,12 @@
 use crate::appearance::{self, launchbox_theme, theme_key};
 use crate::browse::{
     clamp_cover_width, columns_for, cover_path, file_for, format_play_time, grid_art_key,
-    image_aspect, is_launch_key, key_from_parts, rescan_key, resolve_profile, row_of, scrape_chord,
-    title_search_key, Browse, Confirm, Key, LibraryKind, Pane, ScrapeChord, TileFrame,
-    COVER_WIDTH_MAX, COVER_WIDTH_MIN, COVER_WIDTH_STEP, DETAILS_PAD, DETAILS_WIDTH, GRID_PAD,
-    SIDEBAR_WIDTH, TILE_GAP,
+    image_aspect, is_launch_key, key_from_parts, rescan_key, resolve_profile, reveal_row_scroll,
+    row_of, row_reveal_insets, scrape_chord, system_sort_key, title_search_key, Browse, Confirm,
+    Key, LibraryKind, Pane, ScrapeChord, TileFrame, COVER_WIDTH_MAX, COVER_WIDTH_MIN,
+    COVER_WIDTH_STEP, DETAILS_PAD, DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH, TILE_GAP,
 };
-use crate::config::{self, InputSettings};
+use crate::config::{self, InputSettings, SystemSort};
 use crate::cores;
 use crate::database;
 use crate::emulators::{emulator_key, Block, EmulatorCommand, Emulators, Kind, Slot};
@@ -423,6 +423,22 @@ impl Shell {
             )
         {
             self.toggle_appearance(cx);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if !event.is_held
+            && !self.browse.search_open()
+            && system_sort_key(
+                event.keystroke.key.as_str(),
+                event.keystroke.key_char.as_deref(),
+                event.keystroke.modifiers.shift,
+                event.keystroke.modifiers.control
+                    || event.keystroke.modifiers.alt
+                    || event.keystroke.modifiers.platform,
+            )
+        {
+            self.choose_system_sort(self.browse.library.system_sort.next());
             cx.notify();
             cx.stop_propagation();
             return;
@@ -1019,6 +1035,25 @@ impl Shell {
         self.input = input;
         if let Err(err) = config::save_input_settings(input) {
             self.browse.status = format!("Could not save input ({err}).");
+        }
+    }
+
+    fn choose_system_sort(&mut self, sort: SystemSort) {
+        let previous = self.browse.library.system_sort;
+        if !self.browse.set_system_sort(sort) {
+            return;
+        }
+        // The console index moved with the shelf. Keep the grid where it is.
+        self.revealed_console = Some(self.browse.console);
+        self.scroll_sidebar_to_console(self.browse.console);
+        if self.browse.library.kind != LibraryKind::Disk {
+            return;
+        }
+        if let Err(err) = config::save_system_sort(sort) {
+            self.browse.set_system_sort(previous);
+            self.revealed_console = Some(self.browse.console);
+            self.scroll_sidebar_to_console(self.browse.console);
+            self.browse.status = format!("Could not save system sort ({err}).");
         }
     }
 
@@ -1833,16 +1868,73 @@ impl Shell {
         }
         if self.revealed_console != Some(console) {
             self.grid_scroll.set_offset(point(px(0.), px(0.)));
-            if self.sidebar_scroll.bounds().size.height > px(0.) {
-                self.sidebar_scroll.scroll_to_item(console + 1);
-            }
+            self.scroll_sidebar_to_console(console);
         }
-        if let Some(index) = game {
-            self.grid_scroll.scroll_to_item(row_of(index, columns));
+        let revealed = match game {
+            Some(index) => self.reveal_grid_row(row_of(index, columns)),
+            None => true,
+        };
+        if revealed {
+            self.revealed_console = Some(console);
+            self.revealed_game = game;
+            self.revealed_columns = columns;
         }
-        self.revealed_console = Some(console);
-        self.revealed_game = game;
-        self.revealed_columns = columns;
+    }
+
+    fn scroll_sidebar_to_console(&self, index: usize) {
+        if self.sidebar_scroll.bounds().size.height > px(0.) {
+            self.sidebar_scroll.scroll_to_item(index);
+        }
+    }
+
+    /// Move the selected row into view from the previous frame's child bounds.
+    /// Returns false when those bounds are for a different row count, so the
+    /// next frame can try again. `scroll_to_item` is not used: it aligns the
+    /// row's border box and scrolls the grid's padding off the pane.
+    fn reveal_grid_row(&self, row: usize) -> bool {
+        let columns = self.browse.columns.max(1);
+        let games = self.browse.visible_len();
+        let rows = if games == 0 {
+            0
+        } else {
+            games.div_ceil(columns)
+        };
+        let scroll = &self.grid_scroll;
+        if rows == 0 || row >= rows || scroll.children_count() != rows {
+            return false;
+        }
+        let Some(bounds) = scroll.bounds_for_item(row) else {
+            return false;
+        };
+        let viewport = scroll.bounds();
+        let viewport_height = viewport.size.height.as_f32();
+        if viewport_height <= 0.0 {
+            return false;
+        }
+        let row_top = (bounds.top() - viewport.top()).as_f32();
+        let row_bottom = (bounds.bottom() - viewport.top()).as_f32();
+        let max_scroll = scroll.max_offset().y.as_f32();
+        let (before, after) = row_reveal_insets(
+            row,
+            rows,
+            row_top,
+            row_bottom,
+            viewport_height,
+            max_scroll,
+            TILE_GAP,
+        );
+        let next = reveal_row_scroll(
+            -(scroll.offset().y.as_f32()),
+            viewport_height,
+            max_scroll,
+            row_top,
+            row_bottom,
+            before,
+            after,
+        );
+        let y = if next <= 0.0 { px(0.) } else { px(-next) };
+        scroll.set_offset(point(px(0.), y));
+        true
     }
 
     fn reveal_emulators(&mut self) {
@@ -2262,60 +2354,141 @@ fn sidebar(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl 
         .flex_shrink_0()
         .flex()
         .flex_col()
-        .overflow_y_scroll()
-        .track_scroll(scroll)
         .bg(theme.inset)
         .border_r_1()
         .border_color(if focused { theme.accent } else { theme.border })
-        .p(px(8.))
-        .gap(px(4.))
+        .child(sidebar_header(browse, cx))
         .child(
             div()
-                .flex_shrink_0()
-                .px(px(8.))
-                .py(px(6.))
+                .id("sidebar-list")
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .track_scroll(scroll)
+                .p(px(8.))
+                .gap(px(4.))
+                .children(sidebar_consoles(browse, cx)),
+        )
+}
+
+fn sidebar_header(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(8.))
+        .px(px(16.))
+        .pt(px(10.))
+        .pb(px(8.))
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .min_w(px(0.))
                 .text_size(px(12.))
                 .text_color(theme.secondary)
-                .child("Systems"),
+                .child("Systems")
+                .child(keycap("o", cx)),
         )
-        .children(
-            browse
-                .library
-                .shelves
-                .iter()
-                .enumerate()
-                .map(|(index, shelf)| {
-                    let selected = index == browse.console;
+        .child(system_sort_control(browse, cx))
+}
+
+fn system_sort_control(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .id("system-sort")
+        .flex()
+        .flex_shrink_0()
+        .border_1()
+        .border_color(theme.border)
+        .child(sort_segment(browse, SystemSort::Name, false, cx))
+        .child(sort_segment(browse, SystemSort::Year, true, cx))
+}
+
+fn sort_segment(
+    browse: &Browse,
+    sort: SystemSort,
+    divider: bool,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let on = browse.library.system_sort == sort;
+    let mut segment = div()
+        .id(match sort {
+            SystemSort::Name => "sort-name",
+            SystemSort::Year => "sort-year",
+        })
+        .px(px(6.))
+        .py(px(4.))
+        .text_size(px(12.))
+        .cursor_pointer()
+        .bg(if on {
+            theme.selected_fill()
+        } else {
+            theme.background
+        })
+        .text_color(if on { theme.accent } else { theme.foreground })
+        .hover(|style| style.bg(theme.hover_fill()))
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                this.choose_system_sort(sort);
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+        .child(sort.label());
+    if divider {
+        segment = segment.border_l_1().border_color(theme.border);
+    }
+    segment
+}
+
+fn sidebar_consoles(browse: &Browse, cx: &Context<Shell>) -> Vec<impl IntoElement> {
+    let theme = cx.omarchy();
+    browse
+        .library
+        .shelves
+        .iter()
+        .enumerate()
+        .map(|(index, shelf)| {
+            let selected = index == browse.console;
+            div()
+                .id(("console", index))
+                .flex_shrink_0()
+                .px(px(8.))
+                .py(px(8.))
+                .bg(if selected {
+                    theme.selected_fill()
+                } else {
+                    theme.background
+                })
+                .border_1()
+                .border_color(if selected { theme.accent } else { theme.border })
+                .hover(|style| style.bg(theme.hover_fill()))
+                .on_click(
+                    cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                        this.revealed_console = None;
+                        this.browse.select_console(index);
+                        this.focus_handle.focus(window, cx);
+                        cx.notify();
+                    }),
+                )
+                .child(shelf.console.name.clone())
+                .child(
                     div()
-                        .id(("console", index))
-                        .flex_shrink_0()
-                        .px(px(8.))
-                        .py(px(8.))
-                        .bg(if selected {
-                            theme.selected_fill()
-                        } else {
-                            theme.background
-                        })
-                        .border_1()
-                        .border_color(if selected { theme.accent } else { theme.border })
-                        .hover(|style| style.bg(theme.hover_fill()))
-                        .on_click(cx.listener(
-                            move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                                this.revealed_console = None;
-                                this.browse.select_console(index);
-                                this.focus_handle.focus(window, cx);
-                                cx.notify();
-                            },
-                        ))
-                        .child(shelf.console.name.clone())
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(theme.secondary)
-                                .child(format!("{} games", shelf.games.len())),
-                        )
-                }),
-        )
+                        .text_size(px(12.))
+                        .text_color(theme.secondary)
+                        .child(format!("{} games", shelf.games.len())),
+                )
+        })
+        .collect()
 }
 
 fn grid(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl IntoElement {

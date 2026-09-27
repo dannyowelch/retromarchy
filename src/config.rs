@@ -1,8 +1,11 @@
 use crate::types::{Console, EmulatorProfile, GridArt, ScraperConfig};
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::de::Deserializer;
+use serde::{Deserialize, Serialize, Serializer};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 const INPUT_MS_MAX: u32 = 60_000;
 
@@ -114,6 +117,52 @@ pub struct ConsoleMetadata {
     pub description: String,
 }
 
+/// Sidebar order, stored as `system_sort` in config.toml.
+/// `name` is alphabetical by display name. `year` is the first-region launch
+/// year. Anything else is read as `name`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SystemSort {
+    #[default]
+    Name,
+    Year,
+}
+
+impl SystemSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Year => "Year",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Year,
+            Self::Year => Self::Name,
+        }
+    }
+}
+
+impl Serialize for SystemSort {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Name => "name",
+            Self::Year => "year",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for SystemSort {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(if value.eq_ignore_ascii_case("year") {
+            Self::Year
+        } else {
+            Self::Name
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_theme")]
@@ -123,6 +172,10 @@ pub struct Config {
     /// One cover width for every system's game grid, in pixels.
     #[serde(default = "default_cover_width")]
     pub cover_width: f32,
+    /// Sidebar order. Missing or unknown values are [`SystemSort::Name`].
+    /// Kept with the other values so it stays above the TOML tables.
+    #[serde(default)]
+    pub system_sort: SystemSort,
     #[serde(default)]
     pub profiles: Vec<EmulatorProfile>,
     #[serde(default)]
@@ -147,6 +200,7 @@ impl Default for Config {
             theme: default_theme(),
             details_visible: default_true(),
             cover_width: default_cover_width(),
+            system_sort: SystemSort::Name,
             profiles: Vec::new(),
             consoles: Vec::new(),
             scraper: ScraperConfig::default(),
@@ -157,13 +211,35 @@ impl Default for Config {
 
 #[derive(Debug, Deserialize)]
 struct ConsoleMetadataFile {
+    #[serde(default)]
     console: Vec<ConsoleMetadata>,
+    #[serde(default)]
+    launch_year: BTreeMap<String, u32>,
+}
+
+fn bundled_consoles() -> &'static ConsoleMetadataFile {
+    static BUNDLED: OnceLock<ConsoleMetadataFile> = OnceLock::new();
+    BUNDLED.get_or_init(|| {
+        toml::from_str(include_str!("../console_metadata.toml"))
+            .expect("bundled console metadata is valid TOML")
+    })
 }
 
 pub fn load_console_metadata() -> Result<Vec<ConsoleMetadata>> {
-    let metadata_content = include_str!("../console_metadata.toml");
-    let file: ConsoleMetadataFile = toml::from_str(metadata_content)?;
-    Ok(file.console)
+    Ok(bundled_consoles().console.clone())
+}
+
+/// Launch year for `id`. The `[launch_year]` table wins when it has the id;
+/// otherwise the matching `[[console]]` blurb. Unknown ids are `None`.
+pub fn console_year(id: &str) -> Option<u32> {
+    let bundled = bundled_consoles();
+    bundled.launch_year.get(id).copied().or_else(|| {
+        bundled
+            .console
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.year)
+    })
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -233,6 +309,14 @@ pub fn save_scraper_settings(scraper: ScraperConfig) -> Result<()> {
 pub fn save_theme_name(theme: &str) -> Result<()> {
     let mut config = load_config()?;
     config.theme = theme.to_string();
+    save_config(&config)
+}
+
+/// Load config, store [`SystemSort`], and write the file back.
+/// Consoles stay in the order they were added.
+pub fn save_system_sort(sort: SystemSort) -> Result<()> {
+    let mut config = load_config()?;
+    config.system_sort = sort;
     save_config(&config)
 }
 
@@ -462,6 +546,114 @@ screenshot = false
         assert_eq!(loaded.input.initial_delay_ms, 250);
         assert_eq!(loaded.cover_width, 250.0);
         assert_eq!(loaded.consoles[0].grid_art, GridArt::Screenshot);
+    }
+
+    #[test]
+    fn system_sort_reads_name_and_year() {
+        assert_eq!(
+            config_from_toml("system_sort = \"year\"\n")
+                .unwrap()
+                .system_sort,
+            SystemSort::Year
+        );
+        assert_eq!(
+            config_from_toml("system_sort = \"Year\"\n")
+                .unwrap()
+                .system_sort,
+            SystemSort::Year
+        );
+        assert_eq!(
+            config_from_toml("theme = \"system\"\n")
+                .unwrap()
+                .system_sort,
+            SystemSort::Name
+        );
+        assert_eq!(
+            config_from_toml("system_sort = \"banana\"\n")
+                .unwrap()
+                .system_sort,
+            SystemSort::Name
+        );
+        let text = toml::to_string_pretty(&Config {
+            system_sort: SystemSort::Year,
+            ..Config::default()
+        })
+        .unwrap();
+        assert!(
+            text.contains("system_sort = 'year'") || text.contains("system_sort = \"year\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn save_system_sort_keeps_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvLock::set("XDG_CONFIG_HOME", dir.path());
+        let mut config = Config::default();
+        config.theme = "launchbox".into();
+        config.cover_width = 230.0;
+        config.consoles.push(Console {
+            id: "genesis".into(),
+            name: "Sega Genesis".into(),
+            rom_dirs: Vec::new(),
+            extensions: vec!["md".into()],
+            profile: None,
+            grid_art: GridArt::BoxArt,
+            media: MediaToggles::default(),
+        });
+        config.consoles.push(Console {
+            id: "atari2600".into(),
+            name: "Atari 2600".into(),
+            rom_dirs: Vec::new(),
+            extensions: vec!["a26".into()],
+            profile: None,
+            grid_art: GridArt::Screenshot,
+            media: MediaToggles::default(),
+        });
+        save_config(&config).unwrap();
+
+        save_system_sort(SystemSort::Year).unwrap();
+        let loaded = load_config().unwrap();
+        assert_eq!(loaded.system_sort, SystemSort::Year);
+        assert_eq!(loaded.theme, "launchbox");
+        assert_eq!(loaded.cover_width, 230.0);
+        assert_eq!(loaded.consoles[0].id, "genesis");
+        assert_eq!(loaded.consoles[1].id, "atari2600");
+        assert_eq!(loaded.consoles[1].grid_art, GridArt::Screenshot);
+    }
+
+    #[test]
+    fn launch_years_cover_the_catalog() {
+        const NO_LAUNCH_YEAR: &[&str] = &[
+            "arcade",
+            "consolearcade",
+            "desktop",
+            "emulators",
+            "pcarcade",
+            "ports",
+        ];
+        for system in crate::catalog::systems() {
+            let year = console_year(&system.folder_id);
+            if NO_LAUNCH_YEAR.contains(&system.folder_id.as_str()) {
+                assert_eq!(year, None, "{}", system.folder_id);
+            } else {
+                assert!(year.is_some(), "missing year for {}", system.folder_id);
+            }
+        }
+        assert_eq!(console_year("atari2600"), Some(1977));
+        assert_eq!(console_year("atari5200"), Some(1982));
+        assert_eq!(console_year("nes"), Some(1983));
+        assert_eq!(console_year("gb"), Some(1989));
+        assert_eq!(console_year("genesis"), Some(1988));
+        assert_eq!(console_year("gc"), Some(2001));
+        assert_eq!(console_year("psx"), Some(1994));
+        assert_eq!(console_year("snes"), Some(1990));
+        assert_eq!(console_year("ps1"), Some(1994));
+        assert_eq!(console_year("gamecube"), Some(2001));
+        assert_eq!(console_year("not-a-console"), None);
+        for item in load_console_metadata().unwrap() {
+            assert_eq!(console_year(&item.id), Some(item.year), "{}", item.id);
+        }
     }
 
     #[test]

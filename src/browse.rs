@@ -1,4 +1,4 @@
-use crate::config::{self, ConsoleMetadata};
+use crate::config::{self, ConsoleMetadata, SystemSort};
 use crate::database::{self, LibraryStats};
 use crate::game_menu::Overlay;
 use crate::gamepad::{grid_step, list_step, NavDir};
@@ -6,6 +6,7 @@ use crate::types::{
     game_matches, Console, EmulatorProfile, Game, GridArt, GridFilter, Media, MediaKind, Source,
 };
 use chrono::{DateTime, Utc};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -39,6 +40,9 @@ pub struct Library {
     pub kind: LibraryKind,
     pub note: String,
     pub details_open: bool,
+    /// View order. Disk libraries load this from config; it does not rewrite
+    /// the order consoles were added.
+    pub system_sort: SystemSort,
     pub shelves: Vec<Shelf>,
     pub profiles: Vec<EmulatorProfile>,
 }
@@ -101,6 +105,7 @@ pub fn open_library() -> Library {
             kind: LibraryKind::Disk,
             note: String::new(),
             details_open: config.details_visible,
+            system_sort: config.system_sort,
             shelves: Vec::new(),
             profiles: config.profiles.clone(),
         },
@@ -110,15 +115,17 @@ pub fn open_library() -> Library {
 
 pub fn from_config(config: &config::Config, conn: &rusqlite::Connection) -> Library {
     let metadata = config::load_console_metadata().unwrap_or_default();
-    let shelves = config
+    let mut shelves: Vec<_> = config
         .consoles
         .iter()
         .map(|console| shelf_from_disk(console, &metadata, conn))
         .collect();
+    sort_shelves(&mut shelves, config.system_sort);
     Library {
         kind: LibraryKind::Disk,
         note: String::new(),
         details_open: config.details_visible,
+        system_sort: config.system_sort,
         shelves,
         profiles: config.profiles.clone(),
     }
@@ -195,6 +202,7 @@ pub fn demo_library(note: &str) -> Library {
         kind: LibraryKind::Demo,
         note: note.to_string(),
         details_open: true,
+        system_sort: SystemSort::Name,
         shelves,
         profiles: Vec::new(),
     }
@@ -249,7 +257,9 @@ fn shelf(
     let meta = metadata.iter().find(|item| item.id == console.id);
     Shelf {
         manufacturer: meta.map(|item| item.manufacturer.clone()),
-        year: meta.map(|item| item.year),
+        year: meta
+            .map(|item| item.year)
+            .or_else(|| config::console_year(&console.id)),
         description: meta.map(|item| item.description.clone()),
         console,
         stats,
@@ -539,6 +549,80 @@ impl TileFrame {
 
 pub fn row_of(index: usize, columns: usize) -> usize {
     index / columns.max(1)
+}
+
+/// Scroll offset that keeps one row on screen, including `before` pixels above
+/// it and `after` below it. `scroll` and the result grow downward; 0 is the
+/// unscrolled grid a fresh system selection shows. A reveal box taller than
+/// the viewport shows its top.
+pub fn reveal_row_scroll(
+    scroll: f32,
+    viewport: f32,
+    max_scroll: f32,
+    row_top: f32,
+    row_bottom: f32,
+    before: f32,
+    after: f32,
+) -> f32 {
+    let viewport = viewport.max(0.0);
+    let max_scroll = max_scroll.max(0.0);
+    let box_top = row_top - before;
+    let box_bottom = row_bottom + after;
+    let mut next = scroll.max(0.0);
+    if box_bottom - box_top > viewport {
+        next = box_top;
+    } else if box_top < next {
+        next = box_top;
+    } else if box_bottom > next + viewport {
+        next = box_bottom - viewport;
+    }
+    next.clamp(0.0, max_scroll)
+}
+
+/// Leading and trailing space for a grid row. The first row's leading space is
+/// its distance from the pane top, so revealing it lands on scroll 0 instead of
+/// sliding the padding off. The last row's trailing space runs to `max_scroll`.
+/// Every other edge uses the row gap.
+pub fn row_reveal_insets(
+    row: usize,
+    row_count: usize,
+    row_top: f32,
+    row_bottom: f32,
+    viewport: f32,
+    max_scroll: f32,
+    gap: f32,
+) -> (f32, f32) {
+    let before = if row == 0 {
+        row_top.max(0.0)
+    } else {
+        gap.max(0.0)
+    };
+    let after = if row_count > 0 && row + 1 == row_count {
+        (max_scroll + viewport - row_bottom).max(0.0)
+    } else {
+        gap.max(0.0)
+    };
+    (before, after)
+}
+
+fn cmp_name(a: &Shelf, b: &Shelf) -> Ordering {
+    a.console
+        .name
+        .to_lowercase()
+        .cmp(&b.console.name.to_lowercase())
+        .then_with(|| a.console.id.cmp(&b.console.id))
+}
+
+pub fn sort_shelves(shelves: &mut [Shelf], sort: SystemSort) {
+    shelves.sort_by(|a, b| match sort {
+        SystemSort::Name => cmp_name(a, b),
+        SystemSort::Year => match (a.year, b.year) {
+            (Some(left), Some(right)) => left.cmp(&right).then_with(|| cmp_name(a, b)),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => cmp_name(a, b),
+        },
+    });
 }
 
 pub fn file_for(game: &Game, kind: MediaKind) -> Option<PathBuf> {
@@ -869,6 +953,30 @@ impl Browse {
             .unwrap_or_else(|| TileFrame::for_art(GridArt::BoxArt, self.cover_width))
     }
 
+    /// Reorder the sidebar. Keeps the selected console and game. Returns false
+    /// when the order is already `sort`.
+    pub fn set_system_sort(&mut self, sort: SystemSort) -> bool {
+        if self.library.system_sort == sort {
+            return false;
+        }
+        let console_id = self.shelf().map(|shelf| shelf.console.id.clone());
+        let game = self.game;
+        self.library.system_sort = sort;
+        sort_shelves(&mut self.library.shelves, sort);
+        if let Some(id) = console_id {
+            if let Some(index) = self
+                .library
+                .shelves
+                .iter()
+                .position(|shelf| shelf.console.id == id)
+            {
+                self.console = index;
+            }
+        }
+        self.game = game;
+        true
+    }
+
     pub fn select_console(&mut self, index: usize) {
         if index >= self.library.shelves.len() {
             return;
@@ -1076,6 +1184,15 @@ pub fn title_search_key(key: &str, key_char: Option<&str>, shift: bool, modified
         return false;
     }
     key == "/" || key == "slash" || key_char == Some("/")
+}
+
+/// `o` cycles the system list between name and launch year.
+/// Shift+O and Ctrl+O do not.
+pub fn system_sort_key(key: &str, key_char: Option<&str>, shift: bool, modified: bool) -> bool {
+    if shift || modified {
+        return false;
+    }
+    key == "o" || key_char == Some("o")
 }
 
 /// `r` rescans the current system. Shift+R and Ctrl+R do not.
@@ -1734,5 +1851,224 @@ mod tests {
         assert_eq!(key_from_name("r", false), None);
         assert_eq!(key_from_name("/", false), None);
         assert_ne!(key_from_name("s", false), Some(Key::Launch));
+    }
+
+    #[test]
+    fn revealing_the_top_row_keeps_the_leading_gap() {
+        let row_top = 17.0;
+        let row_bottom = 200.0;
+        let viewport = 500.0;
+        let max_scroll = 800.0;
+        let (before, after) =
+            row_reveal_insets(0, 4, row_top, row_bottom, viewport, max_scroll, TILE_GAP);
+        assert_eq!(before, row_top);
+        assert_eq!(after, TILE_GAP);
+        // Aligning the card itself would park the scroll on `row_top` and hide the padding.
+        assert_eq!(
+            reveal_row_scroll(row_top, viewport, max_scroll, row_top, row_bottom, 0.0, 0.0),
+            row_top
+        );
+        assert_eq!(
+            reveal_row_scroll(row_top, viewport, max_scroll, row_top, row_bottom, before, after),
+            0.0
+        );
+        assert_eq!(
+            reveal_row_scroll(0.0, viewport, max_scroll, row_top, row_bottom, before, after),
+            0.0
+        );
+    }
+
+    #[test]
+    fn revealing_the_last_row_keeps_the_trailing_gap() {
+        let row_top = 865.0;
+        let row_bottom = 1065.0;
+        let viewport = 400.0;
+        let max_scroll = 680.0;
+        let (before, after) =
+            row_reveal_insets(4, 5, row_top, row_bottom, viewport, max_scroll, TILE_GAP);
+        assert_eq!(before, TILE_GAP);
+        assert_eq!(after, 15.0);
+        let flush = row_bottom - viewport;
+        assert_eq!(flush, 665.0);
+        let landed = reveal_row_scroll(
+            0.0, viewport, max_scroll, row_top, row_bottom, before, after,
+        );
+        assert_eq!(landed, max_scroll);
+        assert!(landed > flush);
+        assert_eq!(
+            reveal_row_scroll(max_scroll, viewport, max_scroll, row_top, row_bottom, before, after),
+            max_scroll
+        );
+    }
+
+    #[test]
+    fn revealing_a_middle_row_uses_the_gap_and_leaves_a_visible_row() {
+        let row_top = 400.0;
+        let row_bottom = 600.0;
+        let viewport = 400.0;
+        let max_scroll = 900.0;
+        let (before, after) =
+            row_reveal_insets(1, 4, row_top, row_bottom, viewport, max_scroll, 12.0);
+        assert_eq!((before, after), (12.0, 12.0));
+        assert_eq!(
+            reveal_row_scroll(0.0, viewport, max_scroll, row_top, row_bottom, before, after),
+            212.0
+        );
+        assert_eq!(
+            reveal_row_scroll(500.0, viewport, max_scroll, row_top, row_bottom, before, after),
+            388.0
+        );
+        assert_eq!(
+            reveal_row_scroll(300.0, viewport, max_scroll, row_top, row_bottom, before, after),
+            300.0
+        );
+        assert_eq!(
+            reveal_row_scroll(0.0, 100.0, 500.0, 40.0, 200.0, 10.0, 10.0),
+            30.0
+        );
+        assert_eq!(
+            reveal_row_scroll(0.0, 100.0, 50.0, 200.0, 250.0, 0.0, 0.0),
+            50.0
+        );
+    }
+
+    #[test]
+    fn sort_shelves_by_name_and_year() {
+        let mut shelves = vec![
+            bare_shelf("ports", "Ports", None),
+            bare_shelf("gb", "Nintendo Game Boy", Some(1989)),
+            bare_shelf("famicom", "Famicom", Some(1983)),
+            bare_shelf("arcade", "Arcade", None),
+            bare_shelf("nes", "NES", Some(1983)),
+            bare_shelf("atari2600", "Atari 2600", Some(1977)),
+            bare_shelf("genesis", "Sega Genesis", Some(1988)),
+        ];
+        sort_shelves(&mut shelves, SystemSort::Name);
+        assert_eq!(
+            ids_of(&shelves),
+            [
+                "arcade",
+                "atari2600",
+                "famicom",
+                "nes",
+                "gb",
+                "ports",
+                "genesis"
+            ]
+        );
+        sort_shelves(&mut shelves, SystemSort::Year);
+        assert_eq!(
+            ids_of(&shelves),
+            [
+                "atari2600",
+                "famicom",
+                "nes",
+                "genesis",
+                "gb",
+                "arcade",
+                "ports"
+            ]
+        );
+    }
+
+    #[test]
+    fn set_system_sort_keeps_the_selected_console_and_game() {
+        let mut browse = sample();
+        assert_eq!(browse.library.system_sort, SystemSort::Name);
+        assert_eq!(ids_of(&browse.library.shelves), ["snes", "genesis", "nes"]);
+        browse.select_game(2);
+        assert!(browse.set_system_sort(SystemSort::Year));
+        assert_eq!(browse.shelf().unwrap().console.id, "snes");
+        assert_eq!(browse.game, Some(2));
+        assert_eq!(browse.selected_game().unwrap().title, "Super Metroid");
+        assert_eq!(ids_of(&browse.library.shelves), ["nes", "genesis", "snes"]);
+        assert!(!browse.set_system_sort(SystemSort::Year));
+        assert!(browse.set_system_sort(SystemSort::Name));
+        assert_eq!(browse.shelf().unwrap().console.id, "snes");
+        assert_eq!(browse.game, Some(2));
+        assert_eq!(ids_of(&browse.library.shelves), ["nes", "genesis", "snes"]);
+    }
+
+    #[test]
+    fn from_config_sorts_by_the_saved_order_and_fills_years() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = database::open_db(&dir.path().join("library.db")).unwrap();
+        let consoles = vec![
+            bare_console("genesis", "Sega Genesis"),
+            bare_console("gb", "Nintendo Game Boy"),
+            bare_console("ports", "Ports"),
+            bare_console("nes", "Nintendo Entertainment System"),
+            bare_console("atari2600", "Atari 2600"),
+        ];
+        let mut config = config::Config {
+            consoles: consoles.clone(),
+            system_sort: SystemSort::Year,
+            ..config::Config::default()
+        };
+        let library = from_config(&config, &conn);
+        assert_eq!(
+            ids_of(&library.shelves),
+            ["atari2600", "nes", "genesis", "gb", "ports"]
+        );
+        assert_eq!(library.shelves[0].year, Some(1977));
+        assert_eq!(library.shelves[1].year, Some(1983));
+        assert_eq!(library.shelves[2].year, Some(1988));
+        assert_eq!(library.shelves[3].year, Some(1989));
+        assert_eq!(library.shelves[4].year, None);
+        assert_eq!(
+            config
+                .consoles
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["genesis", "gb", "ports", "nes", "atari2600"]
+        );
+        config.system_sort = SystemSort::Name;
+        let library = from_config(&config, &conn);
+        assert_eq!(
+            ids_of(&library.shelves),
+            ["atari2600", "nes", "gb", "ports", "genesis"]
+        );
+    }
+
+    #[test]
+    fn system_sort_key_is_unmodified_o() {
+        assert!(system_sort_key("o", None, false, false));
+        assert!(system_sort_key("unknown", Some("o"), false, false));
+        assert!(!system_sort_key("o", Some("o"), true, false));
+        assert!(!system_sort_key("o", None, false, true));
+        assert!(!system_sort_key("O", Some("O"), false, false));
+        assert!(!system_sort_key("y", Some("y"), false, false));
+        assert!(!system_sort_key("t", Some("t"), false, false));
+    }
+
+    fn bare_console(id: &str, name: &str) -> Console {
+        Console {
+            id: id.into(),
+            name: name.into(),
+            rom_dirs: Vec::new(),
+            extensions: Vec::new(),
+            profile: None,
+            grid_art: GridArt::BoxArt,
+            media: MediaToggles::default(),
+        }
+    }
+
+    fn bare_shelf(id: &str, name: &str, year: Option<u32>) -> Shelf {
+        Shelf {
+            console: bare_console(id, name),
+            manufacturer: None,
+            year,
+            description: None,
+            stats: stats_of(&[]),
+            games: Vec::new(),
+        }
+    }
+
+    fn ids_of(shelves: &[Shelf]) -> Vec<&str> {
+        shelves
+            .iter()
+            .map(|shelf| shelf.console.id.as_str())
+            .collect()
     }
 }
