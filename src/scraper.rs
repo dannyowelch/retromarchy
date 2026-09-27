@@ -234,26 +234,91 @@ pub struct ArtworkQuery {
     pub console_id: String,
     pub title: String,
     pub rom_name: String,
+    /// CRC sent to ScreenScraper. Headered A78 files use the payload only.
     pub crc32: Option<u32>,
+    /// Size sent as `romtaille`. Headered A78 files omit the 128-byte header.
     pub rom_bytes: Option<u64>,
+    /// Bytes skipped before `crc32` / `rom_bytes`. Zero when the file is sent whole.
+    pub header_bytes: u64,
 }
 
 impl ArtworkQuery {
     pub fn from_game(game: &crate::types::Game) -> Self {
-        let rom_bytes = fs::metadata(&game.rom).ok().map(|meta| meta.len());
         let rom_name = game
             .rom
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let (crc32, rom_bytes, header_bytes) =
+            scrape_fingerprint(&game.console, &game.rom, game.crc32);
         Self {
             console_id: game.console.clone(),
             title: game.title.clone(),
             rom_name,
-            crc32: game.crc32,
+            crc32,
             rom_bytes,
+            header_bytes,
         }
     }
+}
+
+const A78_HEADER_LEN: u64 = 128;
+
+fn scrape_fingerprint(
+    console_id: &str,
+    path: &Path,
+    stored_crc: Option<u32>,
+) -> (Option<u32>, Option<u64>, u64) {
+    let full_len = fs::metadata(path).ok().map(|meta| meta.len());
+    if !may_have_a78_header(console_id, path) {
+        return (stored_crc, full_len, 0);
+    }
+    match a78_payload_fingerprint(path) {
+        Some((crc, size)) => (Some(crc), Some(size), A78_HEADER_LEN),
+        None => (stored_crc, full_len, 0),
+    }
+}
+
+fn may_have_a78_header(console_id: &str, path: &Path) -> bool {
+    is_atari_7800(console_id) || extension_is(path, "a78")
+}
+
+fn is_atari_7800(console_id: &str) -> bool {
+    matches!(
+        console_id.to_ascii_lowercase().as_str(),
+        "atari7800" | "a7800" | "7800"
+    )
+}
+
+fn extension_is(path: &Path, want: &str) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(want))
+}
+
+/// CRC and size of an A78 ROM after its 128-byte header.
+/// The header is version byte plus `ATARI7800` at offset 1. Other files stay whole.
+fn a78_payload_fingerprint(path: &Path) -> Option<(u32, u64)> {
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len <= A78_HEADER_LEN {
+        return None;
+    }
+    let mut header = [0u8; A78_HEADER_LEN as usize];
+    file.read_exact(&mut header).ok()?;
+    if &header[1..10] != b"ATARI7800" {
+        return None;
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let count = file.read(&mut buf).ok()?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buf[..count]);
+    }
+    Some((hasher.finalize(), len - A78_HEADER_LEN))
 }
 
 pub fn screenscraper_params(
@@ -1481,7 +1546,7 @@ fn scrape_failure_line(query: &ArtworkQuery, reasons: &[String]) -> String {
             .join("; ")
     };
     scrub_secrets(format!(
-        "scrape failed: title=\"{}\" rom=\"{}\" console={} screenscraper_system={} thegamesdb_platform={} crc={} size={} {detail}",
+        "scrape failed: title=\"{}\" rom=\"{}\" console={} screenscraper_system={} thegamesdb_platform={} crc={} size={} header={} {detail}",
         one_line(&query.title),
         one_line(&query.rom_name),
         one_line(&query.console_id),
@@ -1489,6 +1554,7 @@ fn scrape_failure_line(query: &ArtworkQuery, reasons: &[String]) -> String {
         platform,
         crc,
         size,
+        query.header_bytes,
     ))
 }
 
@@ -1854,6 +1920,7 @@ mod tests {
             rom_name: "Chrono Trigger.sfc".into(),
             crc32: Some(0x50AB_C90A),
             rom_bytes: Some(1024),
+            header_bytes: 0,
         };
         let params = screenscraper_params(&creds, &query);
         let value = |key: &str| {
@@ -2146,34 +2213,68 @@ mod tests {
     }
 
     #[test]
-    fn atari_7800_batch_query_sends_system_ids_and_the_whole_file() {
+    fn atari_7800_batch_query_skips_a78_header_and_sends_system_ids() {
         let dir = tempfile::tempdir().unwrap();
         let bytes = headered_a78();
+        let payload = b"ROM-BYTES";
         let rom = dir.path().join("Asteroids (USA).a78");
         fs::write(&rom, &bytes).unwrap();
-        let crc = crc32fast::hash(&bytes);
-        let query = ArtworkQuery::from_game(&dummy_game(rom, "atari7800", crc));
+        let file_crc = crc32fast::hash(&bytes);
+        let payload_crc = crc32fast::hash(payload);
+        let query = ArtworkQuery::from_game(&dummy_game(rom, "atari7800", file_crc));
 
         assert_eq!(query.rom_name, "Asteroids (USA).a78");
-        assert_eq!(query.rom_bytes, Some(bytes.len() as u64));
-        assert_eq!(query.crc32, Some(crc));
-        assert_ne!(query.crc32, Some(crc32fast::hash(b"ROM-BYTES")));
+        assert_eq!(query.title, "Asteroids");
+        assert_eq!(crate::scanner::clean_title("Asteroids (USA)"), "Asteroids");
+        assert_eq!(query.header_bytes, 128);
+        assert_eq!(query.rom_bytes, Some(payload.len() as u64));
+        assert_eq!(query.crc32, Some(payload_crc));
+        assert_ne!(query.crc32, Some(file_crc));
 
         let params = screenscraper_params(&creds(), &query);
         assert_eq!(param(&params, "systemeid"), "41");
         assert_eq!(param(&params, "romnom"), "Asteroids (USA).a78");
-        assert_eq!(param(&params, "crc"), format!("{crc:08X}"));
-        assert_eq!(param(&params, "romtaille"), bytes.len().to_string());
+        assert_ne!(param(&params, "romnom"), "Asteroids");
+        assert_eq!(param(&params, "crc"), format!("{payload_crc:08X}"));
+        assert_eq!(param(&params, "romtaille"), payload.len().to_string());
         assert!(params.iter().all(|(key, _)| key != "gameid"));
 
+        let raw_a78 = dir.path().join("Food Fight (USA).a78");
+        fs::write(&raw_a78, b"NOHEADER").unwrap();
+        let raw_crc = crc32fast::hash(b"NOHEADER");
+        let raw_query = ArtworkQuery::from_game(&dummy_game(raw_a78, "atari7800", raw_crc));
+        assert_eq!(raw_query.header_bytes, 0);
+        assert_eq!(raw_query.crc32, Some(raw_crc));
+        assert_eq!(raw_query.rom_bytes, Some(8));
+
+        let padded = dir.path().join("Meltdown.a78");
+        let padded_bytes = vec![0u8; 200];
+        fs::write(&padded, &padded_bytes).unwrap();
+        let padded_crc = crc32fast::hash(&padded_bytes);
+        let padded_query = ArtworkQuery::from_game(&dummy_game(padded, "atari7800", padded_crc));
+        assert_eq!(padded_query.header_bytes, 0);
+        assert_eq!(padded_query.crc32, Some(padded_crc));
+        assert_eq!(padded_query.rom_bytes, Some(200));
+
+        let headered_bin = headered_a78();
         let bin = dir.path().join("Centipede.bin");
-        fs::write(&bin, b"RAW-BIN").unwrap();
-        let bin_crc = crc32fast::hash(b"RAW-BIN");
-        let bin_query = ArtworkQuery::from_game(&dummy_game(bin, "A7800", bin_crc));
+        fs::write(&bin, &headered_bin).unwrap();
+        let bin_query =
+            ArtworkQuery::from_game(&dummy_game(bin, "A7800", crc32fast::hash(&headered_bin)));
         let bin_params = screenscraper_params(&creds(), &bin_query);
         assert_eq!(param(&bin_params, "systemeid"), "41");
         assert_eq!(param(&bin_params, "romnom"), "Centipede.bin");
-        assert_eq!(param(&bin_params, "romtaille"), "7");
+        assert_eq!(bin_query.header_bytes, 128);
+        assert_eq!(param(&bin_params, "romtaille"), payload.len().to_string());
+        assert_eq!(param(&bin_params, "crc"), format!("{payload_crc:08X}"));
+
+        let plain = dir.path().join("Joust.bin");
+        fs::write(&plain, b"RAW-BIN").unwrap();
+        let plain_crc = crc32fast::hash(b"RAW-BIN");
+        let plain_query = ArtworkQuery::from_game(&dummy_game(plain, "atari7800", plain_crc));
+        assert_eq!(plain_query.header_bytes, 0);
+        assert_eq!(plain_query.crc32, Some(plain_crc));
+        assert_eq!(plain_query.rom_bytes, Some(7));
 
         let zip_bytes = b"not-a-real-zip";
         let zip = dir.path().join("Food Fight.zip");
@@ -2181,6 +2282,7 @@ mod tests {
         let zip_query =
             ArtworkQuery::from_game(&dummy_game(zip, "7800", crc32fast::hash(zip_bytes)));
         let zip_params = screenscraper_params(&creds(), &zip_query);
+        assert_eq!(zip_query.header_bytes, 0);
         assert_eq!(param(&zip_params, "systemeid"), "41");
         assert_eq!(param(&zip_params, "romnom"), "Food Fight.zip");
         assert_eq!(param(&zip_params, "romtaille"), zip_bytes.len().to_string());
@@ -2188,6 +2290,17 @@ mod tests {
             param(&zip_params, "crc"),
             format!("{:08X}", crc32fast::hash(zip_bytes))
         );
+
+        let lynx = dir.path().join("California Games.lnx");
+        let mut lynx_bytes = vec![0u8; 64];
+        lynx_bytes[0..4].copy_from_slice(b"LYNX");
+        lynx_bytes.extend_from_slice(b"HANDHELD");
+        fs::write(&lynx, &lynx_bytes).unwrap();
+        let lynx_crc = crc32fast::hash(&lynx_bytes);
+        let lynx_query = ArtworkQuery::from_game(&dummy_game(lynx, "atarilynx", lynx_crc));
+        assert_eq!(lynx_query.header_bytes, 0);
+        assert_eq!(lynx_query.crc32, Some(lynx_crc));
+        assert_eq!(lynx_query.rom_bytes, Some(lynx_bytes.len() as u64));
 
         assert_eq!(screenscraper_system("atari7800"), Some(41));
         assert_eq!(screenscraper_system("a7800"), Some(41));
@@ -2224,8 +2337,9 @@ mod tests {
         let bytes = headered_a78();
         let rom = dir.path().join("Asteroids (USA).a78");
         fs::write(&rom, &bytes).unwrap();
-        let crc = crc32fast::hash(&bytes);
-        let query = ArtworkQuery::from_game(&dummy_game(rom, "atari7800", crc));
+        let file_crc = crc32fast::hash(&bytes);
+        let payload_crc = crc32fast::hash(b"ROM-BYTES");
+        let query = ArtworkQuery::from_game(&dummy_game(rom, "atari7800", file_crc));
         let line = scrape_failure_line(
             &query,
             &[
@@ -2240,8 +2354,10 @@ mod tests {
         assert!(line.contains("console=atari7800"));
         assert!(line.contains("screenscraper_system=41"));
         assert!(line.contains("thegamesdb_platform=27"));
-        assert!(line.contains(&format!("crc={crc:08X}")));
-        assert!(line.contains(&format!("size={}", bytes.len())));
+        assert!(line.contains(&format!("crc={payload_crc:08X}")));
+        assert!(line.contains("size=9"));
+        assert!(line.contains("header=128"));
+        assert!(!line.contains(&format!("crc={file_crc:08X}")));
         assert!(line.contains("HTTP 404 Jeu non trouve"));
         assert!(!line.contains("secret-pass"));
         assert!(!line.contains("sspassword"));
