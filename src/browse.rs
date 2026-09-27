@@ -342,6 +342,14 @@ pub fn stats_of(games: &[Game]) -> LibraryStats {
     }
 }
 
+pub fn game_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 game".to_string()
+    } else {
+        format!("{count} games")
+    }
+}
+
 pub fn format_play_time(seconds: u32) -> String {
     let hours = seconds / 3600;
     let minutes = (seconds % 3600) / 60;
@@ -1395,6 +1403,9 @@ mod tests {
 
     #[test]
     fn play_time_and_columns() {
+        assert_eq!(game_count_label(0), "0 games");
+        assert_eq!(game_count_label(1), "1 game");
+        assert_eq!(game_count_label(24), "24 games");
         assert_eq!(format_play_time(45), "45s");
         assert_eq!(format_play_time(120), "2m");
         assert_eq!(format_play_time(5400), "1h 30m");
