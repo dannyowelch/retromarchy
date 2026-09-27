@@ -99,7 +99,7 @@ pub fn open_library() -> Library {
                 "Demo library. Could not open the library database ({err})."
             )),
         },
-        // A blank config is an empty library, same as GTK's first run. The demo
+        // A blank config is an empty library. The demo
         // stays for a config or database that cannot be opened.
         Ok(config) => Library {
             kind: LibraryKind::Disk,
@@ -725,8 +725,8 @@ impl Browse {
         self.rebind_visible(keep, previous, pane);
     }
 
-    /// Games the grid shows for the current console. Same rule as GTK
-    /// [`crate::types::visible_games`]: title query plus [`GridFilter`].
+    /// Games the grid shows for the current console. Title query plus [`GridFilter`],
+    /// the same rule as [`crate::types::visible_games`].
     pub fn visible_games(&self) -> impl Iterator<Item = &Game> {
         let filter = self.filter;
         let query = self.query.clone();
@@ -743,9 +743,8 @@ impl Browse {
         self.visible_games().count()
     }
 
-    /// Games GTK sends to the background scraper for the system on screen.
-    /// Favorites do not narrow the list. The worker fetches only enabled kinds
-    /// that are not already files. A demo library, an empty shelf, or no system
+    /// Games sent to the background scraper for the system on screen.
+    /// Favorites do not narrow the list. A demo library, an empty shelf, or no system
     /// sets the status and returns none. The selection is left alone.
     pub fn missing_scrape_games(&mut self) -> Option<Vec<Game>> {
         let Some(shelf) = self.shelf() else {
@@ -1091,7 +1090,7 @@ pub fn columns_for(width: f32, details_open: bool, tile_width: f32) -> usize {
     columns.clamp(1, 8)
 }
 
-/// GTK `s` scrapes the selected game. Shift+S, or an uppercase S, scrapes
+/// `s` scrapes the selected game. Shift+S, or an uppercase S, scrapes
 /// missing artwork for the current system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrapeChord {
@@ -1104,7 +1103,7 @@ pub fn key_from_name(name: &str, modified: bool) -> Option<Key> {
 }
 
 /// `modified` is Ctrl, Alt, or the platform key. Shift is separate: it picks
-/// missing artwork, the same way GTK treats `GDK_KEY_S`.
+/// missing artwork.
 pub fn scrape_chord(
     key: &str,
     key_char: Option<&str>,
@@ -1182,7 +1181,6 @@ fn map_key(name: &str) -> Option<Key> {
 /// gpui-pre 0.3 Linux `keystroke_from_xkb` maps `Keysym::Return` to `"enter"`
 /// and strips `kp_` from keypad keysym names, so `KP_Enter` arrives as `"enter"`.
 /// A compose sequence can rewrite the key to the raw keysym `"KP_Enter"`.
-/// Those names, and the numpad aliases, launch the same way GTK treats `KP_Enter`.
 pub fn is_launch_key(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -1571,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn favorites_filter_and_toggle_follow_the_gtk_rules() {
+    fn favorites_filter_and_toggle() {
         let mut browse = sample();
         browse.apply(Key::ToggleFavorite);
         assert!(browse.selected_game().is_none());
@@ -1719,7 +1717,7 @@ mod tests {
     }
 
     #[test]
-    fn scrape_chord_matches_gtk_s_and_shift_s() {
+    fn scrape_chord_matches_s_and_shift_s() {
         assert_eq!(
             scrape_chord("s", Some("s"), false, false),
             Some(ScrapeChord::Selected)

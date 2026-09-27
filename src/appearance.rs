@@ -1,6 +1,5 @@
-//! GTK theme toggle. `theme = "system"` follows Omarchy. `theme = "launchbox"`
-//! is the built-in dark palette from the GTK stylesheet. Anything else toggles
-//! back to `system`, same as the GTK `t` key and header button.
+//! Theme toggle. `theme = "system"` follows Omarchy. `theme = "launchbox"`
+//! is the built-in dark palette. Any other value toggles back to `system`.
 
 use gpui_kit::base::ThemeAppearance;
 use gpui_kit::rgb;
@@ -9,7 +8,7 @@ use gpui_omarchy::Theme;
 pub const SYSTEM: &str = "system";
 pub const LAUNCHBOX: &str = "launchbox";
 
-/// `t` with no modifiers. GTK matches the `t` keysym, so Shift+T does not fire.
+/// `t` with no modifiers. Shift+T does not fire.
 pub fn theme_key(key: &str, key_char: Option<&str>, shift: bool, modified: bool) -> bool {
     if shift || modified {
         return false;
@@ -29,7 +28,7 @@ pub fn is_launchbox(theme: &str) -> bool {
     theme == LAUNCHBOX
 }
 
-/// GTK LaunchBox CSS, on the palette the shell already reads through `cx.omarchy()`.
+/// Built-in dark palette used when `theme` is `launchbox`.
 pub fn launchbox_theme() -> Theme {
     Theme {
         name: "LaunchBox".into(),
@@ -56,7 +55,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn toggle_matches_gtk() {
+    fn toggle_swaps_system_and_launchbox() {
         assert_eq!(next_theme("system"), "launchbox");
         assert_eq!(next_theme("launchbox"), "system");
         assert_eq!(next_theme("custom"), "system");
@@ -74,7 +73,7 @@ mod tests {
     }
 
     #[test]
-    fn launchbox_palette_uses_the_gtk_css_colors() {
+    fn launchbox_palette_uses_the_dark_colors() {
         let theme = launchbox_theme();
         assert_eq!(theme.name.as_ref(), "LaunchBox");
         assert_eq!(theme.appearance, ThemeAppearance::Dark);

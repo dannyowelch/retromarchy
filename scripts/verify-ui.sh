@@ -4,8 +4,6 @@ set -euo pipefail
 
 DISPLAY_NUM="${DISPLAY_NUM:-:98}"
 export DISPLAY="$DISPLAY_NUM"
-export GDK_BACKEND=x11
-export GDK_CORE_DEVICE_EVENTS=1
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d /tmp/retro-verify.XXXXXX)"
 SHOTS="/opt/cursor/artifacts"

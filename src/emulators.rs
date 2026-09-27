@@ -1,4 +1,4 @@
-//! Manage Emulators. The draft is the same data GTK writes: `profiles`, and
+//! Manage Emulators. The draft is `profiles`, and
 //! each console's `profile`. RetroArch profiles are a core path (optional
 //! `config` stays unset). Standalone profiles are one command string with
 //! `{rom}`. The shell paints this and calls [`apply_assignments`] on save.
@@ -10,8 +10,7 @@ use crate::gamepad::NavDir;
 use crate::types::EmulatorProfile;
 use std::path::PathBuf;
 
-/// Ctrl+E and Ctrl+M, including the shifted keysyms. GTK checks the control
-/// mask and `e` / `E` / `m` / `M`.
+/// Ctrl+E and Ctrl+M, including the shifted keysyms. The control mask must be set.
 pub fn emulator_key(key: &str, key_char: Option<&str>, control: bool) -> bool {
     if !control {
         return false;
@@ -22,7 +21,7 @@ pub fn emulator_key(key: &str, key_char: Option<&str>, control: bool) -> bool {
     hit("e") || hit("m")
 }
 
-/// GTK shows discovered cores only when `retroarch` is a file on `PATH`.
+/// Discovered cores are listed only when `retroarch` is a file on `PATH`.
 pub fn retroarch_on_path() -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("retroarch").is_file()))
@@ -217,7 +216,7 @@ impl Emulators {
         self.focus = Slot::Kind;
     }
 
-    /// GTK's file chooser fills the core path, switches the kind to RetroArch,
+    /// A chosen core file fills the path, switches the kind to RetroArch,
     /// and uses the file name as the id when that field is still empty.
     pub fn set_core_path(&mut self, path: PathBuf) {
         if self.id.text.is_empty() {
@@ -816,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_e_and_ctrl_m_match_the_gtk_chords() {
+    fn ctrl_e_and_ctrl_m_open_emulators() {
         assert!(emulator_key("m", None, true));
         assert!(emulator_key("M", None, true));
         assert!(emulator_key("e", Some("E"), true));

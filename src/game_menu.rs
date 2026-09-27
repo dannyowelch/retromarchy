@@ -1,5 +1,5 @@
-//! Per-game menu. GTK opens it with a right-click, the Menu key, Shift+F10,
-//! or Select (Back / View). Scrape, rename, and delete then follow that window.
+//! Per-game menu. A right-click, the Menu key, Shift+F10,
+//! or Select (Back / View) opens it. Scrape, rename, and delete then follow.
 //! The header Scrape button and `s` open this same scrape dialog.
 
 use crate::browse::{stats_of, Browse, LibraryKind};
@@ -22,7 +22,7 @@ pub struct Menu {
     pub cursor: usize,
 }
 
-/// Single-line title or search box. `replace` is the GTK selection of the prefilled text.
+/// Single-line title or search box. `replace` means the prefilled text starts selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineEdit {
     pub text: String,
@@ -570,7 +570,7 @@ impl Browse {
         });
     }
 
-    /// GTK Scrape button and the `s` key. Same dialog as the menu's Scrape row.
+    /// Header Scrape button and the `s` key. Same dialog as the menu's Scrape row.
     pub fn scrape_selected(&mut self) -> OverlayCommand {
         let Some(game) = self.selected_game().cloned() else {
             self.status = "Select a game to scrape.".into();
@@ -867,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_prompt_starts_on_cancel_and_matches_gtk_focus() {
+    fn delete_prompt_starts_on_cancel() {
         let mut browse = entered();
         open_menu(&mut browse);
         browse.move_overlay(NavDir::Down);
@@ -899,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_moves_like_the_gtk_dialog_and_a_blank_title_commits() {
+    fn rename_moves_and_a_blank_title_commits() {
         let mut browse = entered();
         open_menu(&mut browse);
         browse.move_overlay(NavDir::Down);

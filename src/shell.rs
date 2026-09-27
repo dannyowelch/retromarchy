@@ -70,16 +70,16 @@ pub struct Shell {
     search: Option<std::sync::mpsc::Receiver<NameSearch>>,
     apply: Option<std::sync::mpsc::Receiver<ScrapeUpdate>>,
     scrape_scroll: ScrollHandle,
-    /// GTK Import ROMs. First run with no consoles reaches it from the empty pane.
+    /// Import ROMs. First run with no consoles reaches it from the empty pane.
     wizard: Option<ImportWizard>,
     import_rx: Option<std::sync::mpsc::Receiver<ImportUpdate>>,
     import_scroll: ScrollHandle,
     pick_scroll: ScrollHandle,
-    /// GTK Manage Emulators. Writes `config.toml` as each change is confirmed.
+    /// Manage Emulators. Writes `config.toml` as each change is confirmed.
     emulators: Option<Emulators>,
-    /// GTK Options → Input. Writes `[input]` as each spin changes.
+    /// Options → Input. Writes `[input]` as each spin changes.
     options: Option<InputOptions>,
-    /// GTK Scraper settings. Writes `[scraper]` when Save is confirmed.
+    /// Scraper settings. Writes `[scraper]` when Save is confirmed.
     scraper: Option<ScraperSettings>,
     emulator_scroll: ScrollHandle,
     scraper_scroll: ScrollHandle,
@@ -112,7 +112,6 @@ enum RescanNote {
     Failed(String),
 }
 
-/// GTK favorite red (`#e01b24`).
 const FAVORITE_RED: u32 = 0xe01b24;
 
 impl Shell {
@@ -198,7 +197,7 @@ impl Shell {
 
     /// Face buttons are edges. Held directions step through [`HoldRepeat`].
     /// South enters the grid or launches. East returns to the system list.
-    /// North toggles a favorite. Select opens the GTK game menu, and closes it.
+    /// North toggles a favorite. Select opens the game menu, and closes it.
     fn poll_nav(&mut self, cx: &mut Context<Self>) {
         let events = self.drain_pad_events();
         let mut changed = self.poll_jobs();
@@ -684,7 +683,7 @@ impl Shell {
     }
 
     /// Arrows and Tab move. Enter confirms the focused control. Esc closes.
-    /// A console's left/right choice is written immediately, same as GTK's combo.
+    /// A console's left/right choice is written immediately.
     fn on_emulator_key(&mut self, keystroke: &Keystroke, release: bool, cx: &mut Context<Self>) {
         if let Some(dir) = arrow_dir(keystroke) {
             let modified = keystroke.modifiers.control
@@ -1202,7 +1201,7 @@ impl Shell {
         }
     }
 
-    /// GTK's Browse button is a folder chooser. GPUI's is the XDG desktop portal
+    /// Browse opens a folder through the XDG desktop portal
     /// via [`App::prompt_for_paths`]. The path field stays editable either way.
     fn pick_folder(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
@@ -1249,8 +1248,7 @@ impl Shell {
         }
     }
 
-    /// GTK's core Browse is an open-file chooser filtered to `*.so`. GPUI's
-    /// prompt has no filter, so the path field stays editable.
+    /// Core Browse is an open-file prompt with no extension filter, so the path field stays editable.
     fn pick_core(&mut self, cx: &mut Context<Self>) {
         if self.picking_core {
             return;
@@ -2675,8 +2673,6 @@ fn tile(
                 .child("Placeholder"),
         );
     }
-    // GTK `.console-subtitle`: 0.9em under the title, middle-ellipsized, dim.
-    // Omarchy uses the theme secondary color. LaunchBox secondary is #999999.
     // The heart sits on this line, so a favorite keeps the name clear of it.
     let mut subtitle = div()
         .text_size(px(11.))
@@ -2974,9 +2970,8 @@ fn detail_art(path: std::path::PathBuf, kind: MediaKind) -> impl IntoElement {
         MediaKind::Screenshot => 4.0 / 3.0,
         _ => 3.0 / 4.0,
     });
-    // Border box includes padding and the 1px left border. GTK scales this
-    // picture into 250×180. Past that, a box plus a screenshot push play time
-    // below the pane, so Contain letterboxes inside the cap.
+    // Border box includes padding and the 1px left border. Height is capped at
+    // 180 so a box plus a screenshot do not push play time below the pane.
     let width = (DETAILS_WIDTH - DETAILS_PAD * 2.0 - 1.0).max(1.0);
     let height = (width / ratio.max(0.05)).clamp(1.0, 180.0);
     img(path)

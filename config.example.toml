@@ -79,7 +79,7 @@ manual = false
 video = false
 
 # Hold-repeat for arrow keys, the d-pad, and the left stick.
-# GTK Options → Input and the GPUI Options button edit this.
+# The Options button edits this.
 # Hold-repeat uses the saved values immediately.
 # Confirm, Back, and Favorite do not repeat.
 [input]
