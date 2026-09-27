@@ -1399,11 +1399,10 @@ fn first_uncooled<T>(
     outcome.success.map(|(_, value)| value)
 }
 
-/// One name-search hit. `remote_id` is the provider game id, not the library id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrapeCandidate {
     pub provider: ScrapeProvider,
-    pub remote_id: String,
+    pub provider_game_id: String,
     pub title: String,
     pub system: String,
 }
@@ -1498,7 +1497,7 @@ pub fn parse_screenscraper_search(body: &str) -> Result<Vec<ScrapeCandidate>, Fe
     }
     let mut out = Vec::new();
     for jeu in json_games(value.pointer("/response/jeux"), "id") {
-        let Some(remote_id) = jeu.get("id").and_then(json_id) else {
+        let Some(provider_game_id) = jeu.get("id").and_then(json_id) else {
             continue;
         };
         let title = screenscraper_title(&jeu);
@@ -1512,7 +1511,7 @@ pub fn parse_screenscraper_search(body: &str) -> Result<Vec<ScrapeCandidate>, Fe
             .to_string();
         out.push(ScrapeCandidate {
             provider: ScrapeProvider::ScreenScraper,
-            remote_id,
+            provider_game_id,
             title,
             system,
         });
@@ -1555,7 +1554,7 @@ pub fn parse_thegamesdb_search(body: &str) -> Result<Vec<ScrapeCandidate>, Fetch
     }
     let mut out = Vec::new();
     for game in json_games(value.pointer("/data/games"), "game_title") {
-        let Some(remote_id) = game.get("id").and_then(json_id) else {
+        let Some(provider_game_id) = game.get("id").and_then(json_id) else {
             continue;
         };
         let title = game
@@ -1574,7 +1573,7 @@ pub fn parse_thegamesdb_search(body: &str) -> Result<Vec<ScrapeCandidate>, Fetch
             .unwrap_or_default();
         out.push(ScrapeCandidate {
             provider: ScrapeProvider::TheGamesDb,
-            remote_id,
+            provider_game_id,
             title,
             system,
         });
@@ -1691,13 +1690,13 @@ fn fixture_candidates(query: &str) -> Vec<ScrapeCandidate> {
     vec![
         ScrapeCandidate {
             provider: ScrapeProvider::ScreenScraper,
-            remote_id: "1".into(),
+            provider_game_id: "1".into(),
             title: query.to_string(),
             system: "Super Nintendo".into(),
         },
         ScrapeCandidate {
             provider: ScrapeProvider::TheGamesDb,
-            remote_id: "2".into(),
+            provider_game_id: "2".into(),
             title: format!("{query} DX"),
             system: "Super Nintendo".into(),
         },
@@ -1858,7 +1857,7 @@ fn load_candidate(
 ) -> CandidateLoad {
     match candidate.provider {
         ScrapeProvider::ScreenScraper => {
-            match load_screenscraper_by_id(agent, creds, &candidate.remote_id, last_http) {
+            match load_screenscraper_by_id(agent, creds, &candidate.provider_game_id, last_http) {
                 Ok(game) => CandidateLoad {
                     images: Ok(kind_bytes(kinds, |kind| {
                         match pick_screenscraper_url(&game.medias, kind) {
@@ -1883,7 +1882,7 @@ fn load_candidate(
             }
         }
         ScrapeProvider::TheGamesDb => {
-            let game_id = match candidate.remote_id.parse::<i64>() {
+            let game_id = match candidate.provider_game_id.parse::<i64>() {
                 Ok(id) => id,
                 Err(_) => {
                     let err = FetchFail::Failed("TheGamesDB game id was not a number.".into());
@@ -2611,7 +2610,7 @@ mod tests {
         let hits = parse_screenscraper_search(ss).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].provider, ScrapeProvider::ScreenScraper);
-        assert_eq!(hits[0].remote_id, "3");
+        assert_eq!(hits[0].provider_game_id, "3");
         assert_eq!(hits[0].title, "Chrono Trigger");
         assert_eq!(hits[0].system, "Super Nintendo");
         assert_eq!(hits[1].title, "Chrono Trigger DX");
@@ -2631,7 +2630,7 @@ mod tests {
         }"#;
         let hits = parse_thegamesdb_search(tg_body).unwrap();
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].remote_id, "111");
+        assert_eq!(hits[0].provider_game_id, "111");
         assert_eq!(hits[0].system, "Super Nintendo (SNES)");
         assert_eq!(hits[1].title, "Radical Psycho Machine Racing");
         assert!(

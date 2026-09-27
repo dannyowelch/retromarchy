@@ -886,9 +886,6 @@ impl Browse {
         Some(title)
     }
 
-    /// Follow the selected id when the visible list changes. On the grid, a
-    /// game that dropped out leaves the nearest remaining row selected so
-    /// Enter still launches and the row can scroll into view.
     pub(crate) fn rebind_visible(
         &mut self,
         keep: Option<String>,

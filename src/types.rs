@@ -67,7 +67,6 @@ fn nonempty(text: Option<&str>) -> Option<&str> {
     text.map(str::trim).filter(|text| !text.is_empty())
 }
 
-/// Context menu on a selected game tile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameAction {
     Scrape,
@@ -162,7 +161,6 @@ pub fn game_matches(game: &Game, query: &str, filter: GridFilter) -> bool {
             .contains(&query.to_lowercase())
 }
 
-/// Title query plus [`GridFilter`]. `query` is matched case-insensitively.
 pub fn visible_games(games: &[Game], query: &str, filter: GridFilter) -> Vec<Game> {
     games
         .iter()

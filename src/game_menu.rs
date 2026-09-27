@@ -8,7 +8,6 @@ use crate::gamepad::NavDir;
 use crate::scraper::{NameSearch, ScrapeCandidate};
 use crate::types::{DeleteOptions, Game, GameAction, GameMetadata};
 
-/// What is in front of the grid. One value, so the menu and a dialog cannot both be open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
     None,
@@ -1073,7 +1072,7 @@ mod tests {
         browse.finish_search(NameSearch {
             candidates: vec![ScrapeCandidate {
                 provider: ScrapeProvider::ScreenScraper,
-                remote_id: "9".into(),
+                provider_game_id: "9".into(),
                 title: "Super Mario World".into(),
                 system: "Super Nintendo".into(),
             }],
@@ -1089,7 +1088,7 @@ mod tests {
             panic!("expected apply");
         };
         assert_eq!(game_id, browse.selected_game().unwrap().id);
-        assert_eq!(candidate.remote_id, "9");
+        assert_eq!(candidate.provider_game_id, "9");
         assert_eq!(candidate.provider.source(), Source::ScreenScraper);
         assert!(!browse.overlay_open());
     }

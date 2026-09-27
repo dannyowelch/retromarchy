@@ -444,8 +444,9 @@ impl Shell {
             cx.stop_propagation();
             return;
         }
-        if self.on_arrow(&event.keystroke, false, cx) {
-            return;
+        match self.on_arrow(&event.keystroke, false, cx) {
+            ArrowKey::Absent => {}
+            ArrowKey::Handled | ArrowKey::Propagate => return,
         }
         if game_menu_key(
             event.keystroke.key.as_str(),
@@ -1678,16 +1679,19 @@ impl Shell {
         self.browse.remember_metadata(game_id, metadata);
     }
 
-    /// Arrow keys use the same clock as the pad. `release` clears a hold.
-    /// A modified arrow is left for the platform. Returns whether this was an arrow.
-    fn on_arrow(&mut self, keystroke: &Keystroke, release: bool, cx: &mut Context<Self>) -> bool {
+    fn on_arrow(
+        &mut self,
+        keystroke: &Keystroke,
+        release: bool,
+        cx: &mut Context<Self>,
+    ) -> ArrowKey {
         let Some(dir) = arrow_dir(keystroke) else {
-            return false;
+            return ArrowKey::Absent;
         };
         let modified =
             keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
         if modified && !release {
-            return true;
+            return ArrowKey::Propagate;
         }
         let now = monotonic_ms(self.nav_started);
         if release {
@@ -1700,7 +1704,7 @@ impl Shell {
             }
         }
         cx.stop_propagation();
-        true
+        ArrowKey::Handled
     }
 
     fn apply_cover_width(&mut self, width: f32, cx: &mut Context<Self>) {
@@ -3575,6 +3579,12 @@ fn load_appearance() -> String {
 
 fn monotonic_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+enum ArrowKey {
+    Absent,
+    Handled,
+    Propagate,
 }
 
 fn arrow_dir(keystroke: &Keystroke) -> Option<NavDir> {
