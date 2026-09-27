@@ -6,7 +6,7 @@ use crate::browse::{stats_of, Browse, LibraryKind};
 use crate::database;
 use crate::gamepad::NavDir;
 use crate::scraper::{NameSearch, ScrapeCandidate};
-use crate::types::{DeleteOptions, Game, GameAction};
+use crate::types::{DeleteOptions, Game, GameAction, GameMetadata};
 
 /// What is in front of the grid. One value, so the menu and a dialog cannot both be open.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,7 +147,6 @@ pub struct Rename {
     pub game_id: String,
     pub edit: LineEdit,
     pub slot: RenameSlot,
-    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,7 +333,6 @@ impl Browse {
     pub fn insert_text(&mut self, text: &str) {
         match &mut self.overlay {
             Overlay::Rename(rename) if rename.slot == RenameSlot::Title => {
-                rename.error = None;
                 rename.edit.insert(text);
             }
             Overlay::Scrape(prompt) if prompt.slot == ScrapeSlot::Query => {
@@ -347,7 +345,6 @@ impl Browse {
     pub fn backspace(&mut self) {
         match &mut self.overlay {
             Overlay::Rename(rename) if rename.slot == RenameSlot::Title => {
-                rename.error = None;
                 rename.edit.backspace();
             }
             Overlay::Scrape(prompt) if prompt.slot == ScrapeSlot::Query => {
@@ -360,7 +357,6 @@ impl Browse {
     pub fn delete_forward(&mut self) {
         match &mut self.overlay {
             Overlay::Rename(rename) if rename.slot == RenameSlot::Title => {
-                rename.error = None;
                 rename.edit.delete_forward();
             }
             Overlay::Scrape(prompt) if prompt.slot == ScrapeSlot::Query => {
@@ -376,9 +372,7 @@ impl Browse {
         let step = match &self.overlay {
             Overlay::None => ConfirmStep::Closed,
             Overlay::Menu(menu) => ConfirmStep::Menu(GameAction::from_index(menu.cursor as i32)),
-            Overlay::Rename(rename) => {
-                ConfirmStep::Rename(rename.slot, rename.edit.text.trim().is_empty())
-            }
+            Overlay::Rename(rename) => ConfirmStep::Rename(rename.slot),
             Overlay::Delete(prompt) => ConfirmStep::Delete(prompt.slot),
             Overlay::Scrape(prompt) => ConfirmStep::Scrape(prompt.slot),
         };
@@ -403,17 +397,11 @@ impl Browse {
                     None => OverlayCommand::None,
                 }
             }
-            ConfirmStep::Rename(RenameSlot::Cancel, _) => {
+            ConfirmStep::Rename(RenameSlot::Cancel) => {
                 self.overlay = Overlay::None;
                 OverlayCommand::None
             }
-            ConfirmStep::Rename(_, true) => {
-                if let Overlay::Rename(rename) = &mut self.overlay {
-                    rename.error = Some("Enter a title.".into());
-                }
-                OverlayCommand::None
-            }
-            ConfirmStep::Rename(_, false) => OverlayCommand::CommitRename,
+            ConfirmStep::Rename(_) => OverlayCommand::CommitRename,
             ConfirmStep::Delete(DeleteSlot::Cancel) => {
                 self.overlay = Overlay::None;
                 OverlayCommand::None
@@ -442,12 +430,15 @@ impl Browse {
         let Overlay::Rename(rename) = &self.overlay else {
             return false;
         };
-        let title = rename.edit.text.trim().to_string();
+        let text = rename.edit.text.clone();
         let id = rename.game_id.clone();
-        if title.is_empty() {
-            if let Overlay::Rename(rename) = &mut self.overlay {
-                rename.error = Some("Enter a title.".into());
-            }
+        let Some(game) = self.game_by_id(&id) else {
+            self.overlay = Overlay::None;
+            self.status = "Select a game.".into();
+            return false;
+        };
+        if game.user_title.is_none() && text.trim() == game.display_title() {
+            self.overlay = Overlay::None;
             return false;
         }
         if self.library.kind == LibraryKind::Demo {
@@ -460,12 +451,14 @@ impl Browse {
             self.status = "Could not rename the game.".into();
             return false;
         };
-        if database::set_game_title(conn, &id, &title).is_err() {
-            self.overlay = Overlay::None;
-            self.status = "Could not rename the game.".into();
-            return false;
+        match database::set_game_title(conn, &id, &text) {
+            Ok(stored) => self.set_user_title(&id, stored),
+            Err(_) => {
+                self.overlay = Overlay::None;
+                self.status = "Could not rename the game.".into();
+                return false;
+            }
         }
-        self.rewrite_title(&id, &title);
         self.overlay = Overlay::None;
         if self.status.starts_with("Could not rename")
             || self.status.starts_with("Demo library. Rename")
@@ -473,6 +466,20 @@ impl Browse {
             self.status.clear();
         }
         true
+    }
+
+    pub fn remember_metadata(&mut self, game_id: &str, metadata: GameMetadata) {
+        let keep = self.selected_game().map(|game| game.id.clone());
+        let previous = self.game;
+        let pane = self.pane;
+        for shelf in &mut self.library.shelves {
+            if let Some(game) = shelf.games.iter_mut().find(|game| game.id == game_id) {
+                game.metadata = Some(metadata);
+                shelf.stats = stats_of(&shelf.games);
+                break;
+            }
+        }
+        self.rebind_visible(keep, previous, pane);
     }
 
     pub fn commit_delete(&mut self, conn: Option<&rusqlite::Connection>) -> Option<RemovedGame> {
@@ -502,7 +509,7 @@ impl Browse {
             return None;
         };
         self.overlay = Overlay::None;
-        self.status = format!("Removed {} from the library.", game.title);
+        self.status = format!("Removed {} from the library.", game.display_title());
         Some(RemovedGame { game, options })
     }
 
@@ -550,16 +557,15 @@ impl Browse {
     fn begin_rename(&mut self, game: &Game) {
         self.overlay = Overlay::Rename(Rename {
             game_id: game.id.clone(),
-            edit: LineEdit::selected(game.title.clone()),
+            edit: LineEdit::selected(game.display_title().to_string()),
             slot: RenameSlot::Title,
-            error: None,
         });
     }
 
     fn begin_delete(&mut self, game: &Game) {
         self.overlay = Overlay::Delete(DeletePrompt {
             game_id: game.id.clone(),
-            title: game.title.clone(),
+            title: game.display_title().to_string(),
             options: DeleteOptions::default(),
             slot: DeleteSlot::Cancel,
         });
@@ -660,14 +666,18 @@ impl Browse {
         OverlayCommand::Apply { game_id, candidate }
     }
 
-    fn rewrite_title(&mut self, id: &str, title: &str) {
+    fn set_user_title(&mut self, id: &str, user_title: Option<String>) {
+        let keep = self.selected_game().map(|game| game.id.clone());
+        let previous = self.game;
+        let pane = self.pane;
         for shelf in &mut self.library.shelves {
             if let Some(game) = shelf.games.iter_mut().find(|game| game.id == id) {
-                game.title = title.to_string();
+                game.user_title = user_title;
                 shelf.stats = stats_of(&shelf.games);
-                return;
+                break;
             }
         }
+        self.rebind_visible(keep, previous, pane);
     }
 
     fn detach_game(&mut self, id: &str) -> Option<Game> {
@@ -696,7 +706,7 @@ impl Browse {
 enum ConfirmStep {
     Closed,
     Menu(Option<GameAction>),
-    Rename(RenameSlot, bool),
+    Rename(RenameSlot),
     Delete(DeleteSlot),
     Scrape(ScrapeSlot),
 }
@@ -766,12 +776,7 @@ fn move_scrape(prompt: &mut ScrapePrompt, dir: NavDir) {
 }
 
 fn scrape_query(game: &Game) -> String {
-    let title = game.title.trim();
-    if title.is_empty() {
-        crate::scanner::derive_title(&game.rom)
-    } else {
-        title.to_string()
-    }
+    game.display_title().to_string()
 }
 
 fn search_message(outcome: &NameSearch) -> String {
@@ -810,7 +815,7 @@ fn byte_index(text: &str, caret: usize) -> usize {
 mod tests {
     use super::*;
     use crate::browse::{demo_library, Browse, Pane};
-    use crate::types::{ScrapeProvider, Source};
+    use crate::types::{GameMetadata, ScrapeProvider, Source};
 
     fn entered() -> Browse {
         let mut browse = Browse::new(demo_library("Demo library."));
@@ -856,7 +861,10 @@ mod tests {
         let mut browse = Browse::new(demo_library("Demo library."));
         browse.select_game(2);
         open_menu(&mut browse);
-        assert_eq!(browse.selected_game().unwrap().title, "Super Metroid");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Metroid"
+        );
     }
 
     #[test]
@@ -892,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_moves_like_the_gtk_dialog_and_rejects_a_blank_title() {
+    fn rename_moves_like_the_gtk_dialog_and_a_blank_title_commits() {
         let mut browse = entered();
         open_menu(&mut browse);
         browse.move_overlay(NavDir::Down);
@@ -917,15 +925,15 @@ mod tests {
         }
         browse.move_overlay(NavDir::Up);
         browse.backspace();
-        assert_eq!(browse.confirm_overlay(false), OverlayCommand::None);
+        assert_eq!(browse.confirm_overlay(false), OverlayCommand::CommitRename);
         match &browse.overlay {
-            Overlay::Rename(rename) => {
-                assert_eq!(rename.error.as_deref(), Some("Enter a title."));
-                assert!(rename.edit.text.trim().is_empty());
-            }
+            Overlay::Rename(rename) => assert!(rename.edit.text.trim().is_empty()),
             other => panic!("{other:?}"),
         }
-        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Mario World"
+        );
     }
 
     #[test]
@@ -939,7 +947,10 @@ mod tests {
         assert!(!browse.commit_rename(None));
         assert!(!browse.overlay_open());
         assert_eq!(browse.status, "Demo library. Rename is not saved.");
-        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Mario World"
+        );
 
         open_menu(&mut browse);
         browse.move_overlay(NavDir::Down);
@@ -980,10 +991,23 @@ mod tests {
         }
         assert_eq!(browse.confirm_overlay(false), OverlayCommand::CommitRename);
         assert!(browse.commit_rename(Some(&conn)));
-        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World!");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Mario World!"
+        );
         let stored = database::load_games(&conn, None).unwrap();
         let stored = stored.iter().find(|game| game.id == id).unwrap();
-        assert_eq!(stored.title, "Super Mario World!");
+        assert_eq!(stored.display_title(), "Super Mario World!");
+        assert_eq!(stored.file_title, "Super Mario World");
+        assert_eq!(stored.user_title.as_deref(), Some("Super Mario World!"));
+        let scraped: Option<String> = conn
+            .query_row(
+                "SELECT scraped_title FROM games WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(scraped.is_none());
         let custom: i32 = conn
             .query_row(
                 "SELECT title_custom FROM games WHERE id = ?1",
@@ -991,7 +1015,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(custom, 1);
+        assert_eq!(custom, 0);
 
         open_menu(&mut browse);
         browse.aim(Aim::Menu(2));
@@ -1122,7 +1146,10 @@ mod tests {
             },
         );
         assert_eq!(browse.game, index);
-        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Mario World"
+        );
         assert!(browse
             .selected_game()
             .unwrap()
@@ -1130,5 +1157,116 @@ mod tests {
             .iter()
             .any(|media| media.kind == MediaKind::Screenshot
                 && media.source == Source::ScreenScraper));
+    }
+
+    #[test]
+    fn disk_rename_to_x_keeps_the_scraped_title_and_the_rom() {
+        let dir = tempfile::tempdir().unwrap();
+        let rom = dir.path().join("chrono.sfc");
+        std::fs::write(&rom, b"ROMDATA").unwrap();
+        let conn = database::open_db(&dir.path().join("library.db")).unwrap();
+        let mut browse = entered();
+        browse.library.kind = LibraryKind::Disk;
+        let id = browse.selected_game().unwrap().id.clone();
+        for shelf in &mut browse.library.shelves {
+            if let Some(game) = shelf.games.iter_mut().find(|game| game.id == id) {
+                game.rom = rom.clone();
+            }
+        }
+        database::upsert_game(&conn, browse.game_by_id(&id).unwrap()).unwrap();
+        database::set_game_metadata(
+            &conn,
+            &id,
+            &GameMetadata {
+                title: Some("Scraped Name".into()),
+                publisher: Some("Nintendo".into()),
+                year: Some(1990),
+                genre: Some("Platform".into()),
+            },
+        )
+        .unwrap();
+
+        open_menu(&mut browse);
+        browse.move_overlay(NavDir::Down);
+        browse.confirm_overlay(false);
+        browse.insert_text("X");
+        assert_eq!(browse.confirm_overlay(false), OverlayCommand::CommitRename);
+        assert!(browse.commit_rename(Some(&conn)));
+        assert_eq!(browse.selected_game().unwrap().display_title(), "X");
+        let scraped: String = conn
+            .query_row(
+                "SELECT scraped_title FROM games WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scraped, "Scraped Name");
+        assert_eq!(std::fs::read(&rom).unwrap(), b"ROMDATA");
+
+        open_menu(&mut browse);
+        browse.move_overlay(NavDir::Down);
+        browse.confirm_overlay(false);
+        browse.backspace();
+        assert_eq!(browse.confirm_overlay(false), OverlayCommand::CommitRename);
+        assert!(browse.commit_rename(Some(&conn)));
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Mario World"
+        );
+        let user_title: Option<String> = conn
+            .query_row("SELECT user_title FROM games WHERE id = ?1", [&id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(user_title.is_none());
+        assert_eq!(std::fs::read(&rom).unwrap(), b"ROMDATA");
+    }
+
+    #[test]
+    fn unchanged_prefill_with_no_override_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = database::open_db(&dir.path().join("library.db")).unwrap();
+        let mut browse = entered();
+        browse.library.kind = LibraryKind::Disk;
+        let id = browse.selected_game().unwrap().id.clone();
+        database::upsert_game(&conn, browse.game_by_id(&id).unwrap()).unwrap();
+        open_menu(&mut browse);
+        browse.move_overlay(NavDir::Down);
+        browse.confirm_overlay(false);
+        assert_eq!(browse.confirm_overlay(false), OverlayCommand::CommitRename);
+        assert!(!browse.commit_rename(Some(&conn)));
+        assert!(!browse.overlay_open());
+        assert!(browse.selected_game().unwrap().user_title.is_none());
+        let user_title: Option<String> = conn
+            .query_row("SELECT user_title FROM games WHERE id = ?1", [&id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(user_title.is_none());
+    }
+
+    #[test]
+    fn remember_metadata_updates_display_and_keeps_the_selected_id() {
+        let mut browse = entered();
+        let id = browse.selected_game().unwrap().id.clone();
+        browse.open_search();
+        browse.push_search("mario");
+        browse.remember_metadata(
+            &id,
+            GameMetadata {
+                title: Some("Mario Paint".into()),
+                publisher: Some("Nintendo".into()),
+                year: Some(1992),
+                genre: Some("Platform".into()),
+            },
+        );
+        let game = browse.selected_game().unwrap();
+        assert_eq!(game.id, id);
+        assert_eq!(game.display_title(), "Mario Paint");
+        assert_eq!(
+            browse.shelf().unwrap().stats.most_played_game.as_deref(),
+            Some("Mario Paint")
+        );
+        assert_eq!(browse.shelf().unwrap().games[0].id, id);
     }
 }

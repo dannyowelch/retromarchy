@@ -1,7 +1,8 @@
 use crate::types::{
-    GridArt, Media, MediaKind, ScrapeProvider, ScraperConfig, ScraperCredentials, Source,
+    GameMetadata, GridArt, Media, MediaKind, ScrapeProvider, ScraperConfig, ScraperCredentials,
+    Source,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -253,7 +254,7 @@ impl ArtworkQuery {
             scrape_fingerprint(&game.console, &game.rom, game.crc32);
         Self {
             console_id: game.console.clone(),
-            title: game.title.clone(),
+            title: game.display_title().to_string(),
             rom_name,
             crc32,
             rom_bytes,
@@ -356,13 +357,15 @@ pub fn screenscraper_params(
     params
 }
 
-struct SsMedia {
-    type_name: String,
-    region: String,
-    url: String,
+const NAME_REGIONS: [&str; 3] = ["us", "wor", "eu"];
+
+#[derive(Debug)]
+struct SsGame {
+    medias: Vec<(String, String, String)>,
+    metadata: GameMetadata,
 }
 
-pub fn parse_screenscraper_medias(body: &str) -> Result<Vec<(String, String, String)>, FetchFail> {
+fn parse_screenscraper_game(body: &str) -> Result<SsGame, FetchFail> {
     let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|_| FetchFail::Failed("ScreenScraper returned invalid JSON".into()))?;
     if let Some(error) = value
@@ -377,21 +380,122 @@ pub fn parse_screenscraper_medias(body: &str) -> Result<Vec<(String, String, Str
             error,
         ));
     }
-    let medias = value
-        .pointer("/response/jeu/medias")
-        .and_then(|medias| medias.as_array())
+    let jeu = value
+        .pointer("/response/jeu")
+        .filter(|jeu| jeu.is_object())
         .ok_or_else(|| FetchFail::Failed("ScreenScraper has no game match".into()))?;
-    let mut out = Vec::new();
-    for media in medias {
-        let type_name = media.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let region = media.get("region").and_then(|v| v.as_str()).unwrap_or("");
-        let url = media.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        if type_name.is_empty() || url.is_empty() {
-            continue;
+    let mut medias = Vec::new();
+    if let Some(items) = jeu.get("medias").and_then(|medias| medias.as_array()) {
+        for media in items {
+            let type_name = media.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let region = media.get("region").and_then(|v| v.as_str()).unwrap_or("");
+            let url = media.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            if type_name.is_empty() || url.is_empty() {
+                continue;
+            }
+            medias.push((type_name.to_string(), region.to_string(), url.to_string()));
         }
-        out.push((type_name.to_string(), region.to_string(), url.to_string()));
     }
-    Ok(out)
+    Ok(SsGame {
+        medias,
+        metadata: screenscraper_metadata(jeu),
+    })
+}
+
+fn screenscraper_metadata(jeu: &serde_json::Value) -> GameMetadata {
+    let noms = json_games(jeu.get("noms"), "text");
+    let title = NAME_REGIONS.iter().find_map(|region| {
+        noms.iter().find_map(|nom| {
+            let matches = nom.get("region").and_then(|value| value.as_str()) == Some(*region);
+            matches
+                .then(|| nom.get("text").and_then(|text| text.as_str()))
+                .flatten()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        })
+    });
+    let publisher = jeu
+        .pointer("/editeur/text")
+        .and_then(|text| text.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    GameMetadata {
+        title,
+        publisher,
+        year: year_from_dates(jeu.get("dates")),
+        genre: english_genres(jeu.get("genres")),
+    }
+}
+
+fn year_from_dates(dates: Option<&serde_json::Value>) -> Option<u32> {
+    let dates = json_games(dates, "text");
+    for region in NAME_REGIONS {
+        if let Some(year) = dates.iter().find_map(|date| {
+            (date.get("region").and_then(|value| value.as_str()) == Some(region))
+                .then(|| date.get("text").and_then(|text| text.as_str()))
+                .flatten()
+                .and_then(release_year)
+        }) {
+            return Some(year);
+        }
+    }
+    dates.iter().find_map(|date| {
+        date.get("text")
+            .and_then(|text| text.as_str())
+            .and_then(release_year)
+    })
+}
+
+fn release_year(text: &str) -> Option<u32> {
+    let text = text.trim();
+    let year_digits = match text.len() {
+        4 => text,
+        7 if text.as_bytes()[4] == b'-' && text[5..].bytes().all(|byte| byte.is_ascii_digit()) => {
+            &text[..4]
+        }
+        10 if text.as_bytes()[4] == b'-'
+            && text.as_bytes()[7] == b'-'
+            && text[5..7].bytes().all(|byte| byte.is_ascii_digit())
+            && text[8..].bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            &text[..4]
+        }
+        _ => return None,
+    };
+    if !year_digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let year: u32 = year_digits.parse().ok()?;
+    (1900..=2099).contains(&year).then_some(year)
+}
+
+fn english_genres(genres: Option<&serde_json::Value>) -> Option<String> {
+    let mut seen = Vec::new();
+    for genre in json_games(genres, "id") {
+        for nom in json_games(genre.get("noms"), "text") {
+            if nom.get("langue").and_then(|value| value.as_str()) != Some("en") {
+                continue;
+            }
+            let Some(text) = nom
+                .get("text")
+                .and_then(|text| text.as_str())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            else {
+                continue;
+            };
+            if !seen.iter().any(|have: &String| have == text) {
+                seen.push(text.to_string());
+            }
+        }
+    }
+    if seen.is_empty() {
+        None
+    } else {
+        Some(seen.join(", "))
+    }
 }
 
 pub fn pick_screenscraper_url(
@@ -418,6 +522,40 @@ fn screenscraper_media_type(kind: MediaKind) -> Option<&'static str> {
 }
 
 pub fn parse_thegamesdb_game_id(body: &str, title: &str) -> Result<i64, FetchFail> {
+    Ok(parse_thegamesdb_game(body, title)?.id)
+}
+
+#[derive(Clone)]
+struct TgGame {
+    id: i64,
+    exact: bool,
+    title: Option<String>,
+    year: Option<u32>,
+    genre_ids: Vec<i64>,
+    publisher_ids: Vec<i64>,
+}
+
+fn parse_thegamesdb_game(body: &str, title: &str) -> Result<TgGame, FetchFail> {
+    let games = thegamesdb_games(body)?;
+    let exact_at = games.iter().position(|game| {
+        game.get("game_title")
+            .and_then(|title_value| title_value.as_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(title))
+    });
+    let game = exact_at.map(|index| &games[index]).unwrap_or(&games[0]);
+    tg_game_from(game, exact_at.is_some())
+}
+
+fn parse_thegamesdb_game_by_id(body: &str, id: i64) -> Result<TgGame, FetchFail> {
+    let games = thegamesdb_games(body)?;
+    let game = games
+        .iter()
+        .find(|game| game.get("id").and_then(|value| value.as_i64()) == Some(id))
+        .ok_or_else(|| FetchFail::Failed("TheGamesDB game id missing".into()))?;
+    tg_game_from(game, true)
+}
+
+fn thegamesdb_games(body: &str) -> Result<Vec<serde_json::Value>, FetchFail> {
     let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|_| FetchFail::Failed("TheGamesDB returned invalid JSON".into()))?;
     if let Some(message) = api_error_message(&value) {
@@ -431,15 +569,220 @@ pub fn parse_thegamesdb_game_id(body: &str, title: &str) -> Result<i64, FetchFai
     if games.is_empty() {
         return Err(FetchFail::Failed("TheGamesDB has no game match".into()));
     }
-    let exact = games.iter().find(|game| {
-        game.get("game_title")
-            .and_then(|title_value| title_value.as_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case(title))
-    });
-    let game = exact.unwrap_or(&games[0]);
-    game.get("id")
+    Ok(games)
+}
+
+fn tg_game_from(game: &serde_json::Value, exact: bool) -> Result<TgGame, FetchFail> {
+    let id = game
+        .get("id")
         .and_then(|id| id.as_i64())
-        .ok_or_else(|| FetchFail::Failed("TheGamesDB game id missing".into()))
+        .ok_or_else(|| FetchFail::Failed("TheGamesDB game id missing".into()))?;
+    let title = game
+        .get("game_title")
+        .and_then(|title| title.as_str())
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string);
+    let year = game
+        .get("release_date")
+        .and_then(|date| date.as_str())
+        .and_then(release_year);
+    Ok(TgGame {
+        id,
+        exact,
+        title,
+        year,
+        genre_ids: json_id_list(game.get("genres")),
+        publisher_ids: json_id_list(game.get("publishers")),
+    })
+}
+
+fn json_id_list(value: Option<&serde_json::Value>) -> Vec<i64> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    match value {
+        serde_json::Value::Array(items) => items.iter().filter_map(json_i64).collect(),
+        serde_json::Value::Null => Vec::new(),
+        other => json_i64(other).into_iter().collect(),
+    }
+}
+
+fn json_i64(value: &serde_json::Value) -> Option<i64> {
+    if let Some(id) = value.as_i64() {
+        return Some(id);
+    }
+    if let Some(text) = value.as_str() {
+        return text.trim().parse().ok();
+    }
+    value.get("id").and_then(json_i64)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TgList {
+    Genres,
+    Publishers,
+}
+
+impl TgList {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Genres => "Genres/ByGenreID",
+            Self::Publishers => "Publishers/ByPublisherID",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Genres => "genres",
+            Self::Publishers => "publishers",
+        }
+    }
+}
+
+fn parse_thegamesdb_names(body: &str, list: TgList) -> Result<Vec<(i64, String)>, FetchFail> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| FetchFail::Failed("TheGamesDB returned invalid JSON".into()))?;
+    if let Some(message) = api_error_message(&value) {
+        return Err(classify_provider_error(ScrapeProvider::TheGamesDb, message));
+    }
+    let rows = value
+        .pointer(&format!("/data/{}", list.key()))
+        .and_then(|rows| rows.as_object())
+        .ok_or_else(|| FetchFail::Failed("TheGamesDB returned no names".into()))?;
+    let mut out = Vec::new();
+    for (key, item) in rows {
+        let id = item
+            .get("id")
+            .and_then(json_i64)
+            .or_else(|| key.parse().ok());
+        let name = item
+            .get("name")
+            .and_then(|name| name.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        if let (Some(id), Some(name)) = (id, name) {
+            out.push((id, name.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Default)]
+struct TgNames {
+    genres: HashMap<i64, String>,
+    publishers: HashMap<i64, String>,
+}
+
+impl TgNames {
+    fn fill(
+        &mut self,
+        agent: &ureq::Agent,
+        creds: &ScraperCredentials,
+        game: &TgGame,
+        last_http: &mut Option<Instant>,
+    ) -> Result<(), FetchFail> {
+        self.fill_list(agent, creds, TgList::Genres, &game.genre_ids, last_http)?;
+        self.fill_list(
+            agent,
+            creds,
+            TgList::Publishers,
+            &game.publisher_ids,
+            last_http,
+        )?;
+        Ok(())
+    }
+
+    fn fill_list(
+        &mut self,
+        agent: &ureq::Agent,
+        creds: &ScraperCredentials,
+        list: TgList,
+        ids: &[i64],
+        last_http: &mut Option<Instant>,
+    ) -> Result<(), FetchFail> {
+        let known = match list {
+            TgList::Genres => &self.genres,
+            TgList::Publishers => &self.publishers,
+        };
+        let missing: Vec<i64> = ids
+            .iter()
+            .copied()
+            .filter(|id| !known.contains_key(id))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let params = vec![
+            ("apikey".to_string(), creds.thegamesdb_api_key.clone()),
+            (
+                "id".to_string(),
+                missing
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        ];
+        let url = format!(
+            "https://api.thegamesdb.net/v1/{}?{}",
+            list.path(),
+            encode_query(&params)
+        );
+        let body = download_text(agent, &url, last_http)?;
+        let names = parse_thegamesdb_names(&body, list)?;
+        let slot = match list {
+            TgList::Genres => &mut self.genres,
+            TgList::Publishers => &mut self.publishers,
+        };
+        for (id, name) in names {
+            slot.insert(id, name);
+        }
+        for id in missing {
+            slot.entry(id).or_default();
+        }
+        Ok(())
+    }
+}
+
+impl TgGame {
+    fn metadata(&self, names: &TgNames) -> GameMetadata {
+        GameMetadata {
+            title: self.title.clone(),
+            publisher: joined_names(&self.publisher_ids, &names.publishers),
+            year: self.year,
+            genre: joined_names(&self.genre_ids, &names.genres),
+        }
+    }
+}
+
+fn joined_names(ids: &[i64], names: &HashMap<i64, String>) -> Option<String> {
+    let mut seen = Vec::new();
+    for id in ids {
+        let Some(name) = names
+            .get(id)
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        if !seen.iter().any(|have: &String| have == name) {
+            seen.push(name.to_string());
+        }
+    }
+    if seen.is_empty() {
+        None
+    } else {
+        Some(seen.join(", "))
+    }
+}
+
+fn metadata_if_matched(game: &TgGame, names: &TgNames) -> Result<GameMetadata, FetchFail> {
+    if !game.exact {
+        Err(FetchFail::Failed("TheGamesDB has no game match".into()))
+    } else {
+        Ok(game.metadata(names))
+    }
 }
 
 struct TgImage {
@@ -667,17 +1010,91 @@ fn thegamesdb_platform(console_id: &str) -> Option<u32> {
 }
 
 struct HttpGame {
-    ss_medias: Option<Result<Vec<SsMedia>, FetchFail>>,
-    tgdb_id: Option<Result<i64, FetchFail>>,
+    ss_game: Option<Result<SsGame, FetchFail>>,
+    tgdb_game: Option<Result<TgGame, FetchFail>>,
     tgdb_images: Option<Result<(String, Vec<TgImage>), FetchFail>>,
 }
 
 impl HttpGame {
     fn new() -> Self {
         Self {
-            ss_medias: None,
-            tgdb_id: None,
+            ss_game: None,
+            tgdb_game: None,
             tgdb_images: None,
+        }
+    }
+
+    fn fetch_metadata(
+        &mut self,
+        agent: &ureq::Agent,
+        creds: &ScraperCredentials,
+        query: &ArtworkQuery,
+        provider: ScrapeProvider,
+        names: &mut TgNames,
+        last_http: &mut Option<Instant>,
+    ) -> Result<GameMetadata, FetchFail> {
+        match provider {
+            ScrapeProvider::ScreenScraper => Ok(self
+                .ss_game(agent, creds, query, last_http)?
+                .metadata
+                .clone()),
+            ScrapeProvider::TheGamesDb => {
+                let game = self.tgdb_game(agent, creds, query, last_http)?.clone();
+                if game.exact {
+                    names.fill(agent, creds, &game, last_http)?;
+                }
+                metadata_if_matched(&game, names)
+            }
+        }
+    }
+
+    fn ss_game(
+        &mut self,
+        agent: &ureq::Agent,
+        creds: &ScraperCredentials,
+        query: &ArtworkQuery,
+        last_http: &mut Option<Instant>,
+    ) -> Result<&SsGame, FetchFail> {
+        if self.ss_game.is_none() {
+            let loaded = load_screenscraper(agent, creds, query, true, last_http).or_else(|err| {
+                if matches!(err, FetchFail::RateLimited(_))
+                    || screenscraper_system(&query.console_id).is_none()
+                {
+                    Err(err)
+                } else {
+                    load_screenscraper(agent, creds, query, false, last_http)
+                }
+            });
+            self.ss_game = Some(loaded);
+        }
+        match self.ss_game.as_ref().expect("filled above") {
+            Ok(game) => Ok(game),
+            Err(err) => Err(err.clone()),
+        }
+    }
+
+    fn tgdb_game(
+        &mut self,
+        agent: &ureq::Agent,
+        creds: &ScraperCredentials,
+        query: &ArtworkQuery,
+        last_http: &mut Option<Instant>,
+    ) -> Result<&TgGame, FetchFail> {
+        if self.tgdb_game.is_none() {
+            let with_platform = thegamesdb_platform(&query.console_id).is_some();
+            let loaded =
+                load_thegamesdb_id(agent, creds, query, with_platform, last_http).or_else(|err| {
+                    if !with_platform || matches!(err, FetchFail::RateLimited(_)) {
+                        Err(err)
+                    } else {
+                        load_thegamesdb_id(agent, creds, query, false, last_http)
+                    }
+                });
+            self.tgdb_game = Some(loaded);
+        }
+        match self.tgdb_game.as_ref().expect("filled above") {
+            Ok(game) => Ok(game),
+            Err(err) => Err(err.clone()),
         }
     }
 
@@ -715,33 +1132,8 @@ impl HttpGame {
         kind: MediaKind,
         last_http: &mut Option<Instant>,
     ) -> Result<String, FetchFail> {
-        if self.ss_medias.is_none() {
-            let loaded = load_screenscraper(agent, creds, query, true, last_http).or_else(|err| {
-                if matches!(err, FetchFail::RateLimited(_))
-                    || screenscraper_system(&query.console_id).is_none()
-                {
-                    Err(err)
-                } else {
-                    load_screenscraper(agent, creds, query, false, last_http)
-                }
-            });
-            self.ss_medias = Some(loaded);
-        }
-        let medias = match self.ss_medias.as_ref().expect("filled above") {
-            Ok(medias) => medias,
-            Err(err) => return Err(err.clone()),
-        };
-        let tuples: Vec<_> = medias
-            .iter()
-            .map(|media| {
-                (
-                    media.type_name.clone(),
-                    media.region.clone(),
-                    media.url.clone(),
-                )
-            })
-            .collect();
-        pick_screenscraper_url(&tuples, kind).ok_or_else(|| {
+        let game = self.ss_game(agent, creds, query, last_http)?;
+        pick_screenscraper_url(&game.medias, kind).ok_or_else(|| {
             FetchFail::Failed(format!(
                 "ScreenScraper: no {} for this game",
                 kind_file_stem(kind).replace('_', " ")
@@ -757,22 +1149,7 @@ impl HttpGame {
         kind: MediaKind,
         last_http: &mut Option<Instant>,
     ) -> Result<String, FetchFail> {
-        if self.tgdb_id.is_none() {
-            let with_platform = thegamesdb_platform(&query.console_id).is_some();
-            let loaded =
-                load_thegamesdb_id(agent, creds, query, with_platform, last_http).or_else(|err| {
-                    if !with_platform || matches!(err, FetchFail::RateLimited(_)) {
-                        Err(err)
-                    } else {
-                        load_thegamesdb_id(agent, creds, query, false, last_http)
-                    }
-                });
-            self.tgdb_id = Some(loaded);
-        }
-        let game_id = match self.tgdb_id.as_ref().expect("filled above") {
-            Ok(id) => *id,
-            Err(err) => return Err(err.clone()),
-        };
+        let game_id = self.tgdb_game(agent, creds, query, last_http)?.id;
         if self.tgdb_images.is_none() {
             self.tgdb_images = Some(load_thegamesdb_images(agent, creds, game_id, last_http));
         }
@@ -806,7 +1183,7 @@ fn load_screenscraper(
     query: &ArtworkQuery,
     with_system: bool,
     last_http: &mut Option<Instant>,
-) -> Result<Vec<SsMedia>, FetchFail> {
+) -> Result<SsGame, FetchFail> {
     let mut params = screenscraper_params(creds, query);
     if !with_system {
         params.retain(|(key, _)| key != "systemeid");
@@ -816,15 +1193,7 @@ fn load_screenscraper(
         encode_query(&params)
     );
     let body = download_text(agent, &url, last_http)?;
-    let medias = parse_screenscraper_medias(&body)?;
-    Ok(medias
-        .into_iter()
-        .map(|(type_name, region, url)| SsMedia {
-            type_name,
-            region,
-            url,
-        })
-        .collect())
+    parse_screenscraper_game(&body)
 }
 
 fn load_thegamesdb_id(
@@ -833,10 +1202,11 @@ fn load_thegamesdb_id(
     query: &ArtworkQuery,
     with_platform: bool,
     last_http: &mut Option<Instant>,
-) -> Result<i64, FetchFail> {
+) -> Result<TgGame, FetchFail> {
     let mut params = vec![
         ("apikey".to_string(), creds.thegamesdb_api_key.clone()),
         ("name".to_string(), query.title.clone()),
+        ("fields".to_string(), "genres,publishers".to_string()),
     ];
     if with_platform {
         if let Some(platform) = thegamesdb_platform(&query.console_id) {
@@ -848,7 +1218,7 @@ fn load_thegamesdb_id(
         encode_query(&params)
     );
     let body = download_text(agent, &url, last_http)?;
-    parse_thegamesdb_game_id(&body, &query.title)
+    parse_thegamesdb_game(&body, &query.title)
 }
 
 fn load_thegamesdb_images(
@@ -967,6 +1337,68 @@ fn fixture_bytes(dir: &Path, kind: MediaKind) -> Result<Vec<u8>, FetchFail> {
     })
 }
 
+fn fixture_metadata(dir: &Path) -> Result<GameMetadata, FetchFail> {
+    let body = fs::read_to_string(dir.join("jeuInfos.json"))
+        .map_err(|_| FetchFail::Failed("fixture metadata missing".into()))?;
+    Ok(parse_screenscraper_game(&body)?.metadata)
+}
+
+struct MissingWork {
+    kinds: Vec<MediaKind>,
+    metadata: bool,
+}
+
+fn missing_work(game: &crate::types::Game, enabled: &[MediaKind]) -> Option<MissingWork> {
+    let kinds = kinds_to_fetch(&present_kinds(&game.media), enabled);
+    let metadata = game.metadata.is_none();
+    if kinds.is_empty() && !metadata {
+        None
+    } else {
+        Some(MissingWork { kinds, metadata })
+    }
+}
+
+fn first_uncooled<T>(
+    active: &[ScrapeProvider],
+    cooled: &mut Vec<ScrapeProvider>,
+    reasons: &mut Vec<String>,
+    prefix: &str,
+    mut fetch: impl FnMut(ScrapeProvider) -> Result<T, FetchFail>,
+) -> Option<T> {
+    let providers: Vec<_> = active
+        .iter()
+        .copied()
+        .filter(|provider| !cooled.contains(provider))
+        .collect();
+    if providers.is_empty() {
+        let names = cooled
+            .iter()
+            .map(|provider| provider.label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        push_reason(
+            reasons,
+            format!("{prefix}skipped after an earlier rate limit ({names})"),
+        );
+        return None;
+    }
+    let outcome = take_first_success(&providers, &mut fetch);
+    for (provider, err) in &outcome.errors {
+        push_reason(
+            reasons,
+            format!(
+                "{prefix}{}: {}",
+                provider.label(),
+                fail_message(err.clone())
+            ),
+        );
+        if matches!(err, FetchFail::RateLimited(_)) && !cooled.contains(provider) {
+            cooled.push(*provider);
+        }
+    }
+    outcome.success.map(|(_, value)| value)
+}
+
 /// One name-search hit. `remote_id` is the provider game id, not the library id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrapeCandidate {
@@ -1041,6 +1473,7 @@ pub fn thegamesdb_search_params(
         ("apikey".to_string(), creds.thegamesdb_api_key.clone()),
         ("name".to_string(), query.to_string()),
         ("include".to_string(), "platform".to_string()),
+        ("fields".to_string(), "genres,publishers".to_string()),
     ];
     if let Some(platform) = thegamesdb_platform(console_id) {
         params.push(("filter[platform]".to_string(), platform.to_string()));
@@ -1328,24 +1761,27 @@ fn run_apply(
     tx: &std::sync::mpsc::Sender<ScrapeUpdate>,
 ) -> String {
     let kinds = scraper.enabled_kinds();
-    if kinds.is_empty() {
-        return "Enable box art or screenshot in Scraper settings.".into();
-    }
     let root = match media_root() {
         Ok(root) => root,
         Err(err) => return format!("Could not create the artwork cache: {err}"),
     };
-    let _ = tx.send(ScrapeUpdate::Status(format!("Scraping {}…", game.title)));
+    let _ = tx.send(ScrapeUpdate::Status(format!(
+        "Scraping {}…",
+        game.display_title()
+    )));
     let source = if fixtures.is_some() {
         Source::Local
     } else {
         candidate.provider.source()
     };
-    let loaded: Vec<(MediaKind, Result<Vec<u8>, FetchFail>)> = if let Some(dir) = &fixtures {
-        kinds
-            .iter()
-            .map(|kind| (*kind, fixture_bytes(dir, *kind)))
-            .collect()
+    let loaded = if let Some(dir) = &fixtures {
+        CandidateLoad {
+            images: Ok(kinds
+                .iter()
+                .map(|kind| (*kind, fixture_bytes(dir, *kind)))
+                .collect()),
+            metadata: fixture_metadata(dir),
+        }
     } else if let Some(reason) = scraper.credentials.block_reason(candidate.provider) {
         return reason.to_string();
     } else {
@@ -1353,36 +1789,53 @@ fn run_apply(
             .timeout(Duration::from_secs(25))
             .build();
         let mut last_http = None;
-        match load_candidate_images(
+        load_candidate(
             &agent,
             &scraper.credentials,
             &candidate,
             &kinds,
             &mut last_http,
-        ) {
-            Ok(images) => images,
-            Err(err) => return fail_message(err),
-        }
+        )
     };
+    if let (Err(err), Err(_)) = (&loaded.images, &loaded.metadata) {
+        return fail_message(err.clone());
+    }
     let mut saved = 0usize;
     let mut failed = 0usize;
-    for (kind, bytes) in loaded {
-        match bytes {
-            Ok(bytes) => match write_cached_image(&root, &game.console, &game.id, kind, &bytes) {
-                Ok(path) => {
-                    saved += 1;
-                    let _ = tx.send(ScrapeUpdate::Saved {
-                        game_id: game.id.clone(),
-                        media: Media { kind, path, source },
-                    });
+    match loaded.images {
+        Ok(images) => {
+            for (kind, bytes) in images {
+                match bytes {
+                    Ok(bytes) => {
+                        match write_cached_image(&root, &game.console, &game.id, kind, &bytes) {
+                            Ok(path) => {
+                                saved += 1;
+                                let _ = tx.send(ScrapeUpdate::Saved {
+                                    game_id: game.id.clone(),
+                                    media: Media { kind, path, source },
+                                });
+                            }
+                            Err(err) => {
+                                failed += 1;
+                                let _ = tx.send(ScrapeUpdate::Status(err));
+                            }
+                        }
+                    }
+                    Err(_) => failed += 1,
                 }
-                Err(err) => {
-                    failed += 1;
-                    let _ = tx.send(ScrapeUpdate::Status(err));
-                }
-            },
-            Err(_) => failed += 1,
+            }
         }
+        Err(_) => failed += 1,
+    }
+    match loaded.metadata {
+        Ok(metadata) => {
+            saved += 1;
+            let _ = tx.send(ScrapeUpdate::Metadata {
+                game_id: game.id.clone(),
+                metadata,
+            });
+        }
+        Err(_) => failed += 1,
     }
     let mut summary = format!("Scrape finished: {saved} saved, {failed} failed.");
     if fixtures.is_some() {
@@ -1391,75 +1844,116 @@ fn run_apply(
     summary
 }
 
-fn load_candidate_images(
+struct CandidateLoad {
+    images: Result<Vec<(MediaKind, Result<Vec<u8>, FetchFail>)>, FetchFail>,
+    metadata: Result<GameMetadata, FetchFail>,
+}
+
+fn load_candidate(
     agent: &ureq::Agent,
     creds: &ScraperCredentials,
     candidate: &ScrapeCandidate,
     kinds: &[MediaKind],
     last_http: &mut Option<Instant>,
-) -> Result<Vec<(MediaKind, Result<Vec<u8>, FetchFail>)>, FetchFail> {
+) -> CandidateLoad {
     match candidate.provider {
         ScrapeProvider::ScreenScraper => {
-            let medias = load_screenscraper_by_id(agent, creds, &candidate.remote_id, last_http)?;
-            Ok(kinds
-                .iter()
-                .copied()
-                .map(|kind| {
-                    let bytes = match pick_screenscraper_url(&medias, kind) {
-                        Some(url) if url_allowed(&url) => download_limited(agent, &url, last_http),
-                        Some(_) => Err(FetchFail::Failed(
-                            "ScreenScraper: refused a non-image download".into(),
-                        )),
-                        None => Err(FetchFail::Failed(format!(
-                            "ScreenScraper: no {} for this game",
-                            kind_file_stem(kind).replace('_', " ")
-                        ))),
-                    };
-                    (kind, bytes)
-                })
-                .collect())
+            match load_screenscraper_by_id(agent, creds, &candidate.remote_id, last_http) {
+                Ok(game) => CandidateLoad {
+                    images: Ok(kind_bytes(kinds, |kind| {
+                        match pick_screenscraper_url(&game.medias, kind) {
+                            Some(url) if url_allowed(&url) => {
+                                download_limited(agent, &url, last_http)
+                            }
+                            Some(_) => Err(FetchFail::Failed(
+                                "ScreenScraper: refused a non-image download".into(),
+                            )),
+                            None => Err(FetchFail::Failed(format!(
+                                "ScreenScraper: no {} for this game",
+                                kind_file_stem(kind).replace('_', " ")
+                            ))),
+                        }
+                    })),
+                    metadata: Ok(game.metadata),
+                },
+                Err(err) => CandidateLoad {
+                    images: Err(err.clone()),
+                    metadata: Err(err),
+                },
+            }
         }
         ScrapeProvider::TheGamesDb => {
-            let game_id: i64 = candidate
-                .remote_id
-                .parse()
-                .map_err(|_| FetchFail::Failed("TheGamesDB game id was not a number.".into()))?;
-            let (base, images) = load_thegamesdb_images(agent, creds, game_id, last_http)?;
-            let tuples: Vec<_> = images
-                .iter()
-                .map(|image| {
-                    (
-                        image.type_name.clone(),
-                        image.side.clone(),
-                        image.filename.clone(),
-                    )
-                })
-                .collect();
-            Ok(kinds
-                .iter()
-                .copied()
-                .map(|kind| {
-                    let bytes = match pick_thegamesdb_filename(&tuples, kind) {
-                        Some(filename) => {
-                            let url = join_base_url(&base, &filename);
-                            if url_allowed(&url) {
-                                download_limited(agent, &url, last_http)
-                            } else {
-                                Err(FetchFail::Failed(
-                                    "TheGamesDB: refused a non-image download".into(),
-                                ))
-                            }
-                        }
-                        None => Err(FetchFail::Failed(format!(
-                            "TheGamesDB: no {} for this game",
-                            kind_file_stem(kind).replace('_', " ")
-                        ))),
+            let game_id = match candidate.remote_id.parse::<i64>() {
+                Ok(id) => id,
+                Err(_) => {
+                    let err = FetchFail::Failed("TheGamesDB game id was not a number.".into());
+                    return CandidateLoad {
+                        images: Err(err.clone()),
+                        metadata: Err(err),
                     };
-                    (kind, bytes)
-                })
-                .collect())
+                }
+            };
+            let metadata = match load_thegamesdb_game_by_id(agent, creds, game_id, last_http) {
+                Ok(game) => {
+                    let mut names = TgNames::default();
+                    match names.fill(agent, creds, &game, last_http) {
+                        Ok(()) => Ok(game.metadata(&names)),
+                        Err(err) => Err(err),
+                    }
+                }
+                Err(err) => Err(err),
+            };
+            let images = if kinds.is_empty() {
+                Ok(Vec::new())
+            } else {
+                match load_thegamesdb_images(agent, creds, game_id, last_http) {
+                    Ok((base, images)) => {
+                        let tuples: Vec<_> = images
+                            .iter()
+                            .map(|image| {
+                                (
+                                    image.type_name.clone(),
+                                    image.side.clone(),
+                                    image.filename.clone(),
+                                )
+                            })
+                            .collect();
+                        Ok(kind_bytes(kinds, |kind| {
+                            match pick_thegamesdb_filename(&tuples, kind) {
+                                Some(filename) => {
+                                    let url = join_base_url(&base, &filename);
+                                    if url_allowed(&url) {
+                                        download_limited(agent, &url, last_http)
+                                    } else {
+                                        Err(FetchFail::Failed(
+                                            "TheGamesDB: refused a non-image download".into(),
+                                        ))
+                                    }
+                                }
+                                None => Err(FetchFail::Failed(format!(
+                                    "TheGamesDB: no {} for this game",
+                                    kind_file_stem(kind).replace('_', " ")
+                                ))),
+                            }
+                        }))
+                    }
+                    Err(err) => Err(err),
+                }
+            };
+            CandidateLoad { images, metadata }
         }
     }
+}
+
+fn kind_bytes(
+    kinds: &[MediaKind],
+    mut fetch: impl FnMut(MediaKind) -> Result<Vec<u8>, FetchFail>,
+) -> Vec<(MediaKind, Result<Vec<u8>, FetchFail>)> {
+    kinds
+        .iter()
+        .copied()
+        .map(|kind| (kind, fetch(kind)))
+        .collect()
 }
 
 fn load_screenscraper_by_id(
@@ -1467,20 +1961,46 @@ fn load_screenscraper_by_id(
     creds: &ScraperCredentials,
     game_id: &str,
     last_http: &mut Option<Instant>,
-) -> Result<Vec<(String, String, String)>, FetchFail> {
+) -> Result<SsGame, FetchFail> {
     let params = screenscraper_game_params(creds, game_id);
     let url = format!(
         "https://www.screenscraper.fr/api2/jeuInfos.php?{}",
         encode_query(&params)
     );
     let body = download_text(agent, &url, last_http)?;
-    parse_screenscraper_medias(&body)
+    parse_screenscraper_game(&body)
+}
+
+fn load_thegamesdb_game_by_id(
+    agent: &ureq::Agent,
+    creds: &ScraperCredentials,
+    game_id: i64,
+    last_http: &mut Option<Instant>,
+) -> Result<TgGame, FetchFail> {
+    let params = vec![
+        ("apikey".to_string(), creds.thegamesdb_api_key.clone()),
+        ("id".to_string(), game_id.to_string()),
+        ("fields".to_string(), "genres,publishers".to_string()),
+    ];
+    let url = format!(
+        "https://api.thegamesdb.net/v1/Games/ByGameID?{}",
+        encode_query(&params)
+    );
+    let body = download_text(agent, &url, last_http)?;
+    parse_thegamesdb_game_by_id(&body, game_id)
 }
 
 #[derive(Debug)]
 pub enum ScrapeUpdate {
     Status(String),
-    Saved { game_id: String, media: Media },
+    Saved {
+        game_id: String,
+        media: Media,
+    },
+    Metadata {
+        game_id: String,
+        metadata: GameMetadata,
+    },
     Done(String),
 }
 
@@ -1621,9 +2141,6 @@ fn run_scrape(
     tx: &std::sync::mpsc::Sender<ScrapeUpdate>,
 ) -> String {
     let enabled = scraper.enabled_kinds();
-    if enabled.is_empty() {
-        return "Enable box art or screenshot in Scraper settings.".into();
-    }
     if games.is_empty() {
         return "No games to scrape.".into();
     }
@@ -1653,44 +2170,25 @@ fn run_scrape(
     let mut skipped = 0usize;
     let mut failed = 0usize;
     let mut cooled = Vec::new();
+    let mut names = TgNames::default();
 
     for (index, game) in games.iter().enumerate() {
         let _ = tx.send(ScrapeUpdate::Status(format!(
             "Scraping {}/{}: {}",
             index + 1,
             games.len(),
-            game.title
+            game.display_title()
         )));
-        let have = present_kinds(&game.media);
-        let todo = kinds_to_fetch(&have, &enabled);
-        if todo.is_empty() {
+        let Some(work) = missing_work(game, &enabled) else {
             skipped += 1;
             continue;
-        }
+        };
         let query = ArtworkQuery::from_game(game);
         let mut http = HttpGame::new();
         let mut game_failed = false;
         let mut reasons = Vec::new();
-        for kind in todo {
-            let providers: Vec<_> = active
-                .iter()
-                .copied()
-                .filter(|provider| !cooled.contains(provider))
-                .collect();
-            if providers.is_empty() {
-                game_failed = true;
-                let names = cooled
-                    .iter()
-                    .map(|provider| provider.label())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                push_reason(
-                    &mut reasons,
-                    format!("skipped after an earlier rate limit ({names})"),
-                );
-                continue;
-            }
-            let outcome = take_first_success(&providers, |provider| {
+        for kind in work.kinds {
+            let found = first_uncooled(&active, &mut cooled, &mut reasons, "", |provider| {
                 let bytes = if let Some(dir) = &fixtures {
                     fixture_bytes(dir, kind)?
                 } else {
@@ -1712,20 +2210,39 @@ fn run_scrape(
                     .map_err(FetchFail::Failed)?;
                 Ok(Media { kind, path, source })
             });
-            for (provider, err) in &outcome.errors {
-                push_reason(
-                    &mut reasons,
-                    format!("{}: {}", provider.label(), fail_message(err.clone())),
-                );
-                if matches!(err, FetchFail::RateLimited(_)) && !cooled.contains(provider) {
-                    cooled.push(*provider);
-                }
-            }
-            if let Some((_provider, media)) = outcome.success {
+            if let Some(media) = found {
                 saved += 1;
                 let _ = tx.send(ScrapeUpdate::Saved {
                     game_id: game.id.clone(),
                     media,
+                });
+            } else {
+                game_failed = true;
+            }
+        }
+        if work.metadata {
+            let found = first_uncooled(
+                &active,
+                &mut cooled,
+                &mut reasons,
+                "metadata ",
+                |provider| match &fixtures {
+                    Some(dir) => fixture_metadata(dir),
+                    None => http.fetch_metadata(
+                        &agent,
+                        &scraper.credentials,
+                        &query,
+                        provider,
+                        &mut names,
+                        &mut last_http,
+                    ),
+                },
+            );
+            if let Some(metadata) = found {
+                saved += 1;
+                let _ = tx.send(ScrapeUpdate::Metadata {
+                    game_id: game.id.clone(),
+                    metadata,
                 });
             } else {
                 game_failed = true;
@@ -1760,7 +2277,7 @@ fn run_scrape(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ProviderEntry, Source};
+    use crate::types::{GameMetadata, ProviderEntry, Source};
     use std::fs;
 
     fn provider(id: ScrapeProvider, enabled: bool) -> ProviderEntry {
@@ -1963,7 +2480,8 @@ mod tests {
                 {"type": "manuel", "region": "us", "url": "https://example.test/manual.pdf"}
             ]}}
         }"#;
-        let medias = parse_screenscraper_medias(body).unwrap();
+        let parsed = parse_screenscraper_game(body).unwrap();
+        let medias = parsed.medias;
         assert_eq!(
             pick_screenscraper_url(&medias, MediaKind::BoxArt).as_deref(),
             Some("https://example.test/us.png")
@@ -2142,7 +2660,9 @@ mod tests {
             id: "abc".into(),
             console: "snes".into(),
             rom: rom.clone(),
-            title: "Chrono".into(),
+            file_title: "Chrono".into(),
+            user_title: None,
+            metadata: None,
             crc32: None,
             profile: None,
             media: Vec::new(),
@@ -2192,7 +2712,9 @@ mod tests {
             id: "asteroids".into(),
             console: console.into(),
             rom,
-            title: "Asteroids".into(),
+            file_title: "Asteroids".into(),
+            user_title: None,
+            metadata: None,
             crc32: Some(crc32),
             profile: None,
             media: Vec::new(),
@@ -2382,5 +2904,228 @@ mod tests {
             "boot\nscrape failed: rom=\"Asteroids (USA).a78\" screenscraper_system=41\n"
         );
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn screenscraper_metadata_prefers_us_then_wor_then_eu() {
+        let body = r#"{"header":{"success":"true"},"response":{"jeu":{"noms":[{"region":"jp","text":"クロノ・トリガー"},{"region":"eu","text":"Chrono Trigger EU"},{"region":"us","text":"Chrono Trigger"}],"editeur":{"id":"38","text":"Square"},"dates":[{"region":"us","text":"1995-08-22"},{"region":"jp","text":"1995-03-11"}],"genres":[{"id":"7","noms":[{"langue":"fr","text":"Jeu de rôles"},{"langue":"en","text":"Role Playing Game"}]}],"medias":[{"type":"box-2D","region":"us","url":"https://example.test/us.png"}]}}}"#;
+        let game = parse_screenscraper_game(body).unwrap();
+        assert_eq!(game.metadata.title.as_deref(), Some("Chrono Trigger"));
+        assert_eq!(game.metadata.publisher.as_deref(), Some("Square"));
+        assert_eq!(game.metadata.year, Some(1995));
+        assert_eq!(game.metadata.genre.as_deref(), Some("Role Playing Game"));
+        assert_eq!(
+            pick_screenscraper_url(&game.medias, MediaKind::BoxArt).as_deref(),
+            Some("https://example.test/us.png")
+        );
+
+        let wor = parse_screenscraper_game(
+            r#"{"header":{"success":"true"},"response":{"jeu":{"noms":[{"region":"eu","text":"EU Name"},{"region":"wor","text":"World Name"}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(wor.metadata.title.as_deref(), Some("World Name"));
+
+        let jp = parse_screenscraper_game(
+            r#"{"header":{"success":"true"},"response":{"jeu":{"noms":[{"region":"jp","text":"クロノ"}]}}}"#,
+        )
+        .unwrap();
+        assert!(jp.metadata.title.is_none());
+
+        let us_year = parse_screenscraper_game(
+            r#"{"header":{"success":"true"},"response":{"jeu":{"dates":[{"region":"jp","text":"1990"},{"region":"us","text":"2001-01-01"}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(us_year.metadata.year, Some(2001));
+        assert_eq!(
+            parse_screenscraper_game(
+                r#"{"header":{"success":"true"},"response":{"jeu":{"dates":{"region":"us","text":"1995-08"}}}}"#
+            )
+            .unwrap()
+            .metadata
+            .year,
+            Some(1995)
+        );
+        assert_eq!(
+            parse_screenscraper_game(
+                r#"{"header":{"success":"true"},"response":{"jeu":{"dates":{"region":"eu","text":"1899"}}}}"#
+            )
+            .unwrap()
+            .metadata
+            .year,
+            None
+        );
+        assert_eq!(
+            parse_screenscraper_game(
+                r#"{"header":{"success":"true"},"response":{"jeu":{"dates":{"region":"wor","text":"2100"}}}}"#
+            )
+            .unwrap()
+            .metadata
+            .year,
+            None
+        );
+    }
+
+    #[test]
+    fn screenscraper_empty_medias_still_returns_metadata() {
+        let game = parse_screenscraper_game(
+            r#"{"header":{"success":"true"},"response":{"jeu":{"noms":{"region":"wor","text":"Tetris"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(game.metadata.title.as_deref(), Some("Tetris"));
+        assert!(game.metadata.publisher.is_none());
+        assert!(game.metadata.year.is_none());
+        assert!(game.metadata.genre.is_none());
+        assert!(game.medias.is_empty());
+    }
+
+    #[test]
+    fn screenscraper_header_error_is_err() {
+        let err =
+            parse_screenscraper_game(r#"{"header":{"success":"false","error":"Jeu non trouve"}}"#)
+                .unwrap_err();
+        let FetchFail::Failed(message) = err else {
+            panic!("expected failed");
+        };
+        assert!(message.contains("Jeu non trouve"));
+    }
+
+    #[test]
+    fn thegamesdb_metadata_requires_an_exact_title() {
+        let body = r#"{"status":"Success","data":{"games":[{"id":9,"game_title":"Other"},{"id":42,"game_title":"Chrono Trigger","release_date":"1995-08-22","genres":[4],"publishers":[7]}]}}"#;
+        let matched = parse_thegamesdb_game(body, "chrono trigger").unwrap();
+        assert_eq!(matched.id, 42);
+        assert!(matched.exact);
+        assert_eq!(matched.year, Some(1995));
+        assert_eq!(matched.genre_ids, vec![4]);
+        assert_eq!(matched.publisher_ids, vec![7]);
+        let miss = parse_thegamesdb_game(body, "no such game").unwrap();
+        assert_eq!(miss.id, 9);
+        assert!(!miss.exact);
+        let err = metadata_if_matched(&miss, &TgNames::default()).unwrap_err();
+        let FetchFail::Failed(message) = err else {
+            panic!("expected failed");
+        };
+        assert_eq!(message, "TheGamesDB has no game match");
+        assert_eq!(
+            parse_thegamesdb_game_id(body, "chrono trigger").unwrap(),
+            42
+        );
+        assert_eq!(parse_thegamesdb_game_id(body, "no such game").unwrap(), 9);
+        let by_id = parse_thegamesdb_game_by_id(body, 42).unwrap();
+        assert_eq!(by_id.id, 42);
+        assert!(by_id.exact);
+        assert_eq!(by_id.title.as_deref(), Some("Chrono Trigger"));
+        assert!(parse_thegamesdb_game_by_id(body, 7).is_err());
+    }
+
+    #[test]
+    fn thegamesdb_names_become_a_genre() {
+        let names = parse_thegamesdb_names(
+            r#"{"status":"Success","data":{"count":1,"genres":{"4":{"id":4,"name":"Role-Playing"}}}}"#,
+            TgList::Genres,
+        )
+        .unwrap();
+        assert_eq!(names, vec![(4, "Role-Playing".into())]);
+        let mut cache = TgNames::default();
+        for (id, name) in names {
+            cache.genres.insert(id, name);
+        }
+        let game = TgGame {
+            id: 42,
+            exact: true,
+            title: Some("Chrono Trigger".into()),
+            year: Some(1995),
+            genre_ids: vec![4],
+            publisher_ids: vec![],
+        };
+        assert_eq!(game.metadata(&cache).genre.as_deref(), Some("Role-Playing"));
+    }
+
+    #[test]
+    fn missing_work_splits_art_from_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let box_path = dir.path().join("box.png");
+        let shot_path = dir.path().join("shot.png");
+        fs::write(&box_path, b"box").unwrap();
+        fs::write(&shot_path, b"shot").unwrap();
+        let mut game = crate::types::Game {
+            id: "chrono".into(),
+            console: "snes".into(),
+            rom: PathBuf::from("/tmp/chrono.sfc"),
+            file_title: "chrono trigger".into(),
+            user_title: None,
+            metadata: None,
+            crc32: None,
+            profile: None,
+            media: vec![
+                Media {
+                    kind: MediaKind::BoxArt,
+                    path: box_path,
+                    source: Source::Local,
+                },
+                Media {
+                    kind: MediaKind::Screenshot,
+                    path: shot_path,
+                    source: Source::Local,
+                },
+            ],
+            last_played: None,
+            play_count: 0,
+            play_time: 0,
+            favorite: false,
+        };
+        let enabled = ScraperConfig::default().enabled_kinds();
+        let work = missing_work(&game, &enabled).unwrap();
+        assert!(work.kinds.is_empty());
+        assert!(work.metadata);
+
+        game.metadata = Some(GameMetadata {
+            title: Some("Chrono Trigger".into()),
+            ..GameMetadata::default()
+        });
+        assert!(missing_work(&game, &enabled).is_none());
+
+        game.media[0].path = PathBuf::from("/no/such/retromarchy-box.png");
+        let work = missing_work(&game, &enabled).unwrap();
+        assert_eq!(work.kinds, vec![MediaKind::BoxArt]);
+        assert!(!work.metadata);
+    }
+
+    #[test]
+    fn scrape_failure_line_keeps_a_metadata_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let rom = dir.path().join("chrono_trigger.sfc");
+        fs::write(&rom, b"rom-bytes!").unwrap();
+        let query = ArtworkQuery::from_game(&dummy_game(rom, "snes", 0x1A2B3C4D));
+        let line = scrape_failure_line(
+            &query,
+            &[
+                "metadata ScreenScraper: HTTP 404 Jeu non trouve".into(),
+                format!("metadata {}", crate::softname::DEVPASSWORD),
+            ],
+        );
+        assert!(line.starts_with("scrape failed:"));
+        assert!(line.contains("metadata ScreenScraper: HTTP 404 Jeu non trouve"));
+        assert!(line.contains("title=\"Asteroids\""));
+        assert!(!line.contains(crate::softname::DEVPASSWORD));
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn fixture_metadata_reads_jeu_infos() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = fixture_metadata(dir.path()).unwrap_err();
+        let FetchFail::Failed(message) = missing else {
+            panic!("expected failed");
+        };
+        assert_eq!(message, "fixture metadata missing");
+        fs::write(
+            dir.path().join("jeuInfos.json"),
+            r#"{"header":{"success":"true"},"response":{"jeu":{"noms":{"region":"wor","text":"Tetris"}}}}"#,
+        )
+        .unwrap();
+        let metadata = fixture_metadata(dir.path()).unwrap();
+        assert_eq!(metadata.title.as_deref(), Some("Tetris"));
+        assert!(metadata.publisher.is_none());
     }
 }

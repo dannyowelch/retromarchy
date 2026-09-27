@@ -137,7 +137,7 @@ fn shelf_from_disk(
     conn: &rusqlite::Connection,
 ) -> Shelf {
     let games = database::load_games(conn, Some(&console.id)).unwrap_or_default();
-    let stats = database::get_library_stats(conn, &console.id).unwrap_or_else(|_| stats_of(&games));
+    let stats = stats_of(&games);
     shelf(console.clone(), metadata, games, stats)
 }
 
@@ -288,7 +288,9 @@ fn demo_game(
         id: format!("demo-{console}-{slug}"),
         console: console.to_string(),
         rom: PathBuf::from(format!("/demo/{console}/{slug}.rom")),
-        title: title.to_string(),
+        file_title: title.to_string(),
+        user_title: None,
+        metadata: None,
         crc32: None,
         profile: None,
         media: Vec::new(),
@@ -317,7 +319,7 @@ pub fn stats_of(games: &[Game]) -> LibraryStats {
         total_play_time += game.play_time;
         if game.play_count > most_played_count {
             most_played_count = game.play_count;
-            most_played_game = Some(game.title.clone());
+            most_played_game = Some(game.display_title().to_string());
         }
         if let Some(played) = game.last_played {
             let newer = last_played_date
@@ -325,7 +327,7 @@ pub fn stats_of(games: &[Game]) -> LibraryStats {
                 .unwrap_or(true);
             if newer {
                 last_played_date = Some(played);
-                last_played_game = Some(game.title.clone());
+                last_played_game = Some(game.display_title().to_string());
             }
         }
     }
@@ -878,7 +880,7 @@ impl Browse {
             game.play_count = play_count;
             game.play_time = play_time;
             game.last_played = Some(last_played);
-            game.title.clone()
+            game.display_title().to_string()
         };
         shelf.stats = stats_of(&shelf.games);
         Some(title)
@@ -887,7 +889,12 @@ impl Browse {
     /// Follow the selected id when the visible list changes. On the grid, a
     /// game that dropped out leaves the nearest remaining row selected so
     /// Enter still launches and the row can scroll into view.
-    fn rebind_visible(&mut self, keep: Option<String>, previous: Option<usize>, pane: Pane) {
+    pub(crate) fn rebind_visible(
+        &mut self,
+        keep: Option<String>,
+        previous: Option<usize>,
+        pane: Pane,
+    ) {
         if let Some(id) = keep.as_deref() {
             if let Some(index) = self.visible_position(id) {
                 self.game = Some(index);
@@ -1237,12 +1244,18 @@ mod tests {
         assert!(!browse.back());
         assert_eq!(browse.confirm(), Some(Confirm::Entered));
         assert_eq!(browse.pane, Pane::Grid);
-        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Mario World"
+        );
         assert_eq!(browse.confirm(), Some(Confirm::Launch));
         assert_eq!(browse.game, Some(0));
         assert!(browse.back());
         assert_eq!(browse.pane, Pane::Sidebar);
-        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Mario World"
+        );
         assert_eq!(browse.confirm(), Some(Confirm::Entered));
         assert_eq!(browse.game, Some(0));
         browse.apply(Key::Clear);
@@ -1314,20 +1327,32 @@ mod tests {
 
         browse.apply(Key::Arrow(NavDir::Right));
         assert_eq!(browse.pane, Pane::Grid);
-        assert_eq!(browse.selected_game().unwrap().title, "Sonic the Hedgehog");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Sonic the Hedgehog"
+        );
 
         browse.set_columns(2);
         browse.apply(Key::Arrow(NavDir::Right));
-        assert_eq!(browse.selected_game().unwrap().title, "Streets of Rage 2");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Streets of Rage 2"
+        );
         browse.apply(Key::Arrow(NavDir::Left));
-        assert_eq!(browse.selected_game().unwrap().title, "Sonic the Hedgehog");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Sonic the Hedgehog"
+        );
         browse.apply(Key::Arrow(NavDir::Left));
         assert_eq!(browse.pane, Pane::Sidebar);
         assert_eq!(browse.game, None);
 
         browse.apply(Key::Arrow(NavDir::Right));
         browse.apply(Key::Arrow(NavDir::Down));
-        assert_eq!(browse.selected_game().unwrap().title, "Gunstar Heroes");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Gunstar Heroes"
+        );
     }
 
     #[test]
@@ -1396,7 +1421,10 @@ mod tests {
         let library = from_config(&config, &conn);
         assert_eq!(library.kind, LibraryKind::Disk);
         assert!(!library.details_open);
-        assert_eq!(library.shelves[0].games[0].title, "Chrono Trigger");
+        assert_eq!(
+            library.shelves[0].games[0].display_title(),
+            "Chrono Trigger"
+        );
         assert_eq!(library.shelves[0].stats.total_games, 1);
         assert_eq!(library.shelves[0].manufacturer.as_deref(), Some("Nintendo"));
     }
@@ -1445,7 +1473,10 @@ mod tests {
         assert_eq!(browse.game, None);
         browse.select_game(2);
         assert_eq!(browse.pane, Pane::Grid);
-        assert_eq!(browse.selected_game().unwrap().title, "Gunstar Heroes");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Gunstar Heroes"
+        );
         browse.select_console(0);
         assert_eq!(browse.console, 0);
         assert_eq!(browse.game, None);
@@ -1557,17 +1588,29 @@ mod tests {
         );
         browse.select_game(2);
         assert!(browse.toggle_favorite(None));
-        assert_eq!(browse.selected_game().unwrap().title, "Super Metroid");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Metroid"
+        );
         assert!(browse.selected_game().unwrap().favorite);
 
         browse.set_filter(GridFilter::Favorites);
         assert_eq!(browse.visible_len(), 2);
-        assert_eq!(browse.selected_game().unwrap().title, "Super Metroid");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Metroid"
+        );
         browse.set_columns(4);
         browse.apply(Key::Arrow(NavDir::Left));
-        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Mario World"
+        );
         browse.apply(Key::Arrow(NavDir::Right));
-        assert_eq!(browse.selected_game().unwrap().title, "Super Metroid");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Metroid"
+        );
 
         assert!(browse.toggle_favorite(None));
         assert!(browse.selected_game().is_none());
@@ -1622,14 +1665,14 @@ mod tests {
         let saved = database::load_games(&conn, Some(&"snes".to_string())).unwrap();
         assert!(saved
             .iter()
-            .any(|game| game.title == "Beta" && game.favorite));
+            .any(|game| game.display_title() == "Beta" && game.favorite));
         assert!(saved
             .iter()
-            .any(|game| game.title == "Alpha" && !game.favorite));
+            .any(|game| game.display_title() == "Alpha" && !game.favorite));
 
         browse.set_filter(GridFilter::Favorites);
         assert_eq!(browse.visible_len(), 1);
-        assert_eq!(browse.selected_game().unwrap().title, "Beta");
+        assert_eq!(browse.selected_game().unwrap().display_title(), "Beta");
         assert!(browse.toggle_favorite(Some(&conn)));
         assert!(browse.selected_game().is_none());
         assert_eq!(browse.visible_len(), 0);
@@ -1723,11 +1766,11 @@ mod tests {
         let enabled = ScraperConfig::default().enabled_kinds();
         let mario = games
             .iter()
-            .find(|game| game.title == "Super Mario World")
+            .find(|game| game.display_title() == "Super Mario World")
             .unwrap();
         let chrono = games
             .iter()
-            .find(|game| game.title == "Chrono Trigger")
+            .find(|game| game.display_title() == "Chrono Trigger")
             .unwrap();
         assert!(kinds_to_fetch(&present_kinds(&mario.media), &enabled).is_empty());
         assert_eq!(
@@ -1756,20 +1799,26 @@ mod tests {
     fn title_filter_composes_with_favorites_and_keeps_a_visible_game() {
         let mut browse = sample();
         browse.select_game(2);
-        assert_eq!(browse.selected_game().unwrap().title, "Super Metroid");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Metroid"
+        );
         browse.open_search();
         browse.push_search("super");
         let titles: Vec<String> = browse
             .visible_games()
-            .map(|game| game.title.clone())
+            .map(|game| game.display_title().to_string())
             .collect();
         let expected: Vec<String> =
             crate::types::visible_games(&browse.shelf().unwrap().games, "super", GridFilter::All)
                 .into_iter()
-                .map(|game| game.title)
+                .map(|game| game.display_title().to_string())
                 .collect();
         assert_eq!(titles, expected);
-        assert_eq!(browse.selected_game().unwrap().title, "Super Metroid");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Metroid"
+        );
         assert_eq!(browse.game, Some(1));
 
         browse.push_search("z");
@@ -1777,17 +1826,26 @@ mod tests {
         assert!(browse.selected_game().is_none());
 
         browse.pop_search();
-        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Mario World"
+        );
         browse.library.shelves[0].games[0].favorite = true;
         browse.set_filter(GridFilter::Favorites);
         assert_eq!(browse.visible_len(), 1);
-        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Mario World"
+        );
 
         browse.close_search();
         assert!(!browse.search_open());
         assert!(browse.query().is_empty());
         assert_eq!(browse.visible_len(), 1);
-        assert_eq!(browse.selected_game().unwrap().title, "Super Mario World");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Mario World"
+        );
     }
 
     #[test]
@@ -1806,13 +1864,13 @@ mod tests {
             .unwrap()
             .games
             .iter()
-            .any(|game| game.title == "Zelda II"));
+            .any(|game| game.display_title() == "Zelda II"));
         assert!(!browse
             .shelf()
             .unwrap()
             .games
             .iter()
-            .any(|game| game.title == "Super Mario World"));
+            .any(|game| game.display_title() == "Super Mario World"));
         assert_eq!(browse.shelf().unwrap().stats.total_games, 4);
     }
 
@@ -1991,7 +2049,10 @@ mod tests {
         assert!(browse.set_system_sort(SystemSort::Year));
         assert_eq!(browse.shelf().unwrap().console.id, "snes");
         assert_eq!(browse.game, Some(2));
-        assert_eq!(browse.selected_game().unwrap().title, "Super Metroid");
+        assert_eq!(
+            browse.selected_game().unwrap().display_title(),
+            "Super Metroid"
+        );
         assert_eq!(ids_of(&browse.library.shelves), ["nes", "genesis", "snes"]);
         assert!(!browse.set_system_sort(SystemSort::Year));
         assert!(browse.set_system_sort(SystemSort::Name));

@@ -29,7 +29,7 @@ use crate::scraper_settings::{
     self, scraper_key, Block as ScraperBlock, Command as ScraperCommand, Part as ScraperPart,
     ScraperSettings, Slot as ScraperSlot,
 };
-use crate::types::{DeleteOptions, Game, GridArt, GridFilter, Media, MediaKind};
+use crate::types::{DeleteOptions, Game, GameMetadata, GridArt, GridFilter, Media, MediaKind};
 use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::base::CheckboxState;
 use gpui_kit::{
@@ -1432,7 +1432,7 @@ impl Shell {
         if !notes.is_empty() {
             self.browse.status = format!(
                 "Removed {} from the library. {}",
-                removed.game.title,
+                removed.game.display_title(),
                 notes.join(" ")
             );
         }
@@ -1540,6 +1540,9 @@ impl Shell {
             match update {
                 Ok(ScrapeUpdate::Status(text)) => self.browse.status = text,
                 Ok(ScrapeUpdate::Saved { game_id, media }) => self.store_media(&game_id, &media),
+                Ok(ScrapeUpdate::Metadata { game_id, metadata }) => {
+                    self.store_metadata(&game_id, metadata);
+                }
                 Ok(ScrapeUpdate::Done(text)) => {
                     self.apply = None;
                     self.browse.status = text;
@@ -1659,6 +1662,20 @@ impl Shell {
             return;
         }
         self.browse.remember_media(game_id, media);
+    }
+
+    fn store_metadata(&mut self, game_id: &str, metadata: GameMetadata) {
+        if self.browse.library.kind != LibraryKind::Disk {
+            return;
+        }
+        let id = game_id.to_string();
+        let saved =
+            database::init_db().and_then(|conn| database::set_game_metadata(&conn, &id, &metadata));
+        if saved.is_err() {
+            self.browse.status = "Could not save metadata.".into();
+            return;
+        }
+        self.browse.remember_metadata(game_id, metadata);
     }
 
     /// Arrow keys use the same clock as the pad. `release` clears a hold.
@@ -1846,7 +1863,7 @@ impl Shell {
                     };
                     let _ = tx.send(note);
                 });
-                self.browse.status = format!("Launched {}.", game.title);
+                self.browse.status = format!("Launched {}.", game.display_title());
             }
             Err(err) => self.browse.status = err.to_string(),
         }
@@ -2603,7 +2620,7 @@ fn tile(
 ) -> impl IntoElement {
     let theme = cx.omarchy();
     let frame = TileFrame::for_art(art, cover_width);
-    let title = game.title.clone();
+    let title = game.display_title().to_string();
     let cover = cover_path(game, art);
     // An explicit ratio stops GPUI from resizing the tile to the file's own ratio.
     let image = div()
@@ -2855,8 +2872,19 @@ fn details(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
             pane = pane.child(detail_art(path, MediaKind::Screenshot));
         }
         pane = pane
-            .child(heading(&game.title))
+            .child(heading(game.display_title()))
             .child(meta(format!("Console: {}", shelf.console.name), cx));
+        if let Some(metadata) = &game.metadata {
+            if let Some(publisher) = &metadata.publisher {
+                pane = pane.child(meta(format!("Publisher: {publisher}"), cx));
+            }
+            if let Some(year) = metadata.year {
+                pane = pane.child(meta(format!("Year: {year}"), cx));
+            }
+            if let Some(genre) = &metadata.genre {
+                pane = pane.child(meta(format!("Genre: {genre}"), cx));
+            }
+        }
         if let Some(played) = game.last_played {
             pane = pane.child(meta(
                 format!("Last played: {}", played.format("%Y-%m-%d %H:%M")),
@@ -3266,10 +3294,9 @@ fn aimed_button(
 }
 
 fn rename_dialog(rename: &crate::game_menu::Rename, cx: &Context<Shell>) -> impl IntoElement {
-    let theme = cx.omarchy();
-    let mut page = dialog_page("rename-dialog", "Rename", 420., cx)
+    dialog_page("rename-dialog", "Rename", 420., cx)
         .child(hint(
-            "Library title. This does not rename the ROM file.",
+            "Library title. Leave it blank to show the scraped or file name. This does not rename the ROM file.",
             cx,
         ))
         .child(line_editor(
@@ -3278,16 +3305,8 @@ fn rename_dialog(rename: &crate::game_menu::Rename, cx: &Context<Shell>) -> impl
             rename.slot == RenameSlot::Title,
             Aim::Rename(RenameSlot::Title),
             cx,
-        ));
-    if let Some(error) = &rename.error {
-        page = page.child(
-            div()
-                .text_size(px(12.))
-                .text_color(theme.danger)
-                .child(error.clone()),
-        );
-    }
-    page.child(
+        ))
+        .child(
         div()
             .flex()
             .justify_end()
@@ -3499,7 +3518,7 @@ fn rescan_console(
     let conn = database::init_db().map_err(|err| err.to_string())?;
     let games = database::replace_scanned_games(&conn, &console.id, &scanned)
         .map_err(|err| err.to_string())?;
-    let stats = database::get_library_stats(&conn, &console.id).map_err(|err| err.to_string())?;
+    let stats = crate::browse::stats_of(&games);
     Ok((console.id, console.name, games, stats))
 }
 

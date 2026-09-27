@@ -43,7 +43,6 @@ fn scan_directory(dir: &Path, console: &Console, games: &mut Vec<Game>) -> Resul
 
 fn process_rom(rom_path: &Path, console: &Console) -> Result<Option<Game>> {
     let id = compute_game_id(rom_path);
-    let title = derive_title(rom_path);
     let crc32 = compute_crc32(rom_path)?;
     let media = discover_local_media(rom_path, console)?;
 
@@ -51,7 +50,9 @@ fn process_rom(rom_path: &Path, console: &Console) -> Result<Option<Game>> {
         id,
         console: console.id.clone(),
         rom: rom_path.to_path_buf(),
-        title,
+        file_title: derive_title(rom_path),
+        user_title: None,
+        metadata: None,
         crc32: Some(crc32),
         profile: None,
         media,

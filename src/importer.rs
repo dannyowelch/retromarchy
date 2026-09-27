@@ -273,7 +273,7 @@ mod tests {
 
         let conn = database::init_db().unwrap();
         let loaded = database::load_games(&conn, None).unwrap();
-        let mut titles: Vec<_> = loaded.iter().map(|game| game.title.as_str()).collect();
+        let mut titles: Vec<_> = loaded.iter().map(|game| game.display_title()).collect();
         titles.sort();
         assert_eq!(titles, ["Mario", "One", "Two"]);
     }
