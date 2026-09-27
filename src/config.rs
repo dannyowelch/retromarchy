@@ -4,7 +4,8 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const INPUT_MS_MAX: u32 = 60_000;
@@ -254,14 +255,41 @@ pub fn load_config() -> Result<Config> {
         save_config(&config)?;
         return Ok(config);
     }
-    let content = fs::read_to_string(&path)
+    let bytes = fs::read(&path)
+        .with_context(|| format!("Failed to read config from {}", path.display()))?;
+    let content = String::from_utf8(bytes.clone())
         .with_context(|| format!("Failed to read config from {}", path.display()))?;
     let (config, migrated) = parse_config(&content)
         .with_context(|| format!("Failed to parse config from {}", path.display()))?;
     if migrated {
+        preserve_pre_migration(&path, &bytes)?;
         save_config(&config)?;
     }
     Ok(config)
+}
+
+fn migration_backup_path(path: &Path) -> PathBuf {
+    path.with_file_name("config.toml.pre-emulators.bak")
+}
+
+/// Copy the pre-migration bytes beside `path`. An existing backup stays.
+fn preserve_pre_migration(path: &Path, original: &[u8]) -> Result<()> {
+    let backup = migration_backup_path(path);
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&backup)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("Failed to back up config to {}", backup.display()))
+        }
+    };
+    file.write_all(original)
+        .with_context(|| format!("Failed to back up config to {}", backup.display()))?;
+    Ok(())
 }
 
 /// Parse config text. An old `[[profiles]]` file is migrated in memory.
@@ -1296,6 +1324,51 @@ video = false
         let before = fs::read(&path).unwrap();
         let _ = load_config().unwrap();
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn migration_backs_up_the_original_and_a_second_load_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = XdgEnv::sandbox(dir.path());
+        let path = config_path().unwrap();
+        let original = b"\
+[[profiles]]
+type = \"Standalone\"
+id = \"dolphin\"
+command = \"dolphin-emu -b -e {rom}\"
+
+[[consoles]]
+id = \"gc\"
+name = \"GameCube\"
+rom_dirs = [\"/roms/gc\"]
+extensions = [\"iso\"]
+profile = \"dolphin\"
+
+[consoles.media]
+box_art = true
+screenshot = false
+manual = false
+video = false
+";
+        fs::write(&path, original).unwrap();
+        load_config().unwrap();
+        let backup = path.with_file_name("config.toml.pre-emulators.bak");
+        assert_eq!(fs::read(&backup).unwrap(), original);
+
+        let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        for file in [&path, &backup] {
+            fs::File::options()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+        }
+        load_config().unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        for file in [&path, &backup] {
+            assert_eq!(fs::metadata(file).unwrap().modified().unwrap(), stamp);
+        }
     }
 }
 

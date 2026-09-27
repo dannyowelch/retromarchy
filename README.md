@@ -63,7 +63,7 @@ Scan, config, the SQLite library, and launch command building live in the librar
 
 ## Data
 
-An emulator is `id`, `name`, `kind` (`RetroArch` or `Standalone`), `path`, and `global_args`. Each console stores `emulator` (that id), `core` (a libretro `.so`, only for RetroArch), and `extra_args`. The launch command is the executable, then `global_args`, then `-L <core>` for RetroArch, then `extra_args`, then the ROM. `{rom}` in either argument string is replaced and the ROM is not appended again. An old `[[profiles]]` file is rewritten on load: RetroArch cores become one RetroArch emulator plus a core on each console that used them, and a standalone command becomes an emulator.
+An emulator is `id`, `name`, `kind` (`RetroArch` or `Standalone`), `path`, and `global_args`. Each console stores `emulator` (that id), `core` (a libretro `.so`, only for RetroArch), and `extra_args`. The launch command is the executable, then `global_args`, then `-L <core>` for RetroArch, then `extra_args`, then the ROM. `{rom}` in either argument string is replaced and the ROM is not appended again. An old `[[profiles]]` file is rewritten on load: RetroArch cores become one RetroArch emulator plus a core on each console that used them, and a standalone command becomes an emulator. The original bytes are copied to `config.toml.pre-emulators.bak` beside the config first. An existing backup is left alone.
 
 - Config: `~/.config/retromarchy/config.toml`
 - Library: `~/.local/share/retromarchy/library.db`
