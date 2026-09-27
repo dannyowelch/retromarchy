@@ -6,8 +6,13 @@
 //! [`InputSettings::fast_interval_ms`] after [`InputSettings::ramp_ms`] from
 //! that first repeat. Releasing, or switching direction, resets the clock.
 //! Each poll returns at most one step so a late tick cannot skip ahead.
+//!
+//! [`HoldRepeat`] is the two-axis clock the shell ticks. Arrow keys and the
+//! gamepad share it. A fresh arrow steps immediately; later key-repeat events
+//! only keep that arrow down. A held arrow wins over the pad on the same axis.
 
 use crate::config::InputSettings;
+use crate::gamepad::NavDir;
 
 /// Which side of an axis is down. The caller maps this to left/right or up/down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +117,74 @@ impl<T: Copy + PartialEq> DirectionRepeat<T> {
             next_at_ms: now_ms.saturating_add(u64::from(settings.initial_delay_ms)),
         });
         1
+    }
+}
+
+/// Arrow keys plus one [`DirectionRepeat`] per axis.
+///
+/// Keyboard Y is independent of the d-pad's sign: negative is Up, positive is Down.
+/// The pad directions passed to [`HoldRepeat::poll`] are already [`NavDir`]s.
+#[derive(Debug, Default)]
+pub struct HoldRepeat {
+    key_x: AxisHold,
+    key_y: AxisHold,
+    repeat_x: DirectionRepeat<NavDir>,
+    repeat_y: DirectionRepeat<NavDir>,
+}
+
+impl HoldRepeat {
+    /// Returns how many steps to apply now. A key-repeat event for a key that
+    /// is already down returns 0 so the clock, not the OS repeat, emits the rest.
+    pub fn press(&mut self, settings: &InputSettings, dir: NavDir, now_ms: u64) -> u32 {
+        let (axis, repeat, side) = self.axis_mut(dir);
+        let fresh = !axis.is_down(side);
+        axis.set(side, true);
+        if !fresh {
+            return 0;
+        }
+        repeat.poll(settings, Some(dir), now_ms)
+    }
+
+    pub fn release(&mut self, settings: &InputSettings, dir: NavDir, now_ms: u64) {
+        let (axis, repeat, side) = self.axis_mut(dir);
+        let was_held = axis.held().is_some();
+        axis.set(side, false);
+        if was_held && axis.held().is_none() {
+            repeat.poll(settings, None, now_ms);
+        }
+    }
+
+    /// One tick. Each returned direction is a single step to apply.
+    /// `None` means that axis does not move on this tick.
+    pub fn poll(
+        &mut self,
+        settings: &InputSettings,
+        pad_x: Option<NavDir>,
+        pad_y: Option<NavDir>,
+        now_ms: u64,
+    ) -> (Option<NavDir>, Option<NavDir>) {
+        let held_x = match self.key_x.held() {
+            Some(AxisSide::Negative) => Some(NavDir::Left),
+            Some(AxisSide::Positive) => Some(NavDir::Right),
+            None => pad_x,
+        };
+        let held_y = match self.key_y.held() {
+            Some(AxisSide::Negative) => Some(NavDir::Up),
+            Some(AxisSide::Positive) => Some(NavDir::Down),
+            None => pad_y,
+        };
+        let step_x = self.repeat_x.poll(settings, held_x, now_ms);
+        let step_y = self.repeat_y.poll(settings, held_y, now_ms);
+        (held_x.filter(|_| step_x > 0), held_y.filter(|_| step_y > 0))
+    }
+
+    fn axis_mut(&mut self, dir: NavDir) -> (&mut AxisHold, &mut DirectionRepeat<NavDir>, AxisSide) {
+        match dir {
+            NavDir::Left => (&mut self.key_x, &mut self.repeat_x, AxisSide::Negative),
+            NavDir::Right => (&mut self.key_x, &mut self.repeat_x, AxisSide::Positive),
+            NavDir::Up => (&mut self.key_y, &mut self.repeat_y, AxisSide::Negative),
+            NavDir::Down => (&mut self.key_y, &mut self.repeat_y, AxisSide::Positive),
+        }
     }
 }
 
@@ -227,6 +300,78 @@ mod tests {
         assert_eq!(axis.held(), Some(AxisSide::Negative));
         axis.set(AxisSide::Negative, false);
         assert_eq!(axis.held(), None);
+    }
+
+    #[test]
+    fn hold_repeat_steps_once_on_press_and_then_on_the_clock() {
+        let settings = settings();
+        let mut hold = HoldRepeat::default();
+        assert_eq!(hold.press(&settings, NavDir::Right, 0), 1);
+        assert_eq!(hold.press(&settings, NavDir::Right, 32), 0);
+        assert_eq!(hold.poll(&settings, None, None, 32), (None, None));
+        assert_eq!(
+            hold.poll(&settings, None, None, 400),
+            (Some(NavDir::Right), None)
+        );
+        hold.release(&settings, NavDir::Right, 450);
+        assert_eq!(hold.poll(&settings, None, None, 450), (None, None));
+        assert_eq!(hold.press(&settings, NavDir::Right, 450), 1);
+    }
+
+    #[test]
+    fn a_held_arrow_wins_over_the_pad_on_that_axis() {
+        let settings = settings();
+        let mut hold = HoldRepeat::default();
+        assert_eq!(hold.press(&settings, NavDir::Up, 0), 1);
+        assert_eq!(
+            hold.poll(&settings, Some(NavDir::Right), Some(NavDir::Down), 0),
+            (Some(NavDir::Right), None)
+        );
+        assert_eq!(
+            hold.poll(&settings, Some(NavDir::Right), Some(NavDir::Down), 16),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn releasing_an_unheld_arrow_leaves_a_pad_hold_on_its_clock() {
+        let settings = settings();
+        let mut hold = HoldRepeat::default();
+        assert_eq!(
+            hold.poll(&settings, Some(NavDir::Right), None, 0).0,
+            Some(NavDir::Right)
+        );
+        hold.release(&settings, NavDir::Left, 50);
+        assert_eq!(hold.poll(&settings, Some(NavDir::Right), None, 50).0, None);
+        assert_eq!(
+            hold.poll(&settings, Some(NavDir::Right), None, 400).0,
+            Some(NavDir::Right)
+        );
+    }
+
+    #[test]
+    fn the_pause_follows_input_settings() {
+        let settings = InputSettings {
+            initial_delay_ms: 100,
+            slow_interval_ms: 80,
+            fast_interval_ms: 40,
+            ramp_ms: 0,
+        };
+        let mut hold = HoldRepeat::default();
+        assert_eq!(
+            hold.poll(&settings, Some(NavDir::Down), None, 0).0,
+            Some(NavDir::Down)
+        );
+        assert_eq!(hold.poll(&settings, Some(NavDir::Down), None, 99).0, None);
+        assert_eq!(
+            hold.poll(&settings, Some(NavDir::Down), None, 100).0,
+            Some(NavDir::Down)
+        );
+        assert_eq!(hold.poll(&settings, Some(NavDir::Down), None, 139).0, None);
+        assert_eq!(
+            hold.poll(&settings, Some(NavDir::Down), None, 140).0,
+            Some(NavDir::Down)
+        );
     }
 
     #[test]

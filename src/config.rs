@@ -1,8 +1,11 @@
-use crate::types::{Console, EmulatorProfile, ScraperConfig};
+use crate::types::{Console, EmulatorProfile, GridArt, ScraperConfig};
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::de::Deserializer;
+use serde::{Deserialize, Serialize, Serializer};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 const INPUT_MS_MAX: u32 = 60_000;
 
@@ -20,6 +23,36 @@ fn default_fast_interval_ms() -> u32 {
 
 fn default_ramp_ms() -> u32 {
     2000
+}
+
+/// Shared game-grid cover width. Screenshot and box-art cards both use it.
+pub const COVER_WIDTH_DEFAULT: f32 = 216.0;
+/// Narrowest cover that still leaves a readable caption.
+pub const COVER_WIDTH_MIN: f32 = 120.0;
+/// Widest cover. `columns_for` still keeps at least one column.
+pub const COVER_WIDTH_MAX: f32 = 400.0;
+/// Slider detents and `-` / `+` both move by this many pixels.
+pub const COVER_WIDTH_STEP: f32 = 10.0;
+
+fn default_cover_width() -> f32 {
+    COVER_WIDTH_DEFAULT
+}
+
+/// Keep a cover width inside the slider range. Non-finite values become the default.
+pub fn clamp_cover_width(width: f32) -> f32 {
+    if !width.is_finite() {
+        return COVER_WIDTH_DEFAULT;
+    }
+    width.round().clamp(COVER_WIDTH_MIN, COVER_WIDTH_MAX)
+}
+
+/// Move `steps` detents of [`COVER_WIDTH_STEP`] from the current width, then clamp.
+pub fn step_cover_width(width: f32, steps: i32) -> f32 {
+    let current = clamp_cover_width(width);
+    if steps == 0 {
+        return current;
+    }
+    clamp_cover_width(current + steps as f32 * COVER_WIDTH_STEP)
 }
 
 /// How long a direction repeats while it is held. Serialized as `[input]`.
@@ -84,12 +117,65 @@ pub struct ConsoleMetadata {
     pub description: String,
 }
 
+/// Sidebar order, stored as `system_sort` in config.toml.
+/// `name` is alphabetical by display name. `year` is the first-region launch
+/// year. Anything else is read as `name`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SystemSort {
+    #[default]
+    Name,
+    Year,
+}
+
+impl SystemSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Year => "Year",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Year,
+            Self::Year => Self::Name,
+        }
+    }
+}
+
+impl Serialize for SystemSort {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Name => "name",
+            Self::Year => "year",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for SystemSort {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(if value.eq_ignore_ascii_case("year") {
+            Self::Year
+        } else {
+            Self::Name
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_theme")]
     pub theme: String,
     #[serde(default = "default_true")]
     pub details_visible: bool,
+    /// One cover width for every system's game grid, in pixels.
+    #[serde(default = "default_cover_width")]
+    pub cover_width: f32,
+    /// Sidebar order. Missing or unknown values are [`SystemSort::Name`].
+    /// Kept with the other values so it stays above the TOML tables.
+    #[serde(default)]
+    pub system_sort: SystemSort,
     #[serde(default)]
     pub profiles: Vec<EmulatorProfile>,
     #[serde(default)]
@@ -113,6 +199,8 @@ impl Default for Config {
         Self {
             theme: default_theme(),
             details_visible: default_true(),
+            cover_width: default_cover_width(),
+            system_sort: SystemSort::Name,
             profiles: Vec::new(),
             consoles: Vec::new(),
             scraper: ScraperConfig::default(),
@@ -123,13 +211,35 @@ impl Default for Config {
 
 #[derive(Debug, Deserialize)]
 struct ConsoleMetadataFile {
+    #[serde(default)]
     console: Vec<ConsoleMetadata>,
+    #[serde(default)]
+    launch_year: BTreeMap<String, u32>,
+}
+
+fn bundled_consoles() -> &'static ConsoleMetadataFile {
+    static BUNDLED: OnceLock<ConsoleMetadataFile> = OnceLock::new();
+    BUNDLED.get_or_init(|| {
+        toml::from_str(include_str!("../console_metadata.toml"))
+            .expect("bundled console metadata is valid TOML")
+    })
 }
 
 pub fn load_console_metadata() -> Result<Vec<ConsoleMetadata>> {
-    let metadata_content = include_str!("../console_metadata.toml");
-    let file: ConsoleMetadataFile = toml::from_str(metadata_content)?;
-    Ok(file.console)
+    Ok(bundled_consoles().console.clone())
+}
+
+/// Launch year for `id`. The `[launch_year]` table wins when it has the id;
+/// otherwise the matching `[[console]]` blurb. Unknown ids are `None`.
+pub fn console_year(id: &str) -> Option<u32> {
+    let bundled = bundled_consoles();
+    bundled.launch_year.get(id).copied().or_else(|| {
+        bundled
+            .console
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.year)
+    })
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -150,17 +260,102 @@ pub fn load_config() -> Result<Config> {
         .with_context(|| format!("Failed to parse config from {}", path.display()))
 }
 
-/// Parse config text and clamp `[input]` so bad values cannot stall navigation.
+/// Parse config text. Clamps `[input]` and `cover_width`.
 pub fn config_from_toml(content: &str) -> Result<Config> {
     let mut config: Config = toml::from_str(content)?;
     config.input.sanitize();
+    config.cover_width = clamp_cover_width(config.cover_width);
     Ok(config)
+}
+
+/// Load config, store one console's `grid_art`, and write the file back.
+/// Other consoles, cover width, theme, and scraper settings stay as they were.
+pub fn save_console_grid_art(console_id: &str, art: GridArt) -> Result<()> {
+    let mut config = load_config()?;
+    {
+        let console = config
+            .consoles
+            .iter_mut()
+            .find(|console| console.id == console_id)
+            .with_context(|| format!("No console {console_id} in config"))?;
+        console.grid_art = art;
+    }
+    save_config(&config)
+}
+
+/// Load config, store one global cover width, and write it back.
+pub fn save_cover_width(width: f32) -> Result<()> {
+    let mut config = load_config()?;
+    config.cover_width = clamp_cover_width(width);
+    save_config(&config)
+}
+
+/// Load config, store hold-repeat timings, and write the file back.
+pub fn save_input_settings(input: InputSettings) -> Result<()> {
+    let mut config = load_config()?;
+    config.input = input.sanitized();
+    save_config(&config)
+}
+
+/// Load config, replace `[scraper]`, and write the file back.
+/// Theme, input, consoles, and profiles stay as they were.
+pub fn save_scraper_settings(scraper: ScraperConfig) -> Result<()> {
+    let mut config = load_config()?;
+    config.scraper = scraper;
+    save_config(&config)
+}
+
+/// Load config, store `theme`, and write the file back.
+pub fn save_theme_name(theme: &str) -> Result<()> {
+    let mut config = load_config()?;
+    config.theme = theme.to_string();
+    save_config(&config)
+}
+
+/// Load config, store [`SystemSort`], and write the file back.
+/// Consoles stay in the order they were added.
+pub fn save_system_sort(sort: SystemSort) -> Result<()> {
+    let mut config = load_config()?;
+    config.system_sort = sort;
+    save_config(&config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{Console, GridArt, MediaToggles};
+    use std::path::Path;
+    use std::sync::MutexGuard;
+
+    struct EnvLock {
+        key: &'static str,
+        prev: Option<String>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl EnvLock {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let guard = super::XDG_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self {
+                key,
+                prev,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for EnvLock {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn grid_art_roundtrip_saves() {
@@ -247,6 +442,256 @@ screenshot = false
         assert_eq!(config.input.slow_interval_ms, 180);
         assert_eq!(config.input.fast_interval_ms, 50);
         assert_eq!(config.input.ramp_ms, 2000);
+        assert_eq!(config.cover_width, COVER_WIDTH_DEFAULT);
+    }
+
+    #[test]
+    fn cover_width_round_trips_and_clamps() {
+        let mut config = Config::default();
+        config.cover_width = 250.0;
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            text.contains("cover_width = 250") || text.contains("cover_width = 250.0"),
+            "{text}"
+        );
+        let back = config_from_toml(&text).unwrap();
+        assert_eq!(back.cover_width, 250.0);
+
+        assert_eq!(
+            config_from_toml("cover_width = 10\n").unwrap().cover_width,
+            COVER_WIDTH_MIN
+        );
+        assert_eq!(
+            config_from_toml("cover_width = 9999\n")
+                .unwrap()
+                .cover_width,
+            COVER_WIDTH_MAX
+        );
+        assert_eq!(clamp_cover_width(f32::NAN), COVER_WIDTH_DEFAULT);
+        assert_eq!(step_cover_width(COVER_WIDTH_DEFAULT, 1), 226.0);
+        assert_eq!(step_cover_width(COVER_WIDTH_DEFAULT, -1), 206.0);
+        assert_eq!(step_cover_width(COVER_WIDTH_MAX, 1), COVER_WIDTH_MAX);
+        assert_eq!(step_cover_width(COVER_WIDTH_MIN, -1), COVER_WIDTH_MIN);
+        assert_eq!(step_cover_width(217.4, 1), 227.0);
+    }
+
+    #[test]
+    fn save_cover_width_keeps_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvLock::set("XDG_CONFIG_HOME", dir.path());
+        let mut config = Config::default();
+        config.theme = "custom".into();
+        config.details_visible = false;
+        config.consoles.push(Console {
+            id: "nes".into(),
+            name: "NES".into(),
+            rom_dirs: Vec::new(),
+            extensions: vec!["nes".into()],
+            profile: None,
+            grid_art: GridArt::Screenshot,
+            media: MediaToggles::default(),
+        });
+        save_config(&config).unwrap();
+        save_cover_width(246.0).unwrap();
+        let loaded = load_config().unwrap();
+        assert_eq!(loaded.cover_width, 246.0);
+        assert_eq!(loaded.theme, "custom");
+        assert!(!loaded.details_visible);
+        assert_eq!(loaded.consoles.len(), 1);
+        assert_eq!(loaded.consoles[0].id, "nes");
+        assert_eq!(loaded.consoles[0].grid_art, GridArt::Screenshot);
+        // A second launch reads the same global width.
+        assert_eq!(load_config().unwrap().cover_width, 246.0);
+    }
+
+    #[test]
+    fn save_input_and_theme_keep_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvLock::set("XDG_CONFIG_HOME", dir.path());
+        let mut config = Config::default();
+        config.theme = "system".into();
+        config.details_visible = false;
+        config.cover_width = 250.0;
+        config.consoles.push(Console {
+            id: "nes".into(),
+            name: "NES".into(),
+            rom_dirs: Vec::new(),
+            extensions: vec!["nes".into()],
+            profile: None,
+            grid_art: GridArt::Screenshot,
+            media: MediaToggles::default(),
+        });
+        save_config(&config).unwrap();
+
+        save_input_settings(InputSettings {
+            initial_delay_ms: 250,
+            slow_interval_ms: 120,
+            fast_interval_ms: 40,
+            ramp_ms: 1500,
+        })
+        .unwrap();
+        let loaded = load_config().unwrap();
+        assert_eq!(loaded.input.initial_delay_ms, 250);
+        assert_eq!(loaded.input.slow_interval_ms, 120);
+        assert_eq!(loaded.input.fast_interval_ms, 40);
+        assert_eq!(loaded.input.ramp_ms, 1500);
+        assert_eq!(loaded.theme, "system");
+        assert!(!loaded.details_visible);
+        assert_eq!(loaded.cover_width, 250.0);
+        assert_eq!(loaded.consoles[0].id, "nes");
+
+        save_theme_name("launchbox").unwrap();
+        let loaded = load_config().unwrap();
+        assert_eq!(loaded.theme, "launchbox");
+        assert_eq!(loaded.input.initial_delay_ms, 250);
+        assert_eq!(loaded.cover_width, 250.0);
+        assert_eq!(loaded.consoles[0].grid_art, GridArt::Screenshot);
+    }
+
+    #[test]
+    fn system_sort_reads_name_and_year() {
+        assert_eq!(
+            config_from_toml("system_sort = \"year\"\n")
+                .unwrap()
+                .system_sort,
+            SystemSort::Year
+        );
+        assert_eq!(
+            config_from_toml("system_sort = \"Year\"\n")
+                .unwrap()
+                .system_sort,
+            SystemSort::Year
+        );
+        assert_eq!(
+            config_from_toml("theme = \"system\"\n")
+                .unwrap()
+                .system_sort,
+            SystemSort::Name
+        );
+        assert_eq!(
+            config_from_toml("system_sort = \"banana\"\n")
+                .unwrap()
+                .system_sort,
+            SystemSort::Name
+        );
+        let text = toml::to_string_pretty(&Config {
+            system_sort: SystemSort::Year,
+            ..Config::default()
+        })
+        .unwrap();
+        assert!(
+            text.contains("system_sort = 'year'") || text.contains("system_sort = \"year\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn save_system_sort_keeps_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvLock::set("XDG_CONFIG_HOME", dir.path());
+        let mut config = Config::default();
+        config.theme = "launchbox".into();
+        config.cover_width = 230.0;
+        config.consoles.push(Console {
+            id: "genesis".into(),
+            name: "Sega Genesis".into(),
+            rom_dirs: Vec::new(),
+            extensions: vec!["md".into()],
+            profile: None,
+            grid_art: GridArt::BoxArt,
+            media: MediaToggles::default(),
+        });
+        config.consoles.push(Console {
+            id: "atari2600".into(),
+            name: "Atari 2600".into(),
+            rom_dirs: Vec::new(),
+            extensions: vec!["a26".into()],
+            profile: None,
+            grid_art: GridArt::Screenshot,
+            media: MediaToggles::default(),
+        });
+        save_config(&config).unwrap();
+
+        save_system_sort(SystemSort::Year).unwrap();
+        let loaded = load_config().unwrap();
+        assert_eq!(loaded.system_sort, SystemSort::Year);
+        assert_eq!(loaded.theme, "launchbox");
+        assert_eq!(loaded.cover_width, 230.0);
+        assert_eq!(loaded.consoles[0].id, "genesis");
+        assert_eq!(loaded.consoles[1].id, "atari2600");
+        assert_eq!(loaded.consoles[1].grid_art, GridArt::Screenshot);
+    }
+
+    #[test]
+    fn launch_years_cover_the_catalog() {
+        const NO_LAUNCH_YEAR: &[&str] = &[
+            "arcade",
+            "consolearcade",
+            "desktop",
+            "emulators",
+            "pcarcade",
+            "ports",
+        ];
+        for system in crate::catalog::systems() {
+            let year = console_year(&system.folder_id);
+            if NO_LAUNCH_YEAR.contains(&system.folder_id.as_str()) {
+                assert_eq!(year, None, "{}", system.folder_id);
+            } else {
+                assert!(year.is_some(), "missing year for {}", system.folder_id);
+            }
+        }
+        assert_eq!(console_year("atari2600"), Some(1977));
+        assert_eq!(console_year("atari5200"), Some(1982));
+        assert_eq!(console_year("nes"), Some(1983));
+        assert_eq!(console_year("gb"), Some(1989));
+        assert_eq!(console_year("genesis"), Some(1988));
+        assert_eq!(console_year("gc"), Some(2001));
+        assert_eq!(console_year("psx"), Some(1994));
+        assert_eq!(console_year("snes"), Some(1990));
+        assert_eq!(console_year("ps1"), Some(1994));
+        assert_eq!(console_year("gamecube"), Some(2001));
+        assert_eq!(console_year("not-a-console"), None);
+        for item in load_console_metadata().unwrap() {
+            assert_eq!(console_year(&item.id), Some(item.year), "{}", item.id);
+        }
+    }
+
+    #[test]
+    fn save_console_grid_art_writes_one_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvLock::set("XDG_CONFIG_HOME", dir.path());
+        let mut config = Config::default();
+        config.cover_width = 180.0;
+        config.consoles.push(Console {
+            id: "snes".into(),
+            name: "Super Nintendo".into(),
+            rom_dirs: Vec::new(),
+            extensions: vec!["sfc".into()],
+            profile: None,
+            grid_art: GridArt::BoxArt,
+            media: MediaToggles::default(),
+        });
+        config.consoles.push(Console {
+            id: "genesis".into(),
+            name: "Sega Genesis".into(),
+            rom_dirs: Vec::new(),
+            extensions: vec!["md".into()],
+            profile: None,
+            grid_art: GridArt::BoxArt,
+            media: MediaToggles::default(),
+        });
+        save_config(&config).unwrap();
+
+        save_console_grid_art("snes", GridArt::Screenshot).unwrap();
+        let loaded = load_config().unwrap();
+        assert_eq!(loaded.consoles[0].grid_art, GridArt::Screenshot);
+        assert_eq!(loaded.consoles[1].grid_art, GridArt::BoxArt);
+        assert_eq!(loaded.cover_width, 180.0);
+        assert_eq!(loaded.consoles[0].name, "Super Nintendo");
+
+        let err = save_console_grid_art("missing", GridArt::Screenshot).unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
+        assert_eq!(load_config().unwrap().consoles[1].id, "genesis");
     }
 
     #[test]
@@ -300,6 +745,63 @@ ramp_ms = 800000
         .sanitized();
         assert_eq!(swapped.fast_interval_ms, 40);
         assert_eq!(swapped.slow_interval_ms, 40);
+    }
+}
+
+#[cfg(test)]
+pub(crate) static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Isolated HOME and XDG dirs for tests that read or write the real config paths.
+#[cfg(test)]
+pub(crate) struct XdgEnv {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl XdgEnv {
+    pub(crate) fn sandbox(root: &std::path::Path) -> Self {
+        let home = root.join("home");
+        let config = root.join("config");
+        let data = root.join("data");
+        let cache = root.join("cache");
+        for dir in [&home, &config, &data, &cache] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        Self::set(&[
+            ("HOME", &home),
+            ("XDG_CONFIG_HOME", &config),
+            ("XDG_DATA_HOME", &data),
+            ("XDG_CACHE_HOME", &cache),
+        ])
+    }
+
+    fn set(pairs: &[(&'static str, &std::path::Path)]) -> Self {
+        let guard = XDG_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let saved = pairs
+            .iter()
+            .map(|(key, value)| {
+                let prev = std::env::var_os(key);
+                std::env::set_var(key, value);
+                (*key, prev)
+            })
+            .collect();
+        Self {
+            saved,
+            _guard: guard,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for XdgEnv {
+    fn drop(&mut self) {
+        for (key, prev) in self.saved.drain(..) {
+            match prev {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }
 

@@ -1,195 +1,68 @@
 # Retromarchy
 
-A LaunchBox-style retro game launcher for Omarchy (Arch + Hyprland), built with Rust, GTK4, and libadwaita.
+A LaunchBox-style retro game launcher for Omarchy (Arch + Hyprland).
 
-The window is keyboard-first: a console sidebar on the left, a game grid in the center, and a collapsible details pane on the right. With nothing selected, the pane shows console info (bundled manufacturer, year, and description when that system is in `console_metadata.toml`, plus library stats). With a game selected, it shows box art and a screenshot when those files exist, plus title, console, ROM path, CRC32, a **Play** button, and play stats.
-
-The default look follows the Omarchy / libadwaita system theme. A header button (tooltip **Toggle Theme**, or `t`) switches to an optional LaunchBox-like dark theme. The choice is saved as `theme = "system"` or `theme = "launchbox"`.
-
-## Features
-
-- First run writes `~/.config/retromarchy/config.toml` with defaults and no consoles or profiles. An empty library shows **No games found** with **Import ROMs** and **Manage Emulators**.
-- ROM import stores folder paths and scans them. Files are not copied. Import does not scrape artwork.
-- ES-DE / EmulationStation multi-system import (immediate subfolders matched to systems) and one-system import.
-- Emulator profiles: RetroArch (libretro core path, optional RetroArch config file) and standalone (`{rom}` in the command).
-- When `retroarch` is on `PATH`, **Manage Emulators** lists local cores and can add a profile or add-and-assign it to a known system. You can still type a path or **Browse…** for a `.so`. Cores are not downloaded.
-- Launch uses the game’s profile, or the console’s default profile. After the process exits, last played, play count, and play time are updated.
-- ROM scan computes CRC32 and discovers local sidecars (box art, screenshot, manual, video) when those toggles are on.
-- Manual artwork scrape only: box art and screenshot (one file per kind). Providers are ScreenScraper, then TheGamesDB, in that order unless you change it. **Scrape** on one game asks you to pick a name match. **Scrape Missing** still fills gaps automatically. The scraper does not download ROMs or BIOS.
-
-## Build (Arch)
+This branch replaces the GTK4 window with a GPUI shell that uses [gpui-omarchy](https://github.com/huacnlee/gpui-omarchy). The shell reads the same config and library as the GTK app. To run the GTK app again, check out `main`.
 
 ```bash
-sudo pacman -S rust gtk4 libadwaita
-cargo build --release
+git checkout main
 ```
-
-`rust-toolchain.toml` selects the stable toolchain.
 
 ## Run
 
 ```bash
-cargo run --release
+cargo run --bin retromarchy
 ```
 
-Or install the binary:
+The window id is `org.omarchy.Retromarchy`, with server-side decorations, so Hyprland can tile it.
 
-```bash
-cargo install --path .
-retromarchy
-```
+`gpui_omarchy::init` reads the current Omarchy theme from `~/.local/state/omarchy/current` (legacy `~/.config/omarchy/current`). If that theme is missing or invalid, the shell uses Tokyo Night. The theme name is in the header.
 
-## Getting started
+A normal Arch desktop already has the libraries GPUI needs (a Vulkan driver, fontconfig, and libxkbcommon). This branch does not link GTK or libadwaita.
 
-You do not need to copy `config.example.toml` first. Start the app; a missing config file is created with defaults (no consoles, no profiles, scraper kinds on, ScreenScraper then TheGamesDB).
+## What you see
 
-1. **Import ROMs** (header button or the empty-state button, or Ctrl+I).
-   - **Import ES-DE / EmulationStation library** — point at a ROMs root (the dialog suggests `~/ROMs`). Immediate subfolders are matched to the bundled system catalog. **Scan folders**, check the systems you want, remap unmatched folders, then **Import**.
-   - **Add one system** — search the catalog, **Choose folder**, **Browse…**, **Add system**.
-   Paths are stored. ROM files are not copied. Nothing is scraped.
-2. **Manage Emulators** (header, empty state, Ctrl+E, or Ctrl+M).
-   - If `retroarch` is on `PATH`, **Discovered cores** lists `.so` files from `/usr/lib/libretro`, `/usr/lib/libretro/cores`, `/usr/share/libretro/cores`, `~/.config/retroarch/cores`, and `libretro_directory` in `~/.config/retroarch/retroarch.cfg`. **Add profile** saves a RetroArch profile. **Add & assign to …** also sets that system’s default profile. Cores are not downloaded.
-   - Or add a profile by hand: **Standalone** with a command that contains `{rom}`, or **RetroArch** with a core path (**Browse…** filters to `*.so`).
-   - **Default profile per system** assigns the profile used at launch. Without one, Play / Enter says to configure an emulator.
-3. Select a console in the sidebar, then a game. **Play** or Enter launches it.
-4. Artwork is optional and manual. **Scraper** (Ctrl+G) stores credentials. **Scrape** (`s`), or **Scrape…** on the game menu, searches by name and lets you pick a ScreenScraper or TheGamesDB match. That replaces box art and screenshot for the one game. **Scrape Missing** (Shift+S) still fetches only missing artwork for every game on the current system. Right-click a game, or press the Menu key or Shift+F10, for **Scrape…**, **Rename…**, and **Delete…**. Rename changes the library title only. Delete always removes the library row; the ROM file and scraped artwork stay unless you check those boxes.
+The window has three panes.
 
-The header combo (tooltip **Grid artwork for this system**) chooses what the grid prefers for the current console: **Box art** or **Screenshot** (`1` / `2`). If that file is missing, the grid falls back to the other one. An older `grid_art = "title_screen"` value is read as box art. The combo beside it (tooltip **Show all games or favorites**) is **All** or **Favorites** and filters the current console. A favorited game shows a heart on its tile. `/` opens the filter (**Filter games...**). Escape closes the filter, or clears the game selection and returns the details pane to console info.
+1. The left pane lists consoles from `~/.config/retromarchy/config.toml`.
+2. The center pane is a game grid for the selected console. The status-bar **Art** control (or `1` / `2`) picks that console's `grid_art`: box art or screenshot. A tile uses that file when it exists, then the other image. Otherwise it shows initials. Card height follows the slot (3:4 box, 4:3 screenshot). The console name sits under the title.
+3. The right pane shows console stats when no game is selected. Select a game and it shows the title, console, play stats, ROM path, CRC32, box art, and screenshot.
 
-## Configuration
+If the config has no consoles, the center pane is empty and offers **Import ROMs**. That is the first-run screen. The in-memory demo still appears when the config file or the library database cannot be opened, and it is labeled **Demo library**. The demo does not write games into your library. Placeholder art for one Super Nintendo row lives in `resources/demo/`. Those files are not ROMs.
 
-The app reads and writes `~/.config/retromarchy/config.toml`. The dialogs above are the normal way to change it. The same file is hand-editable; `config.example.toml` is a commented sample of the on-disk shape, not a required setup step.
+## Keys
 
-Top-level keys the app uses:
+- Arrow keys, the d-pad, and the left stick move the focused pane. Right, or Tab, or A (South) enters the grid. Left on the first column of a row returns to the console list and clears the game. B (East) returns to the console list and keeps the selected game.
+- Holding a direction repeats on one clock. The first step is immediate. The next waits `initial_delay_ms`, then the gap eases from `slow_interval_ms` to `fast_interval_ms` over `ramp_ms`. A held arrow wins over the pad on that axis. A, B, and Y do not repeat. Missing fields use 400, 180, 50, and 2000. The header **Options** button edits those four values, the same spins GTK writes to `[input]`. Each step is 10 ms. Starting pause and the transition may be 0. The two repeat intervals may not. Nothing goes past 60 seconds. A faster repeat is pulled down when it would outrun the slower one. The file is written as you change a value, and hold-repeat uses it immediately. Arrows and Tab move. Left and right step. Esc closes. Gamepad B closes. A closes when Close is focused.
+- `h` `j` `k` `l` step the grid. They are not on the hold-repeat clock.
+- Enter, numpad Enter, or A on a selected game, launches it with the profile resolver. The status line names the error when the system has no profile. When the process exits, play count, play time, and last played are written and the details pane refreshes. The wait and the database write stay off the UI thread.
+- `/` opens a title filter. It composes with All / Favorites. Esc clears and closes it. `/` again does the same. Arrows and Enter still move and launch while it is open.
+- `r` rescans the current system's ROM folders, upserts rows, and drops games whose files are gone. Favorites, custom titles, and play stats stay. The scan runs off the UI thread.
+- `d` shows or hides the details pane.
+- `f` toggles a favorite on the selected game. Gamepad Y (North) does the same. The header has an All / Favorites control for the current console. A filled heart on the card and in the details pane means favorited. Disk libraries write the flag through the SQLite library; the demo library keeps it in memory until you quit.
+- The Menu key, Shift+F10, or Select (Back / View) opens the game menu on the selected game. Right-click a card does the same. The rows are Scrape, Rename, and Delete. Arrows or `j` / `k` move, Enter or A chooses, Escape or B closes. A click outside the menu closes it.
+- `s`, or the header Scrape button, opens that same scrape dialog for the selected game. Shift+S, or Scrape Missing, scrapes every game on the current system. The scraper fetches box art and screenshot from ScreenScraper, then TheGamesDB, and skips a kind whose file is already on disk. Favorites do not narrow the system list. Progress is on the status line. The selected game and the scroll position stay put. Credentials come from the config. The demo library does not scrape.
+- Ctrl+G, or the header **Scraper** button, opens Scraper settings. Box art and screenshot, the provider list (enable, Up, Down), a ScreenScraper username and password, and a TheGamesDB API key. The password and API key are masked. Save writes `[scraper]` and leaves the rest of `config.toml` alone. Esc closes without saving. The next scrape reads the file, so a restart is not required. Arrows and Tab move. Enter toggles a check, moves a provider, or saves when Save is focused. Gamepad A confirms and B closes.
+- The game-menu Scrape row searches by name, then saves box art and screenshot for that one game. Rename writes the display title (`title` and `title_custom`) and leaves the ROM file alone. Delete asks before removing the library row; the ROM and cached artwork stay unless those boxes are checked. The demo library opens the same dialogs and does not write them.
+- Escape clears the title filter when it is open. Otherwise it clears the selected game when the menu is closed. B does not.
+- `1` and `2` set the current system's grid art to box art or screenshot, the same keys as GTK. The status-bar **Art** control does the same with the mouse. The choice is that console's `grid_art` in `config.toml`. A missing file falls back to the other image, and the card height changes with the slot. A demo library updates the grid and does not write the file.
+- `-` and `+` (or `=`, and the numpad equivalents) change the game-grid cover width by 10px. The same width is used for every system and saved as `cover_width` in the config. The range is 120–400. The status bar slider does the same thing.
+- Ctrl+I opens the ROM import wizard. The header **Import ROMs** button does the same, and so does the button on an empty library. The steps match GTK: an ES-DE / EmulationStation root, or one system. Arrows, Tab, and Enter move. Esc closes. Gamepad A confirms and B closes. Scan runs off the UI thread. **Browse…** uses GPUI's folder prompt (`prompt_for_paths`, the XDG desktop portal). The path field is always there, prefilled with `~/ROMs`, when the portal is unavailable.
+- Ctrl+M or Ctrl+E opens Manage Emulators. The header button and the empty-library button do the same. The dialog lists discovered RetroArch cores when `retroarch` is on `PATH`, adds a core profile or a standalone command, deletes a profile, and sets each console's default profile. Changes are written to `config.toml` as you confirm them. Arrows, Tab, and Enter move. Esc closes. Gamepad A confirms and B closes. Launching a game uses the new assignment without restarting.
+- `t` toggles the theme, and so does the header **Theme** button. `system` follows the Omarchy theme. `launchbox` is the built-in dark palette. The choice is saved as `theme`.
 
-- `theme`: `"system"` (default) or `"launchbox"`.
-- `details_visible`: whether the right pane starts open (default `true`).
-- `profiles`, `consoles`, `scraper`, `input`.
+## Not in this branch
 
-**RetroArch profile** (launch is `retroarch -L <core> [--config <file>] <rom>`):
+The import wizard does not assign emulator profiles. This shell reads the d-pad, the left stick, A, B, Y, and Select. `src/ui.rs` and `src/dialogs.rs` are the GTK window. This binary does not compile them.
 
-```toml
-[[profiles]]
-type = "RetroArch"
-id = "retroarch-snes9x"
-core = "/usr/lib/libretro/snes9x_libretro.so"
-# config = "/home/user/.config/retroarch/snes.cfg"  # optional
-```
+Scan, config, the SQLite library, and launch command building are the library crate. `cargo test` runs those tests. The binary is the shell.
 
-Profiles created in **Manage Emulators** omit `config`.
-
-**Standalone profile** (`{rom}` is replaced, then the string is split on shell words):
-
-```toml
-[[profiles]]
-type = "Standalone"
-id = "dolphin"
-command = "dolphin-emu -b -e {rom}"
-```
-
-**Console** (`grid_art` is `box_art` or `screenshot`; default `box_art`). `media` only controls local sidecar discovery, not the scraper:
-
-```toml
-[[consoles]]
-id = "snes"
-name = "Super Nintendo"
-rom_dirs = ["/home/user/ROMs/snes"]
-extensions = ["sfc", "smc", "zip"]
-profile = "retroarch-snes9x"
-grid_art = "box_art"
-
-[consoles.media]
-box_art = true
-screenshot = true
-manual = true
-video = true
-```
-
-Systems added by import use the catalog id, display name, and extensions, with all four media toggles on and `grid_art` at the default.
-
-### Local media discovery
-
-On scan, next to the ROM or in a subdirectory of the ROM’s folder (first match wins):
-
-- **Box art**: `<rom_stem>.png`, `.jpg`, or `.jpeg`, or `box_art/<rom_stem>.<ext>`
-- **Screenshot**: same image extensions, or `screenshot/`
-- **Manual**: `<rom_stem>.pdf` or `.txt`, or `manual/`
-- **Video**: `<rom_stem>.mp4`, `.mkv`, or `.avi`, or `video/`
-
-Manuals and videos are local only; the scraper does not fetch them. Title-screen files already on disk are left in place and are not shown or scraped.
-
-## Scraper
-
-Open **Scraper** in the header or press Ctrl+G (**Scraper settings**). It saves the `[scraper]` table. Scrapes run only from **Scrape** / `s` (one game, you pick the match) and **Scrape Missing** / Shift+S (every game on the system, first provider hit, missing files only). Import and rescan do not call the network.
-
-Enabled kinds are box art and screenshot. **Scrape Missing** walks the provider list for each missing kind and stops at the first hit. A single-game scrape searches those same providers by name, in the same order, and downloads box art and screenshot for the hit you pick, replacing files that are already there. Default order is ScreenScraper, then TheGamesDB. Reorder with **Up** / **Down**, or edit the list.
-
-```toml
-[scraper]
-box_art = true
-screenshot = true
-
-[[scraper.providers]]
-id = "screenscraper"
-enabled = true
-
-[[scraper.providers]]
-id = "thegamesdb"
-enabled = true
-
-[scraper.credentials]
-screenscraper_user = ""
-screenscraper_password = ""
-thegamesdb_api_key = ""
-```
-
-ScreenScraper needs a free member username and password. The application Softname is built into the binary; it is not something you paste. TheGamesDB needs `thegamesdb_api_key`. Member credentials stay in this file. Older configs may still contain `screenscraper_dev_id` and `screenscraper_dev_password`; those keys are ignored and are not written back.
-
-Images are written to `~/.local/share/retromarchy/media/<console>/<game-id>/<kind>.<ext>` (`box_art` or `screenshot`; png, jpg, gif, or webp). One file per kind. The `media` table in the library database records the path. Archive, ROM, BIOS, manual, and video URLs are rejected. Older `title_screen` rows are ignored and their files are not deleted.
-
-## Input
-
-**Options** in the header opens **Input**. Those fields control hold-repeat for arrow keys, the d-pad, and the left stick, and they are written to `[input]` as you edit them. Defaults are a 400 ms starting pause, 180 ms slow repeat, 50 ms fast repeat, and a 2000 ms slow-to-fast transition. Confirm, Back, and Favorite do not repeat.
-
-## Keybindings
-
-Ignored while the filter entry is focused, except Escape, `/`, and Tab.
-
-- **Arrow keys**: Move the focused pane (systems list, or the game grid). Holding one repeats. **Options → Input** sets the pause, the slow repeat, the fast repeat, and the slow-to-fast transition. **h j k l** step the grid once per keypress (up and down jump one row)
-- **Enter**: Launch the selected game
-- **f**: Toggle the selected game as a favorite
-- **r**: Rescan the current console
-- **s**: Scrape the selected game (search by name, then pick a match)
-- **Shift+S**: Scrape missing artwork for the current system
-- **Right-click**, **Menu**, or **Shift+F10**: Game menu (**Scrape…**, **Rename…**, **Delete…**) on the selected game
-- **Ctrl+G**: Scraper settings
-- **Ctrl+I**: Import ROMs
-- **Ctrl+E** or **Ctrl+M**: Manage Emulators
-- **1 / 2**: Grid artwork for this system (box art, screenshot)
-- **/**: Toggle the game filter
-- **Escape**: Close the filter, or clear the selection
-- **d**: Show or hide the details pane
-- **t**: Toggle system theme and the LaunchBox dark theme
-- **Tab**: Focus the grid and select the first game if none is selected
-
-## Controller
-
-A gamepad is optional. Buttons follow the SDL / Xbox layout (South is the bottom face button: Xbox A, PlayStation Cross, Nintendo B):
-
-- **Left stick or d-pad**: Move, same as the arrow keys on the focused pane (systems list or game grid). Holding the direction repeats: one step right away, then a pause, then a slow repeat that speeds up. The stick counts as held once it passes the on-threshold and lets go when it returns near center. **Options → Input** stores that timing in `[input]`.
-- **A (South)**: From the systems list, move into that console’s games. On a game, launch it (same as Enter).
-- **B (East)**: From the game grid, return to the systems list.
-- **Y (North)**: Toggle the focused game as a favorite. Does nothing when focus is on the systems list.
-- **Select (Xbox Back / View, gilrs `Button::Select`)**: On a selected game, open the same menu as right-click. This is not B (East / Back) and not A (South / Confirm).
-
-Start and X are ignored. The header buttons are not mapped. While that menu or a dialog is open, the d-pad moves, A activates the focused control, and B closes it.
-
-## Data locations
+## Data
 
 - Config: `~/.config/retromarchy/config.toml`
-- Library: `~/.local/share/retromarchy/library.db` (SQLite). Each game has a `favorite` flag (0 or 1) and a `title_custom` flag. A title saved from **Rename…** sets `title_custom` so a rescan does not replace it with the ROM stem. Existing libraries gain new columns on startup.
+- Library: `~/.local/share/retromarchy/library.db`
 - Scraped artwork: `~/.local/share/retromarchy/media/`
 
-## License
+`config.example.toml` is a commented sample of the config file. The first run still creates a default config when the file is missing.
 
-This repository does not include a `LICENSE` file. `resources/systems.json` is derived from EmulationStation Desktop Edition; see `ATTRIBUTION.md`.
+This repository does not include a `LICENSE` file. `resources/systems.json` is derived from EmulationStation Desktop Edition. See `ATTRIBUTION.md`.

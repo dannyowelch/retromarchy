@@ -1,6 +1,20 @@
 # Retromarchy Configuration Example
 # Copy this to ~/.config/retromarchy/config.toml and adjust paths
 
+# theme = "system" follows the Omarchy theme. "launchbox" is the built-in dark theme.
+# The header Theme button and the t key toggle it.
+# theme = "system"
+
+# Sidebar order. "name" (the default) is alphabetical by display name.
+# "year" is each system's first-region launch year. Unknown years sort last,
+# and ties fall back to the name. Consoles stay in the order they were added.
+# The Systems header Name/Year control and the o key toggle it.
+# system_sort = "name"
+
+# One cover width for every system's game grid, in pixels.
+# The GPUI shell slider and - / + keys step by 10 between 120 and 400.
+# cover_width = 216
+
 # Emulator profiles define how to launch games
 [[profiles]]
 type = "RetroArch"
@@ -65,14 +79,16 @@ manual = false
 video = false
 
 # Hold-repeat for arrow keys, the d-pad, and the left stick.
-# Options → Input in the app edits this. Confirm, Back, and Favorite do not repeat.
+# GTK Options → Input and the GPUI Options button edit this.
+# Hold-repeat uses the saved values immediately.
+# Confirm, Back, and Favorite do not repeat.
 [input]
 initial_delay_ms = 400
 slow_interval_ms = 180
 fast_interval_ms = 50
 ramp_ms = 2000
 
-# Artwork scraper. Hand-edit this, or use Scraper in the app.
+# Artwork scraper. Hand-edit this, or use the Scraper button (Ctrl+G).
 # Images are cached under ~/.local/share/retromarchy/media/.
 # The scraper never downloads ROMs or BIOS.
 [scraper]
