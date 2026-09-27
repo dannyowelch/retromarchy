@@ -1,7 +1,7 @@
 use crate::appearance::{self, launchbox_theme, theme_key};
 use crate::browse::{
     clamp_cover_width, columns_for, cover_path, file_for, format_play_time, game_count_label,
-    grid_art_key, image_aspect, is_launch_key, key_from_parts, rescan_key, resolve_profile,
+    grid_art_key, image_aspect, is_launch_key, key_from_parts, rescan_key, resolve_launch,
     reveal_row_scroll, row_of, row_reveal_insets, scrape_chord, system_sort_key, title_search_key,
     Browse, Confirm, Key, LibraryKind, Pane, ScrapeChord, TileFrame, COVER_WIDTH_MAX,
     COVER_WIDTH_MIN, COVER_WIDTH_STEP, DETAILS_PAD, DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH,
@@ -10,7 +10,7 @@ use crate::browse::{
 use crate::config::{self, InputSettings, SystemSort};
 use crate::cores;
 use crate::database;
-use crate::emulators::{emulator_key, Block, EmulatorCommand, Emulators, Kind, Slot};
+use crate::emulators::{emulator_key, Block, EmulatorCommand, Emulators, Slot, Tab, HINT};
 use crate::game_menu::{
     game_menu_key, Aim, DeleteSlot, Overlay, OverlayCommand, RenameSlot, ScrapeSlot,
 };
@@ -29,7 +29,9 @@ use crate::scraper_settings::{
     self, scraper_key, Block as ScraperBlock, Command as ScraperCommand, Part as ScraperPart,
     ScraperSettings, Slot as ScraperSlot,
 };
-use crate::types::{DeleteOptions, Game, GameMetadata, GridArt, GridFilter, Media, MediaKind};
+use crate::types::{
+    DeleteOptions, EmulatorKind, Game, GameMetadata, GridArt, GridFilter, Media, MediaKind,
+};
 use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::base::CheckboxState;
 use gpui_kit::{
@@ -83,7 +85,6 @@ pub struct Shell {
     scraper: Option<ScraperSettings>,
     emulator_scroll: ScrollHandle,
     scraper_scroll: ScrollHandle,
-    picking_core: bool,
     /// Closing the dialog drops whatever control had focus. The next frame
     /// puts the keyboard back on the shell.
     refocus: bool,
@@ -187,7 +188,6 @@ impl Shell {
             scraper: None,
             emulator_scroll: ScrollHandle::new(),
             scraper_scroll: ScrollHandle::new(),
-            picking_core: false,
             refocus: false,
             play_tx,
             play_rx,
@@ -659,7 +659,7 @@ impl Shell {
                     changed = true;
                 }
                 Some(PadAction::Back) => {
-                    self.close_emulators();
+                    self.finish_emulators();
                     changed = true;
                 }
                 Some(PadAction::Favorite | PadAction::Menu) | None => {}
@@ -682,8 +682,8 @@ impl Shell {
         changed
     }
 
-    /// Arrows and Tab move. Enter confirms the focused control. Esc closes.
-    /// A console's left/right choice is written immediately.
+    /// Tab, 1, and 2 switch tabs. Arrows move. Enter confirms. Esc closes.
+    /// A system's left/right choice is written immediately.
     fn on_emulator_key(&mut self, keystroke: &Keystroke, release: bool, cx: &mut Context<Self>) {
         if let Some(dir) = arrow_dir(keystroke) {
             let modified = keystroke.modifiers.control
@@ -712,7 +712,7 @@ impl Shell {
             // keydown. The keyup still arrives, and that is what moves this dialog.
             if keystroke.key == "tab" {
                 if let Some(dialog) = &mut self.emulators {
-                    dialog.tab(keystroke.modifiers.shift);
+                    dialog.cycle_tab();
                 }
                 cx.notify();
             }
@@ -723,7 +723,7 @@ impl Shell {
         let modified =
             keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
         if key == "escape" {
-            self.close_emulators();
+            self.finish_emulators();
             cx.notify();
         } else if key == "enter" {
             self.confirm_emulators(cx);
@@ -752,7 +752,21 @@ impl Shell {
             }
             cx.notify();
         } else if !modified {
-            if let Some(text) = typed_text(keystroke) {
+            let typing = self
+                .emulators
+                .as_ref()
+                .is_some_and(|dialog| dialog.accepts_text());
+            if !typing && matches!(key, "1" | "digit1" | "numpad1") {
+                if let Some(dialog) = &mut self.emulators {
+                    dialog.show(Tab::Emulators);
+                }
+                cx.notify();
+            } else if !typing && matches!(key, "2" | "digit2" | "numpad2") {
+                if let Some(dialog) = &mut self.emulators {
+                    dialog.show(Tab::Systems);
+                }
+                cx.notify();
+            } else if let Some(text) = typed_text(keystroke) {
                 if let Some(dialog) = &mut self.emulators {
                     dialog.type_text(text);
                 }
@@ -1080,8 +1094,13 @@ impl Shell {
 
     fn close_emulators(&mut self) {
         self.emulators = None;
-        self.picking_core = false;
         self.refocus = true;
+    }
+
+    fn finish_emulators(&mut self) {
+        if self.write_emulators() {
+            self.close_emulators();
+        }
     }
 
     fn open_emulators(&mut self) {
@@ -1102,34 +1121,29 @@ impl Shell {
         };
         self.browse.close_overlay();
         self.search = None;
-        let show_cores = crate::emulators::retroarch_on_path();
-        let cores = if show_cores {
-            cores::discover_cores()
-        } else {
-            Vec::new()
-        };
-        self.picking_core = false;
-        self.emulators = Some(Emulators::open(&config, cores, show_cores));
+        let cores = cores::discover_cores();
+        self.emulators = Some(Emulators::open(&config, cores));
     }
 
-    fn confirm_emulators(&mut self, cx: &mut Context<Self>) {
+    fn confirm_emulators(&mut self, _cx: &mut Context<Self>) {
         let Some(command) = self.emulators.as_mut().map(|dialog| dialog.confirm()) else {
             return;
         };
         match command {
             EmulatorCommand::None => {}
-            EmulatorCommand::Close => self.close_emulators(),
-            EmulatorCommand::Browse => self.pick_core(cx),
-            EmulatorCommand::Write => self.write_emulators(),
+            EmulatorCommand::Close => self.finish_emulators(),
+            EmulatorCommand::Write => {
+                self.write_emulators();
+            }
         }
     }
 
-    fn write_emulators(&mut self) {
-        let (profiles, consoles) = {
+    fn write_emulators(&mut self) -> bool {
+        let (emulators, systems) = {
             let Some(dialog) = &self.emulators else {
-                return;
+                return false;
             };
-            (dialog.profiles().to_vec(), dialog.consoles().to_vec())
+            (dialog.emulators().to_vec(), dialog.systems().to_vec())
         };
         let mut config = match config::load_config() {
             Ok(config) => config,
@@ -1137,22 +1151,25 @@ impl Shell {
                 if let Some(dialog) = &mut self.emulators {
                     dialog.set_error(format!("Could not read config ({err})."));
                 }
-                return;
+                return false;
             }
         };
-        crate::emulators::apply_assignments(&mut config, &profiles, &consoles);
+        crate::emulators::apply_assignments(&mut config, &emulators, &systems);
         if let Err(err) = config::save_config(&config) {
             if let Some(dialog) = &mut self.emulators {
                 dialog.set_error(format!("Could not save config ({err})."));
             }
-            return;
+            return false;
         }
-        self.browse.library.profiles = config.profiles.clone();
+        self.browse.library.emulators = config.emulators.clone();
         for shelf in &mut self.browse.library.shelves {
             if let Some(console) = config.consoles.iter().find(|c| c.id == shelf.console.id) {
-                shelf.console.profile = console.profile.clone();
+                shelf.console.emulator = console.emulator.clone();
+                shelf.console.core = console.core.clone();
+                shelf.console.extra_args = console.extra_args.clone();
             }
         }
+        true
     }
 
     fn open_import(&mut self) {
@@ -1243,55 +1260,6 @@ impl Shell {
                     wizard.set_error(message);
                 } else {
                     self.browse.status = message;
-                }
-            }
-        }
-    }
-
-    /// Core Browse is an open-file prompt with no extension filter, so the path field stays editable.
-    fn pick_core(&mut self, cx: &mut Context<Self>) {
-        if self.picking_core {
-            return;
-        }
-        self.picking_core = true;
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Select".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let picked = match rx.await {
-                Ok(Ok(Some(paths))) => paths
-                    .into_iter()
-                    .next()
-                    .map(Picked::Path)
-                    .unwrap_or(Picked::Cancel),
-                Ok(Ok(None)) | Err(_) => Picked::Cancel,
-                Ok(Err(err)) => {
-                    Picked::Failed(format!("Core picker unavailable ({err}). Type the path."))
-                }
-            };
-            let _ = this.update(cx, |this, cx| {
-                this.finish_core_pick(picked);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn finish_core_pick(&mut self, picked: Picked) {
-        self.picking_core = false;
-        match picked {
-            Picked::Cancel => {}
-            Picked::Path(path) => {
-                if let Some(dialog) = &mut self.emulators {
-                    dialog.set_core_path(path);
-                }
-            }
-            Picked::Failed(message) => {
-                if let Some(dialog) = &mut self.emulators {
-                    dialog.set_error(message);
                 }
             }
         }
@@ -1832,13 +1800,13 @@ impl Shell {
             self.browse.status = "Select a game, then press Enter.".into();
             return;
         };
-        let Some(profile) = resolve_profile(&self.browse.library, &game) else {
+        let Some(launch) = resolve_launch(&self.browse.library, &game) else {
             self.browse.status =
-                "This system has no emulator profile. Use Manage Emulators to add one and assign it."
+                "This system has no emulator. Use Manage Emulators to add one and assign it."
                     .into();
             return;
         };
-        match launcher::launch_game_tracked(&profile, &game.rom) {
+        match launcher::launch_game_tracked(&launch, &game.rom) {
             Ok(mut child) => {
                 let tx = self.play_tx.clone();
                 let game_id = game.id.clone();
@@ -2054,6 +2022,8 @@ impl Render for Shell {
             .children(emulator_dialog(
                 self.emulators.as_ref(),
                 &self.emulator_scroll,
+                window.viewport_size().width.as_f32(),
+                window.viewport_size().height.as_f32(),
                 cx,
             ))
             .children(options_dialog(self.options.as_ref(), cx))
@@ -4129,13 +4099,17 @@ fn import_error(text: &str, cx: &Context<Shell>) -> impl IntoElement {
 fn emulator_dialog(
     dialog: Option<&Emulators>,
     scroll: &ScrollHandle,
+    viewport_w: f32,
+    viewport_h: f32,
     cx: &Context<Shell>,
 ) -> Option<gpui_kit::AnyElement> {
     let dialog = dialog?;
+    let width = (viewport_w - 32.0).clamp(520.0, 880.0);
+    let scroll_h = (viewport_h - 220.0).clamp(160.0, 520.0);
     let mut list = div()
         .id("emulator-list")
         .w_full()
-        .h(px(440.))
+        .h(px(scroll_h))
         .overflow_y_scroll()
         .track_scroll(scroll)
         .flex()
@@ -4147,13 +4121,19 @@ fn emulator_dialog(
     }
     Some(
         modal(
-            dialog_page("emulator-dialog", "Manage Emulators", 820., cx)
-                .child(hint(
-                    "Arrows move. Left and right change a choice. Enter confirms. Esc closes.",
+            dialog_page("emulator-dialog", "Manage Emulators", width, cx)
+                .max_h(px((viewport_h - 24.0).max(240.0)))
+                .child(hint(HINT, cx))
+                .child(emulator_tabs(dialog, cx))
+                .child(list)
+                .child(div().flex().justify_end().child(emulator_action(
+                    "emulator-close".to_string(),
+                    "Close".to_string(),
+                    ButtonVariant::Secondary,
+                    dialog.focus() == Slot::Close,
+                    Slot::Close,
                     cx,
-                ))
-                .child(heading(crate::emulators::PROFILES_HEADING))
-                .child(list),
+                ))),
         )
         .into_any_element(),
     )
@@ -4289,103 +4269,129 @@ fn options_close(aimed: bool, cx: &Context<Shell>) -> impl IntoElement {
 
 fn emulator_block(block: Block, cx: &Context<Shell>) -> gpui_kit::AnyElement {
     match block {
-        Block::Heading(text) => heading(text).into_any_element(),
         Block::Note(text) => hint(text, cx).into_any_element(),
         Block::Error(text) => import_error(&text, cx).into_any_element(),
-        Block::Core(line) => core_block(line, cx).into_any_element(),
-        Block::Profile(line) => profile_block(line, cx).into_any_element(),
-        Block::Kind { kind, aimed } => kind_block(kind, aimed, cx).into_any_element(),
-        Block::Id { edit, aimed } => {
-            emulator_field("emulator-id", &edit, aimed, "Profile id", Slot::Id, cx)
-                .into_any_element()
-        }
-        Block::Detail {
-            edit,
-            field_aimed,
-            browse_aimed,
-        } => div()
-            .flex()
-            .gap(px(8.))
-            .items_center()
-            .child(emulator_field(
-                "emulator-detail",
-                &edit,
-                field_aimed,
-                "Command with {rom}, or core path",
-                Slot::Detail,
-                cx,
-            ))
-            .child(emulator_action(
-                "emulator-browse".to_string(),
-                "Browse…".to_string(),
-                ButtonVariant::Secondary,
-                browse_aimed,
-                Slot::Browse,
-                cx,
-            ))
+        Block::Label(text) => div()
+            .text_size(px(12.))
+            .text_color(cx.omarchy().secondary)
+            .child(text.to_string())
             .into_any_element(),
-        Block::Add { aimed } => emulator_action(
-            "emulator-add".to_string(),
-            "Add profile".to_string(),
+        Block::Emulator(line) => emulator_row(line, cx).into_any_element(),
+        Block::Field {
+            edit,
+            aimed,
+            placeholder,
+            slot,
+        } => emulator_field(field_id(slot), &edit, aimed, placeholder, slot, cx).into_any_element(),
+        Block::Kind { kind, aimed } => kind_block(kind, aimed, cx).into_any_element(),
+        Block::Save { label, aimed } => emulator_action(
+            "emulator-save".to_string(),
+            label.to_string(),
             ButtonVariant::Primary,
             aimed,
-            Slot::Add,
+            Slot::Save,
             cx,
         )
         .into_any_element(),
-        Block::Console(line) => console_block(line, cx).into_any_element(),
-        Block::Close { aimed } => div()
-            .flex()
-            .justify_end()
-            .child(emulator_action(
-                "emulator-close".to_string(),
-                "Close".to_string(),
-                ButtonVariant::Secondary,
-                aimed,
-                Slot::Close,
-                cx,
-            ))
-            .into_any_element(),
+        Block::System(line) => system_row(line, cx).into_any_element(),
     }
 }
 
-fn core_block(line: crate::emulators::CoreLine, cx: &Context<Shell>) -> impl IntoElement {
-    let theme = cx.omarchy();
-    let mut actions = div().flex().flex_wrap().gap(px(6.)).items_center();
-    for (index, core_button) in line.buttons.into_iter().enumerate() {
-        let id = format!("emulator-core-{}-{index}", line.index);
-        if let Some(slot) = core_button.slot {
-            let variant = if core_button.primary {
-                ButtonVariant::Primary
-            } else {
-                ButtonVariant::Secondary
-            };
-            actions = actions.child(emulator_action(
-                id,
-                core_button.label,
-                variant,
-                core_button.aimed,
-                slot,
-                cx,
-            ));
-        } else {
-            actions = actions
-                .child(button(id, core_button.label, ButtonVariant::Secondary, cx).disabled(true));
-        }
+fn field_id(slot: Slot) -> &'static str {
+    match slot {
+        Slot::Name => "emulator-name",
+        Slot::Path => "emulator-path",
+        Slot::GlobalArgs => "emulator-global-args",
+        _ => "emulator-field",
     }
+}
+
+fn emulator_tabs(dialog: &Emulators, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .id("emulator-tabs")
+        .flex()
+        .flex_none()
+        .border_1()
+        .border_color(if dialog.focus() == Slot::Tabs {
+            theme.accent
+        } else {
+            theme.border
+        })
+        .child(tab_segment(Tab::Emulators, dialog.tab(), false, cx))
+        .child(tab_segment(Tab::Systems, dialog.tab(), true, cx))
+}
+
+fn tab_segment(tab: Tab, selected: Tab, divider: bool, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let on = tab == selected;
+    let mut segment = div()
+        .id(match tab {
+            Tab::Emulators => "emulator-tab-emulators",
+            Tab::Systems => "emulator-tab-systems",
+        })
+        .flex_1()
+        .px(px(10.))
+        .py(px(6.))
+        .cursor_pointer()
+        .bg(if on {
+            theme.selected_fill()
+        } else {
+            theme.background
+        })
+        .text_color(if on { theme.accent } else { theme.foreground })
+        .hover(|style| style.bg(theme.hover_fill()))
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                if let Some(dialog) = &mut this.emulators {
+                    dialog.show(tab);
+                }
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+        .child(tab.label());
+    if divider {
+        segment = segment.border_l_1().border_color(theme.border);
+    }
+    segment
+}
+
+fn emulator_row(line: crate::emulators::EmulatorLine, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let index = line.index;
     div()
         .flex()
-        .gap(px(8.))
         .items_center()
+        .gap(px(8.))
         .p(px(8.))
         .border_1()
-        .border_color(theme.border)
+        .border_color(if line.row_aimed {
+            theme.accent
+        } else {
+            theme.border
+        })
         .bg(theme.surface)
         .child(
             div()
+                .id(format!("emulator-row-{index}"))
                 .flex_1()
                 .min_w(px(0.))
                 .overflow_hidden()
+                .cursor_pointer()
+                .on_click(
+                    cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                        let aimed = this
+                            .emulators
+                            .as_mut()
+                            .is_some_and(|dialog| dialog.aim(Slot::Row(index)));
+                        if aimed {
+                            this.confirm_emulators(cx);
+                        }
+                        this.focus_handle.focus(window, cx);
+                        cx.notify();
+                    }),
+                )
                 .child(line.name)
                 .child(
                     div()
@@ -4393,74 +4399,88 @@ fn core_block(line: crate::emulators::CoreLine, cx: &Context<Shell>) -> impl Int
                         .text_color(theme.secondary)
                         .overflow_hidden()
                         .whitespace_nowrap()
-                        .child(line.path),
+                        .child(line.detail),
                 ),
         )
-        .child(actions)
-}
-
-fn profile_block(line: crate::emulators::ProfileLine, cx: &Context<Shell>) -> impl IntoElement {
-    let theme = cx.omarchy();
-    div()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .p(px(8.))
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.surface)
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .overflow_hidden()
-                .child(line.label),
-        )
         .child(emulator_action(
-            format!("emulator-delete-{}", line.index),
+            format!("emulator-delete-{index}"),
             "Delete".to_string(),
             ButtonVariant::Danger,
-            line.aimed,
-            Slot::Delete(line.index),
+            line.delete_aimed,
+            Slot::Delete(index),
             cx,
         ))
 }
 
-fn console_block(line: crate::emulators::ConsoleLine, cx: &Context<Shell>) -> impl IntoElement {
+fn system_row(line: crate::emulators::SystemLine, cx: &Context<Shell>) -> impl IntoElement {
     let theme = cx.omarchy();
+    let index = line.index;
+    let core = if line.core_enabled {
+        emulator_action(
+            format!("emulator-core-{index}"),
+            format!("Core: {}", line.core),
+            ButtonVariant::Secondary,
+            line.core_aimed,
+            Slot::SystemCore(index),
+            cx,
+        )
+        .into_any_element()
+    } else {
+        div()
+            .px(px(8.))
+            .py(px(6.))
+            .text_color(theme.secondary)
+            .child("Core: No core")
+            .into_any_element()
+    };
     div()
         .flex()
-        .items_center()
-        .gap(px(8.))
+        .flex_col()
+        .gap(px(6.))
         .p(px(8.))
         .border_1()
-        .border_color(theme.border)
+        .border_color(
+            if line.emulator_aimed || line.core_aimed || line.args_aimed {
+                theme.accent
+            } else {
+                theme.border
+            },
+        )
         .bg(theme.surface)
-        .child(div().flex_1().child(line.name))
+        .child(line.name)
         .child(emulator_action(
-            format!("emulator-console-{}", line.index),
-            line.value,
+            format!("emulator-system-{index}"),
+            format!("Emulator: {}", line.emulator),
             ButtonVariant::Secondary,
-            line.aimed,
-            Slot::Console(line.index),
+            line.emulator_aimed,
+            Slot::SystemEmulator(index),
+            cx,
+        ))
+        .child(core)
+        .child(emulator_field(
+            format!("emulator-system-args-{index}"),
+            &line.args,
+            line.args_aimed,
+            "Extra arguments",
+            Slot::SystemArgs(index),
             cx,
         ))
 }
 
-fn kind_block(kind: Kind, aimed: bool, cx: &Context<Shell>) -> impl IntoElement {
+fn kind_block(kind: EmulatorKind, aimed: bool, cx: &Context<Shell>) -> impl IntoElement {
     let theme = cx.omarchy();
     div()
         .id("emulator-kind")
         .flex()
         .border_1()
         .border_color(if aimed { theme.accent } else { theme.border })
-        .child(kind_segment(Kind::Standalone, kind, false, cx))
-        .child(kind_segment(Kind::RetroArch, kind, true, cx))
+        .child(kind_segment(EmulatorKind::Standalone, kind, false, cx))
+        .child(kind_segment(EmulatorKind::RetroArch, kind, true, cx))
 }
 
 fn kind_segment(
-    kind: Kind,
-    selected: Kind,
+    kind: EmulatorKind,
+    selected: EmulatorKind,
     divider: bool,
     cx: &Context<Shell>,
 ) -> impl IntoElement {
@@ -4468,8 +4488,8 @@ fn kind_segment(
     let on = kind == selected;
     let mut segment = div()
         .id(match kind {
-            Kind::Standalone => "emulator-kind-standalone",
-            Kind::RetroArch => "emulator-kind-retroarch",
+            EmulatorKind::Standalone => "emulator-kind-standalone",
+            EmulatorKind::RetroArch => "emulator-kind-retroarch",
         })
         .px(px(10.))
         .py(px(6.))
@@ -4498,7 +4518,7 @@ fn kind_segment(
 }
 
 fn emulator_field(
-    id: &'static str,
+    id: impl Into<gpui_kit::ElementId>,
     edit: &crate::game_menu::LineEdit,
     focused: bool,
     placeholder: &'static str,

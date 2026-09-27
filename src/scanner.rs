@@ -189,7 +189,9 @@ mod tests {
             name: "Super Nintendo".to_string(),
             rom_dirs: vec![rom_dir.clone()],
             extensions: vec!["sfc".to_string()],
-            profile: Some("retroarch-snes9x".to_string()),
+            emulator: None,
+            core: None,
+            extra_args: String::new(),
             grid_art: crate::types::GridArt::default(),
             media: MediaToggles::default(),
         };
@@ -227,7 +229,9 @@ mod tests {
             name: "Super Nintendo".to_string(),
             rom_dirs: vec![rom_dir.clone()],
             extensions: vec!["sfc".to_string()],
-            profile: Some("retroarch-snes9x".to_string()),
+            emulator: None,
+            core: None,
+            extra_args: String::new(),
             grid_art: crate::types::GridArt::default(),
             media: MediaToggles {
                 box_art: true,

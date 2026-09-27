@@ -3,7 +3,8 @@ use crate::database::{self, LibraryStats};
 use crate::game_menu::Overlay;
 use crate::gamepad::{grid_step, list_step, NavDir};
 use crate::types::{
-    game_matches, Console, EmulatorProfile, Game, GridArt, GridFilter, Media, MediaKind, Source,
+    game_matches, Console, Emulator, EmulatorKind, Game, GridArt, GridFilter, Media, MediaKind,
+    ResolvedLaunch, Source,
 };
 use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
@@ -44,7 +45,7 @@ pub struct Library {
     /// the order consoles were added.
     pub system_sort: SystemSort,
     pub shelves: Vec<Shelf>,
-    pub profiles: Vec<EmulatorProfile>,
+    pub emulators: Vec<Emulator>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,7 +108,7 @@ pub fn open_library() -> Library {
             details_open: config.details_visible,
             system_sort: config.system_sort,
             shelves: Vec::new(),
-            profiles: config.profiles.clone(),
+            emulators: config.emulators.clone(),
         },
         Err(err) => demo_library(&format!("Demo library. Could not read config ({err}).")),
     }
@@ -127,7 +128,7 @@ pub fn from_config(config: &config::Config, conn: &rusqlite::Connection) -> Libr
         details_open: config.details_visible,
         system_sort: config.system_sort,
         shelves,
-        profiles: config.profiles.clone(),
+        emulators: config.emulators.clone(),
     }
 }
 
@@ -204,7 +205,7 @@ pub fn demo_library(note: &str) -> Library {
         details_open: true,
         system_sort: SystemSort::Name,
         shelves,
-        profiles: Vec::new(),
+        emulators: Vec::new(),
     }
 }
 
@@ -222,7 +223,9 @@ fn demo_shelf(
             name: name.to_string(),
             rom_dirs: Vec::new(),
             extensions: Vec::new(),
-            profile: None,
+            emulator: None,
+            core: None,
+            extra_args: String::new(),
             grid_art,
             media: Default::default(),
         },
@@ -1064,21 +1067,37 @@ impl Browse {
     }
 }
 
-pub fn resolve_profile(library: &Library, game: &Game) -> Option<EmulatorProfile> {
-    let from_game = game.profile.as_deref().filter(|id| !id.is_empty());
-    let id = from_game.or_else(|| {
-        library
-            .shelves
-            .iter()
-            .find(|shelf| shelf.console.id == game.console)
-            .and_then(|shelf| shelf.console.profile.as_deref())
-            .filter(|id| !id.is_empty())
-    })?;
-    library
-        .profiles
+pub fn resolve_launch(library: &Library, game: &Game) -> Option<ResolvedLaunch> {
+    let console = library
+        .shelves
         .iter()
-        .find(|profile| profile.id() == id)
-        .cloned()
+        .find(|shelf| shelf.console.id == game.console)
+        .map(|shelf| &shelf.console)?;
+    let assigned = console.system_emulator();
+    let override_id = game.profile.as_deref().filter(|id| !id.is_empty());
+    let emulator_id = match override_id {
+        Some(id) if library.emulators.iter().any(|emulator| emulator.id == id) => id.to_string(),
+        _ => assigned.as_ref()?.emulator_id.clone(),
+    };
+    let emulator = library
+        .emulators
+        .iter()
+        .find(|emulator| emulator.id == emulator_id)?
+        .clone();
+    let (core, extra_args) = match &assigned {
+        Some(row) if row.emulator_id == emulator.id => (row.core.clone(), row.extra_args.clone()),
+        _ => (None, String::new()),
+    };
+    let core = if emulator.kind == EmulatorKind::RetroArch {
+        core
+    } else {
+        None
+    };
+    Some(ResolvedLaunch {
+        emulator,
+        core,
+        extra_args,
+    })
 }
 
 pub fn columns_for(width: f32, details_open: bool, tile_width: f32) -> usize {
@@ -1406,7 +1425,9 @@ mod tests {
                 name: "Super Nintendo".into(),
                 rom_dirs: Vec::new(),
                 extensions: vec!["sfc".into()],
-                profile: None,
+                emulator: None,
+                core: None,
+                extra_args: String::new(),
                 grid_art: GridArt::BoxArt,
                 media: MediaToggles::default(),
             }],
@@ -1639,7 +1660,9 @@ mod tests {
                 name: "Super Nintendo".into(),
                 rom_dirs: Vec::new(),
                 extensions: vec!["sfc".into()],
-                profile: None,
+                emulator: None,
+                core: None,
+                extra_args: String::new(),
                 grid_art: GridArt::BoxArt,
                 media: MediaToggles::default(),
             }],
@@ -2115,7 +2138,9 @@ mod tests {
             name: name.into(),
             rom_dirs: Vec::new(),
             extensions: Vec::new(),
-            profile: None,
+            emulator: None,
+            core: None,
+            extra_args: String::new(),
             grid_art: GridArt::BoxArt,
             media: MediaToggles::default(),
         }
