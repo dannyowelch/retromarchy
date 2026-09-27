@@ -3,7 +3,7 @@ use crate::types::{
 };
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -522,7 +522,8 @@ fn encode_query(params: &[(String, String)]) -> String {
 }
 
 fn screenscraper_system(console_id: &str) -> Option<u32> {
-    Some(match console_id {
+    let console_id = console_id.to_ascii_lowercase();
+    Some(match console_id.as_str() {
         "megadrive" | "genesis" | "megadrivejp" => 1,
         "mastersystem" => 2,
         "nes" | "famicom" | "fds" => 3,
@@ -547,6 +548,8 @@ fn screenscraper_system(console_id: &str) -> Option<u32> {
         "3do" => 29,
         "pcengine" | "tg16" => 31,
         "xbox" => 32,
+        // ES-DE folder `atari7800`, plus the short aliases ScreenScraper lists.
+        "atari7800" | "a7800" | "7800" => 41,
         "wonderswan" => 45,
         "wonderswancolor" => 46,
         "psx" => 57,
@@ -559,7 +562,8 @@ fn screenscraper_system(console_id: &str) -> Option<u32> {
 }
 
 fn thegamesdb_platform(console_id: &str) -> Option<u32> {
-    Some(match console_id {
+    let console_id = console_id.to_ascii_lowercase();
+    Some(match console_id.as_str() {
         "gc" => 2,
         "n64" | "n64dd" => 3,
         "gb" | "sgb" => 4,
@@ -580,6 +584,8 @@ fn thegamesdb_platform(console_id: &str) -> Option<u32> {
         "atari2600" => 22,
         "neogeo" => 24,
         "3do" => 25,
+        // https://thegamesdb.net/platform.php?id=27
+        "atari7800" | "a7800" | "7800" => 27,
         "pcengine" | "tg16" => 34,
         "mastersystem" => 35,
         "megadrive" | "megadrivejp" => 36,
@@ -1432,6 +1438,116 @@ pub fn fixture_dir_from_env() -> Option<PathBuf> {
         .filter(|path| path.is_dir())
 }
 
+fn push_reason(reasons: &mut Vec<String>, reason: String) {
+    if !reasons.iter().any(|have| have == &reason) {
+        reasons.push(reason);
+    }
+}
+
+/// One stderr line for a game counted as failed. Also appends to an existing
+/// `*.log` file in the retromarchy data or cache directory. Does not create one.
+fn log_scrape_failure(query: &ArtworkQuery, reasons: &[String]) {
+    let line = scrape_failure_line(query, reasons);
+    eprintln!("{line}");
+    for path in existing_scrape_logs() {
+        append_log_line(&path, &line);
+    }
+}
+
+fn scrape_failure_line(query: &ArtworkQuery, reasons: &[String]) -> String {
+    let system = match screenscraper_system(&query.console_id) {
+        Some(id) => id.to_string(),
+        None => "none".to_string(),
+    };
+    let platform = match thegamesdb_platform(&query.console_id) {
+        Some(id) => id.to_string(),
+        None => "none".to_string(),
+    };
+    let crc = match query.crc32 {
+        Some(crc) => format!("{crc:08X}"),
+        None => "none".to_string(),
+    };
+    let size = match query.rom_bytes {
+        Some(size) => size.to_string(),
+        None => "none".to_string(),
+    };
+    let detail = if reasons.is_empty() {
+        "no artwork".to_string()
+    } else {
+        reasons
+            .iter()
+            .map(|reason| public_detail(reason))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    scrub_secrets(format!(
+        "scrape failed: title=\"{}\" rom=\"{}\" console={} screenscraper_system={} thegamesdb_platform={} crc={} size={} {detail}",
+        one_line(&query.title),
+        one_line(&query.rom_name),
+        one_line(&query.console_id),
+        system,
+        platform,
+        crc,
+        size,
+    ))
+}
+
+fn scrub_secrets(mut line: String) -> String {
+    for secret in [crate::softname::DEVPASSWORD, crate::softname::DEVID] {
+        if !secret.is_empty() {
+            line = line.replace(secret, "redacted");
+        }
+    }
+    line
+}
+
+fn one_line(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(180) {
+        if ch.is_control() || ch == '"' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn existing_scrape_logs() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(xdg) = xdg::BaseDirectories::with_prefix("retromarchy") else {
+        return files;
+    };
+    for dir in [xdg.get_data_home(), xdg.get_cache_home()] {
+        collect_log_files(&dir, &mut files);
+    }
+    files.sort();
+    files
+}
+
+fn collect_log_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_log = path.extension().and_then(|ext| ext.to_str()) == Some("log");
+        if path.is_file() && is_log {
+            files.push(path);
+        }
+    }
+}
+
+fn append_log_line(path: &Path, line: &str) {
+    if !path.is_file() {
+        return;
+    }
+    let Ok(mut file) = fs::OpenOptions::new().append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(file, "{line}");
+}
+
 fn run_scrape(
     games: Vec<crate::types::Game>,
     scraper: ScraperConfig,
@@ -1488,6 +1604,7 @@ fn run_scrape(
         let query = ArtworkQuery::from_game(game);
         let mut http = HttpGame::new();
         let mut game_failed = false;
+        let mut reasons = Vec::new();
         for kind in todo {
             let providers: Vec<_> = active
                 .iter()
@@ -1496,6 +1613,15 @@ fn run_scrape(
                 .collect();
             if providers.is_empty() {
                 game_failed = true;
+                let names = cooled
+                    .iter()
+                    .map(|provider| provider.label())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                push_reason(
+                    &mut reasons,
+                    format!("skipped after an earlier rate limit ({names})"),
+                );
                 continue;
             }
             let outcome = take_first_success(&providers, |provider| {
@@ -1521,6 +1647,10 @@ fn run_scrape(
                 Ok(Media { kind, path, source })
             });
             for (provider, err) in &outcome.errors {
+                push_reason(
+                    &mut reasons,
+                    format!("{}: {}", provider.label(), fail_message(err.clone())),
+                );
                 if matches!(err, FetchFail::RateLimited(_)) && !cooled.contains(provider) {
                     cooled.push(*provider);
                 }
@@ -1537,6 +1667,7 @@ fn run_scrape(
         }
         if game_failed {
             failed += 1;
+            log_scrape_failure(&query, &reasons);
         }
     }
 
@@ -1971,5 +2102,169 @@ mod tests {
         assert!(rom_dir.path().join("other.sfc").is_file());
         delete_rom_file(rom_dir.path()).unwrap();
         assert!(rom_dir.path().is_dir());
+    }
+
+    fn creds() -> ScraperCredentials {
+        ScraperCredentials {
+            screenscraper_user: "user".into(),
+            screenscraper_password: "secret-pass".into(),
+            thegamesdb_api_key: "key".into(),
+        }
+    }
+
+    fn param<'a>(params: &'a [(String, String)], key: &str) -> &'a str {
+        params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+            .unwrap()
+    }
+
+    fn dummy_game(rom: PathBuf, console: &str, crc32: u32) -> crate::types::Game {
+        crate::types::Game {
+            id: "asteroids".into(),
+            console: console.into(),
+            rom,
+            title: "Asteroids".into(),
+            crc32: Some(crc32),
+            profile: None,
+            media: Vec::new(),
+            last_played: None,
+            play_count: 0,
+            play_time: 0,
+            favorite: false,
+        }
+    }
+
+    /// Headered `.a78` bytes: version byte, `ATARI7800` at offset 1, then a payload.
+    fn headered_a78() -> Vec<u8> {
+        let mut bytes = vec![0u8; 128];
+        bytes[0] = 1;
+        bytes[1..10].copy_from_slice(b"ATARI7800");
+        bytes.extend_from_slice(b"ROM-BYTES");
+        bytes
+    }
+
+    #[test]
+    fn atari_7800_batch_query_sends_system_ids_and_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = headered_a78();
+        let rom = dir.path().join("Asteroids (USA).a78");
+        fs::write(&rom, &bytes).unwrap();
+        let crc = crc32fast::hash(&bytes);
+        let query = ArtworkQuery::from_game(&dummy_game(rom, "atari7800", crc));
+
+        assert_eq!(query.rom_name, "Asteroids (USA).a78");
+        assert_eq!(query.rom_bytes, Some(bytes.len() as u64));
+        assert_eq!(query.crc32, Some(crc));
+        assert_ne!(query.crc32, Some(crc32fast::hash(b"ROM-BYTES")));
+
+        let params = screenscraper_params(&creds(), &query);
+        assert_eq!(param(&params, "systemeid"), "41");
+        assert_eq!(param(&params, "romnom"), "Asteroids (USA).a78");
+        assert_eq!(param(&params, "crc"), format!("{crc:08X}"));
+        assert_eq!(param(&params, "romtaille"), bytes.len().to_string());
+        assert!(params.iter().all(|(key, _)| key != "gameid"));
+
+        let bin = dir.path().join("Centipede.bin");
+        fs::write(&bin, b"RAW-BIN").unwrap();
+        let bin_crc = crc32fast::hash(b"RAW-BIN");
+        let bin_query = ArtworkQuery::from_game(&dummy_game(bin, "A7800", bin_crc));
+        let bin_params = screenscraper_params(&creds(), &bin_query);
+        assert_eq!(param(&bin_params, "systemeid"), "41");
+        assert_eq!(param(&bin_params, "romnom"), "Centipede.bin");
+        assert_eq!(param(&bin_params, "romtaille"), "7");
+
+        let zip_bytes = b"not-a-real-zip";
+        let zip = dir.path().join("Food Fight.zip");
+        fs::write(&zip, zip_bytes).unwrap();
+        let zip_query =
+            ArtworkQuery::from_game(&dummy_game(zip, "7800", crc32fast::hash(zip_bytes)));
+        let zip_params = screenscraper_params(&creds(), &zip_query);
+        assert_eq!(param(&zip_params, "systemeid"), "41");
+        assert_eq!(param(&zip_params, "romnom"), "Food Fight.zip");
+        assert_eq!(param(&zip_params, "romtaille"), zip_bytes.len().to_string());
+        assert_eq!(
+            param(&zip_params, "crc"),
+            format!("{:08X}", crc32fast::hash(zip_bytes))
+        );
+
+        assert_eq!(screenscraper_system("atari7800"), Some(41));
+        assert_eq!(screenscraper_system("a7800"), Some(41));
+        assert_eq!(screenscraper_system("atarilynx"), Some(28));
+        assert_eq!(thegamesdb_platform("atari7800"), Some(27));
+        assert_eq!(thegamesdb_platform("a7800"), Some(27));
+        assert_eq!(thegamesdb_platform("atarilynx"), Some(4924));
+
+        let tg = thegamesdb_search_params(&creds(), "Asteroids", "atari7800");
+        assert_eq!(param(&tg, "filter[platform]"), "27");
+        assert_eq!(param(&tg, "name"), "Asteroids");
+
+        let search = screenscraper_search_params(&creds(), "Asteroids");
+        assert!(search
+            .iter()
+            .any(|(key, value)| key == "recherche" && value == "Asteroids"));
+        assert!(search.iter().all(|(key, _)| {
+            key != "crc"
+                && key != "romnom"
+                && key != "romtaille"
+                && key != "systemeid"
+                && key != "gameid"
+        }));
+        let game_params = screenscraper_game_params(&creds(), "1234");
+        assert_eq!(param(&game_params, "gameid"), "1234");
+        assert!(game_params
+            .iter()
+            .all(|(key, _)| key != "crc" && key != "romnom" && key != "systemeid"));
+    }
+
+    #[test]
+    fn scrape_failure_line_names_the_rom_and_hides_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = headered_a78();
+        let rom = dir.path().join("Asteroids (USA).a78");
+        fs::write(&rom, &bytes).unwrap();
+        let crc = crc32fast::hash(&bytes);
+        let query = ArtworkQuery::from_game(&dummy_game(rom, "atari7800", crc));
+        let line = scrape_failure_line(
+            &query,
+            &[
+                "ScreenScraper: HTTP 404 Jeu non trouve".into(),
+                "ScreenScraper: bad sspassword=secret-pass".into(),
+                format!("echo {}", crate::softname::DEVPASSWORD),
+                format!("id {}", crate::softname::DEVID),
+            ],
+        );
+        assert!(line.starts_with("scrape failed:"));
+        assert!(line.contains("rom=\"Asteroids (USA).a78\""));
+        assert!(line.contains("console=atari7800"));
+        assert!(line.contains("screenscraper_system=41"));
+        assert!(line.contains("thegamesdb_platform=27"));
+        assert!(line.contains(&format!("crc={crc:08X}")));
+        assert!(line.contains(&format!("size={}", bytes.len())));
+        assert!(line.contains("HTTP 404 Jeu non trouve"));
+        assert!(!line.contains("secret-pass"));
+        assert!(!line.contains("sspassword"));
+        assert!(!line.contains("devpassword"));
+        assert!(!line.contains(crate::softname::DEVPASSWORD));
+        assert!(!line.contains(crate::softname::DEVID));
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn scrape_failure_appends_only_when_a_log_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("retromarchy.log");
+        let missing = dir.path().join("absent.log");
+        fs::write(&log, "boot\n").unwrap();
+        let line = "scrape failed: rom=\"Asteroids (USA).a78\" screenscraper_system=41";
+        append_log_line(&log, line);
+        append_log_line(&missing, "scrape failed: should not create a file");
+        let text = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            text,
+            "boot\nscrape failed: rom=\"Asteroids (USA).a78\" screenscraper_system=41\n"
+        );
+        assert!(!missing.exists());
     }
 }
