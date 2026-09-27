@@ -1,10 +1,11 @@
 use crate::appearance::{self, launchbox_theme, theme_key};
 use crate::browse::{
-    clamp_cover_width, columns_for, cover_path, file_for, format_play_time, grid_art_key,
-    image_aspect, is_launch_key, key_from_parts, rescan_key, resolve_profile, reveal_row_scroll,
-    row_of, row_reveal_insets, scrape_chord, system_sort_key, title_search_key, Browse, Confirm,
-    Key, LibraryKind, Pane, ScrapeChord, TileFrame, COVER_WIDTH_MAX, COVER_WIDTH_MIN,
-    COVER_WIDTH_STEP, DETAILS_PAD, DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH, TILE_GAP,
+    clamp_cover_width, columns_for, cover_path, file_for, format_play_time, game_count_label,
+    grid_art_key, image_aspect, is_launch_key, key_from_parts, rescan_key, resolve_profile,
+    reveal_row_scroll, row_of, row_reveal_insets, scrape_chord, system_sort_key, title_search_key,
+    Browse, Confirm, Key, LibraryKind, Pane, ScrapeChord, TileFrame, COVER_WIDTH_MAX,
+    COVER_WIDTH_MIN, COVER_WIDTH_STEP, DETAILS_PAD, DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH,
+    TILE_GAP,
 };
 use crate::config::{self, InputSettings, SystemSort};
 use crate::cores;
@@ -2462,6 +2463,8 @@ fn sidebar_consoles(browse: &Browse, cx: &Context<Shell>) -> Vec<impl IntoElemen
             div()
                 .id(("console", index))
                 .flex_shrink_0()
+                .flex()
+                .flex_col()
                 .px(px(8.))
                 .py(px(8.))
                 .bg(if selected {
@@ -2483,9 +2486,32 @@ fn sidebar_consoles(browse: &Browse, cx: &Context<Shell>) -> Vec<impl IntoElemen
                 .child(shelf.console.name.clone())
                 .child(
                     div()
-                        .text_size(px(12.))
-                        .text_color(theme.secondary)
-                        .child(format!("{} games", shelf.games.len())),
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .min_h(px(16.))
+                        .child({
+                            let mut year = div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_size(px(12.))
+                                .text_color(theme.secondary);
+                            if let Some(launched) = shelf.year {
+                                year = year.child(launched.to_string());
+                            }
+                            year
+                        })
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(12.))
+                                .text_color(theme.secondary)
+                                .whitespace_nowrap()
+                                .child(game_count_label(shelf.games.len())),
+                        ),
                 )
         })
         .collect()
