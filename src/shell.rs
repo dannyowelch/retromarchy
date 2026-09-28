@@ -878,6 +878,63 @@ impl Shell {
         self.emulators.is_some() || self.systems.is_some() || self.options.is_some()
     }
 
+    fn current_screen(&self) -> Option<Screen> {
+        if self.emulators.is_some() {
+            Some(Screen::Emulators)
+        } else if self.systems.is_some() {
+            Some(Screen::Systems)
+        } else {
+            self.options
+                .as_ref()
+                .map(|dialog| Screen::Options(dialog.section()))
+        }
+    }
+
+    /// Header buttons share one path. The screen already on display stays put.
+    /// Another settings screen is saved the way Esc saves it, then the target opens.
+    fn activate_screen(&mut self, target: Screen) {
+        match screen_menu(self.current_screen(), target) {
+            ScreenMenu::Stay => {}
+            ScreenMenu::Section(section) => {
+                if let Some(dialog) = &mut self.options {
+                    dialog.select(section);
+                }
+            }
+            ScreenMenu::Open(next) => {
+                if !self.save_and_close_settings() {
+                    return;
+                }
+                match next {
+                    Screen::Emulators => self.open_emulators(),
+                    Screen::Systems => self.open_systems(),
+                    Screen::Options(section) => self.open_options(section),
+                }
+            }
+        }
+    }
+
+    /// Esc's save path: commit the open screen and write it. An unconfirmed
+    /// system picker or delete prompt is dropped first, the same way Esc drops
+    /// it, and the screen still saves instead of discarding the draft.
+    fn save_and_close_settings(&mut self) -> bool {
+        if self.emulators.is_some() {
+            self.finish_emulators();
+            return self.emulators.is_none();
+        }
+        if self.systems.is_some() {
+            if let Some(dialog) = &mut self.systems {
+                while dialog.dismiss() {}
+            }
+            self.finish_systems();
+            return self.systems.is_none();
+        }
+        if self.options.is_some() {
+            self.finish_options();
+            return self.options.is_none();
+        }
+        true
+    }
+
     fn open_options(&mut self, section: OptionsSection) {
         if self.screen_busy() {
             return;
@@ -2028,6 +2085,29 @@ impl Render for Shell {
         let background = cx.omarchy().background;
         let foreground = cx.omarchy().foreground;
         let font = cx.omarchy().font.clone();
+        let library = self.current_screen().is_none();
+        let note = if library {
+            note_bar(&self.browse.library.note, cx)
+        } else {
+            None
+        };
+        let content = if let Some(screen) =
+            emulator_screen(self.emulators.as_ref(), &self.emulator_scroll, cx)
+        {
+            screen
+        } else if let Some(screen) = systems_screen(
+            self.systems.as_ref(),
+            &self.systems_scroll,
+            &self.picker_scroll,
+            cx,
+        ) {
+            screen
+        } else if let Some(screen) = options_screen(self.options.as_ref(), &self.options_scroll, cx)
+        {
+            screen
+        } else {
+            body(&self.browse, &self.grid_scroll, &self.sidebar_scroll, cx).into_any_element()
+        };
 
         focus_scope("retromarchy")
             .track_focus(&self.focus_handle)
@@ -2044,31 +2124,10 @@ impl Render for Shell {
                 this.on_key_up(event, cx);
             }))
             .child(header(&self.browse, &self.appearance, &theme_name, cx))
-            .children(note_bar(&self.browse.library.note, cx))
-            .child(body(
-                &self.browse,
-                &self.grid_scroll,
-                &self.sidebar_scroll,
-                cx,
-            ))
+            .children(note)
+            .child(content)
             .child(status_line(&self.browse, &self.cover_slider, window, cx))
             .children(game_dialog(&self.browse, &self.scrape_scroll, cx))
-            .children(emulator_screen(
-                self.emulators.as_ref(),
-                &self.emulator_scroll,
-                cx,
-            ))
-            .children(systems_screen(
-                self.systems.as_ref(),
-                &self.systems_scroll,
-                &self.picker_scroll,
-                cx,
-            ))
-            .children(options_screen(
-                self.options.as_ref(),
-                &self.options_scroll,
-                cx,
-            ))
     }
 }
 
@@ -2197,7 +2256,7 @@ fn scraper_button(cx: &Context<Shell>) -> impl IntoElement {
             .px(px(4.))
             .flex_shrink_0()
             .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-                this.open_options(OptionsSection::Scraper);
+                this.activate_screen(Screen::Options(OptionsSection::Scraper));
                 this.focus_handle.focus(window, cx);
                 cx.notify();
             })),
@@ -2210,7 +2269,7 @@ fn options_button(cx: &Context<Shell>) -> impl IntoElement {
         .px(px(4.))
         .flex_shrink_0()
         .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-            this.open_options(OptionsSection::Input);
+            this.activate_screen(Screen::Options(OptionsSection::Input));
             this.focus_handle.focus(window, cx);
             cx.notify();
         }))
@@ -2244,7 +2303,7 @@ fn systems_button(cx: &Context<Shell>) -> impl IntoElement {
     .px(px(4.))
     .flex_shrink_0()
     .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-        this.open_systems();
+        this.activate_screen(Screen::Systems);
         this.focus_handle.focus(window, cx);
         cx.notify();
     }))
@@ -2260,7 +2319,7 @@ fn emulators_button(cx: &Context<Shell>) -> impl IntoElement {
     .px(px(4.))
     .flex_shrink_0()
     .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-        this.open_emulators();
+        this.activate_screen(Screen::Emulators);
         this.focus_handle.focus(window, cx);
         cx.notify();
     }))
@@ -3650,7 +3709,7 @@ fn library_empty(cx: &Context<Shell>) -> impl IntoElement {
                 cx,
             )
             .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-                this.open_systems();
+                this.activate_screen(Screen::Systems);
                 this.focus_handle.focus(window, cx);
                 cx.notify();
             })),
@@ -3663,7 +3722,7 @@ fn library_empty(cx: &Context<Shell>) -> impl IntoElement {
                 cx,
             )
             .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-                this.open_emulators();
+                this.activate_screen(Screen::Emulators);
                 this.focus_handle.focus(window, cx);
                 cx.notify();
             })),
@@ -3878,7 +3937,15 @@ fn systems_screen(
         panel,
         cx,
     );
-    let mut layer = div().size_full().child(screen);
+    // The delete prompt covers this screen only. The shell menu and status bar stay put.
+    let mut layer = div()
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .relative()
+        .flex()
+        .flex_col()
+        .child(screen);
     if let Some(confirm) = confirm {
         layer = layer.child(system_delete_dialog(&confirm, cx));
     }
@@ -5113,6 +5180,30 @@ fn scraper_action(
         )))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Emulators,
+    Systems,
+    Options(OptionsSection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenMenu {
+    Stay,
+    Section(OptionsSection),
+    Open(Screen),
+}
+
+fn screen_menu(open: Option<Screen>, target: Screen) -> ScreenMenu {
+    match (open, target) {
+        (Some(Screen::Options(current)), Screen::Options(next)) if current != next => {
+            ScreenMenu::Section(next)
+        }
+        (Some(current), next) if current == next => ScreenMenu::Stay,
+        (_, next) => ScreenMenu::Open(next),
+    }
+}
+
 pub fn window_options() -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds {
@@ -5127,5 +5218,77 @@ pub fn window_options() -> WindowOptions {
             ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_click_on_the_open_screen_does_nothing() {
+        assert_eq!(
+            screen_menu(Some(Screen::Systems), Screen::Systems),
+            ScreenMenu::Stay
+        );
+        assert_eq!(
+            screen_menu(Some(Screen::Emulators), Screen::Emulators),
+            ScreenMenu::Stay
+        );
+        assert_eq!(
+            screen_menu(
+                Some(Screen::Options(OptionsSection::Input)),
+                Screen::Options(OptionsSection::Input)
+            ),
+            ScreenMenu::Stay
+        );
+        assert_eq!(
+            screen_menu(
+                Some(Screen::Options(OptionsSection::Scraper)),
+                Screen::Options(OptionsSection::Scraper)
+            ),
+            ScreenMenu::Stay
+        );
+    }
+
+    #[test]
+    fn menu_click_moves_within_options() {
+        assert_eq!(
+            screen_menu(
+                Some(Screen::Options(OptionsSection::Input)),
+                Screen::Options(OptionsSection::Scraper)
+            ),
+            ScreenMenu::Section(OptionsSection::Scraper)
+        );
+        assert_eq!(
+            screen_menu(
+                Some(Screen::Options(OptionsSection::Scraper)),
+                Screen::Options(OptionsSection::Input)
+            ),
+            ScreenMenu::Section(OptionsSection::Input)
+        );
+    }
+
+    #[test]
+    fn menu_click_leaves_one_screen_for_another() {
+        assert_eq!(
+            screen_menu(Some(Screen::Systems), Screen::Emulators),
+            ScreenMenu::Open(Screen::Emulators)
+        );
+        assert_eq!(
+            screen_menu(Some(Screen::Emulators), Screen::Systems),
+            ScreenMenu::Open(Screen::Systems)
+        );
+        assert_eq!(
+            screen_menu(None, Screen::Options(OptionsSection::Scraper)),
+            ScreenMenu::Open(Screen::Options(OptionsSection::Scraper))
+        );
+        assert_eq!(
+            screen_menu(
+                Some(Screen::Systems),
+                Screen::Options(OptionsSection::Input)
+            ),
+            ScreenMenu::Open(Screen::Options(OptionsSection::Input))
+        );
     }
 }
