@@ -6,7 +6,7 @@ pub type ConsoleId = String;
 pub type ProfileId = String;
 pub type GameId = String;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Console {
     pub id: ConsoleId,
     pub name: String,
@@ -26,6 +26,83 @@ pub struct Console {
     #[serde(default)]
     pub grid_art: GridArt,
     pub media: MediaToggles,
+}
+
+/// `rom_dirs` is a list. A hand-edited `rom_dir` string or array, or a single
+/// string in `rom_dirs`, is folded in without dropping the other value.
+impl<'de> Deserialize<'de> for Console {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let file = ConsoleFile::deserialize(deserializer)?;
+        let mut rom_dirs = Vec::new();
+        push_rom_paths(&mut rom_dirs, file.rom_dirs);
+        if let Some(extra) = file.rom_dir {
+            push_rom_paths(&mut rom_dirs, extra);
+        }
+        Ok(Self {
+            id: file.id,
+            name: file.name,
+            rom_dirs,
+            extensions: file.extensions,
+            emulator: file.emulator,
+            core: file.core,
+            extra_args: file.extra_args,
+            grid_art: file.grid_art,
+            media: file.media,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct ConsoleFile {
+    id: ConsoleId,
+    name: String,
+    #[serde(default)]
+    rom_dir: Option<RomPathValue>,
+    #[serde(default)]
+    rom_dirs: RomPathValue,
+    extensions: Vec<String>,
+    #[serde(default)]
+    emulator: Option<String>,
+    #[serde(default)]
+    core: Option<PathBuf>,
+    #[serde(default)]
+    extra_args: String,
+    #[serde(default)]
+    grid_art: GridArt,
+    #[serde(default)]
+    media: MediaToggles,
+}
+
+#[derive(Default)]
+struct RomPathValue(Vec<PathBuf>);
+
+impl<'de> Deserialize<'de> for RomPathValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            One(String),
+            Many(Vec<String>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::One(path) => Ok(Self(vec![PathBuf::from(path)])),
+            Raw::Many(paths) => Ok(Self(paths.into_iter().map(PathBuf::from).collect())),
+        }
+    }
+}
+
+fn push_rom_paths(out: &mut Vec<PathBuf>, paths: RomPathValue) {
+    for path in paths.0 {
+        let text = path.to_string_lossy();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(trimmed);
+        if !out.iter().any(|have| have == &path) {
+            out.push(path);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

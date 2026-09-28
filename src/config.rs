@@ -1110,6 +1110,97 @@ ramp_ms = 800000
         assert_eq!(swapped.slow_interval_ms, 40);
     }
 
+    fn snes_console(roms: &str) -> String {
+        format!(
+            r#"
+[[consoles]]
+id = "snes"
+name = "Super Nintendo"
+{roms}
+extensions = ["sfc", "smc"]
+emulator = "retroarch"
+core = "/usr/lib/libretro/snes9x_libretro.so"
+extra_args = "--region ntsc"
+grid_art = "screenshot"
+
+[consoles.media]
+box_art = true
+screenshot = false
+manual = false
+video = true
+"#
+        )
+    }
+
+    fn assert_snes_fields(console: &Console) {
+        assert_eq!(console.id, "snes");
+        assert_eq!(console.name, "Super Nintendo");
+        assert_eq!(console.extensions, vec!["sfc", "smc"]);
+        assert_eq!(console.emulator.as_deref(), Some("retroarch"));
+        assert_eq!(
+            console.core.as_deref(),
+            Some(Path::new("/usr/lib/libretro/snes9x_libretro.so"))
+        );
+        assert_eq!(console.extra_args, "--region ntsc");
+        assert_eq!(console.grid_art, GridArt::Screenshot);
+        assert!(console.media.box_art);
+        assert!(!console.media.screenshot);
+        assert!(console.media.video);
+    }
+
+    #[test]
+    fn a_single_rom_dir_loads_as_a_list() {
+        let config = config_from_toml(&snes_console(r#"rom_dir = "/roms/snes""#)).unwrap();
+        assert_eq!(
+            config.consoles[0].rom_dirs,
+            vec![PathBuf::from("/roms/snes")]
+        );
+        assert_snes_fields(&config.consoles[0]);
+
+        let config = config_from_toml(&snes_console(r#"rom_dirs = "/roms/snes""#)).unwrap();
+        assert_eq!(
+            config.consoles[0].rom_dirs,
+            vec![PathBuf::from("/roms/snes")]
+        );
+        assert_snes_fields(&config.consoles[0]);
+
+        let config = config_from_toml(&snes_console(
+            r#"rom_dir = ["/roms/extra", "/roms/snes"]
+rom_dirs = ["/roms/snes", "/roms/more"]"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            config.consoles[0].rom_dirs,
+            vec![
+                PathBuf::from("/roms/snes"),
+                PathBuf::from("/roms/more"),
+                PathBuf::from("/roms/extra"),
+            ]
+        );
+        assert_snes_fields(&config.consoles[0]);
+    }
+
+    #[test]
+    fn saving_writes_rom_folders_as_a_list() {
+        let config = config_from_toml(&snes_console(r#"rom_dir = "/roms/snes""#)).unwrap();
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            text.contains("rom_dirs = ['/roms/snes']")
+                || text.contains("rom_dirs = [\"/roms/snes\"]")
+        );
+        assert!(text.contains("/roms/snes"));
+        assert!(!text.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("rom_dir ") || line.starts_with("rom_dir=")
+        }));
+        let again = config_from_toml(&text).unwrap();
+        assert_eq!(
+            again.consoles[0].rom_dirs,
+            vec![PathBuf::from("/roms/snes")]
+        );
+        assert_snes_fields(&again.consoles[0]);
+    }
+
     fn console(id: &str, name: &str, profile: &str) -> String {
         format!(
             r#"

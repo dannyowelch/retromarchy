@@ -7,8 +7,6 @@ pub mod database;
 pub mod emulators;
 pub mod game_menu;
 pub mod gamepad;
-pub mod import_wizard;
-pub mod importer;
 pub mod input_repeat;
 pub mod launcher;
 pub mod options;

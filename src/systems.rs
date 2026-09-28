@@ -1,10 +1,12 @@
-use crate::config::Config;
+use crate::catalog::{self, SystemEntry};
+use crate::config::{self, Config};
 use crate::cores::{Core, CoreCatalog};
 use crate::game_menu::LineEdit;
 use crate::gamepad::NavDir;
 use crate::picker::{Item, Jump, Menu, Picker};
+use crate::scanner;
 use crate::split::{Side, Split};
-use crate::types::{Console, Emulator, EmulatorKind};
+use crate::types::{Console, Emulator, EmulatorKind, GridArt, MediaToggles};
 use std::path::{Path, PathBuf};
 
 pub fn systems_key(key: &str, key_char: Option<&str>, control: bool) -> bool {
@@ -19,6 +21,12 @@ pub enum Field {
     Emulator,
     Core,
     Args,
+    Path(usize),
+    AddPath,
+    Browse,
+    Rescan,
+    Delete,
+    Type,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +37,8 @@ pub struct SystemRow {
     pub emulator_id: Option<String>,
     pub core: Option<PathBuf>,
     pub args: LineEdit,
+    pub rom_dirs: Vec<String>,
+    pub path_draft: LineEdit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +47,26 @@ pub struct ListRow {
     pub title: String,
     pub detail: String,
     pub selected: bool,
+    pub add: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathLine {
+    pub index: usize,
+    pub path: String,
+    pub aimed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmSlot {
+    Cancel,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Confirm {
+    pub name: String,
+    pub slot: ConfirmSlot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,14 +81,26 @@ pub struct Panel {
     pub core_aimed: bool,
     pub args: LineEdit,
     pub args_aimed: bool,
+    pub paths: Vec<PathLine>,
+    pub path_draft: LineEdit,
+    pub path_draft_aimed: bool,
+    pub browse_aimed: bool,
+    pub rescan_aimed: bool,
+    pub delete_aimed: bool,
+    pub adding: bool,
+    pub types_available: bool,
     pub emulator_menu: Option<Menu>,
     pub core_menu: Option<Menu>,
+    pub type_menu: Option<Menu>,
+    pub confirm: Option<Confirm>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Stay,
     Write,
+    Rescan,
+    Browse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +111,9 @@ pub struct Systems {
     split: Split,
     field: Field,
     picker: Picker,
+    type_query: String,
+    confirm: Option<Confirm>,
+    dropped: Option<String>,
 }
 
 impl Systems {
@@ -82,6 +127,9 @@ impl Systems {
             split: Split::list(),
             field: Field::Emulator,
             picker: Picker::closed(),
+            type_query: String::new(),
+            confirm: None,
+            dropped: None,
         }
     }
 
@@ -97,8 +145,17 @@ impl Systems {
         self.split.index
     }
 
+    pub fn selected_id(&self) -> Option<String> {
+        self.rows.get(self.split.index).map(|row| row.id.clone())
+    }
+
+    pub fn take_dropped(&mut self) -> Option<String> {
+        self.dropped.take()
+    }
+
     pub fn list_rows(&self) -> Vec<ListRow> {
-        self.rows
+        let mut rows: Vec<_> = self
+            .rows
             .iter()
             .enumerate()
             .map(|(index, row)| ListRow {
@@ -106,26 +163,39 @@ impl Systems {
                 title: row.name.clone(),
                 detail: self.emulator_label(row.emulator_id.as_deref()),
                 selected: index == self.split.index,
+                add: false,
             })
-            .collect()
+            .collect();
+        rows.push(ListRow {
+            index: self.rows.len(),
+            title: "Add system".to_string(),
+            detail: String::new(),
+            selected: self.split.index == self.rows.len(),
+            add: true,
+        });
+        rows
     }
 
     pub fn panel(&self) -> Panel {
-        let editing = self.split.side == Side::Panel;
+        let editing = self.split.side == Side::Panel && self.confirm.is_none();
+        if self.adding() {
+            let types_available = !self.type_choices().is_empty();
+            let type_menu = self.type_menu();
+            let confirm = self.confirm.clone();
+            return Panel {
+                empty: false,
+                adding: true,
+                types_available,
+                type_menu,
+                confirm,
+                ..empty_panel()
+            };
+        }
         let Some(row) = self.rows.get(self.split.index) else {
             return Panel {
                 empty: true,
-                name: String::new(),
-                emulator: "None".to_string(),
-                emulator_aimed: false,
-                core: "No core".to_string(),
-                core_missing: false,
-                core_enabled: false,
-                core_aimed: false,
-                args: LineEdit::plain(String::new()),
-                args_aimed: false,
-                emulator_menu: None,
-                core_menu: None,
+                confirm: self.confirm.clone(),
+                ..empty_panel()
             };
         };
         let row = row.clone();
@@ -134,6 +204,16 @@ impl Systems {
         let (core, missing) = core_label(self.cores_for(self.split.index), row.core.as_deref());
         let args = row.args.clone();
         let retroarch = self.retroarch_selected(self.split.index);
+        let paths = row
+            .rom_dirs
+            .iter()
+            .enumerate()
+            .map(|(index, path)| PathLine {
+                index,
+                path: path.clone(),
+                aimed: editing && self.field == Field::Path(index),
+            })
+            .collect();
         let (emulator_menu, core_menu) = self.open_menus();
         Panel {
             empty: false,
@@ -146,24 +226,43 @@ impl Systems {
             core_aimed: editing && self.field == Field::Core,
             args,
             args_aimed: editing && self.field == Field::Args,
+            paths,
+            path_draft: row.path_draft,
+            path_draft_aimed: editing && self.field == Field::AddPath,
+            browse_aimed: editing && self.field == Field::Browse,
+            rescan_aimed: editing && self.field == Field::Rescan,
+            delete_aimed: editing && self.field == Field::Delete,
+            adding: false,
+            types_available: false,
             emulator_menu,
             core_menu,
+            type_menu: None,
+            confirm: self.confirm.clone(),
         }
     }
 
     pub fn select(&mut self, index: usize) {
-        if index < self.rows.len() {
+        if index <= self.rows.len() {
             self.picker.close();
+            self.type_query.clear();
+            self.confirm = None;
             self.split.select(index);
-            self.field = Field::Emulator;
+            self.field = if self.adding() {
+                Field::Type
+            } else {
+                Field::Emulator
+            };
         }
     }
 
     pub fn aim(&mut self, field: Field) {
-        if self.rows.is_empty() {
+        if self.adding() || self.rows.is_empty() || self.confirm.is_some() {
             return;
         }
         if field == Field::Core && !self.retroarch_selected(self.split.index) {
+            return;
+        }
+        if !self.fields().contains(&field) {
             return;
         }
         self.picker.close();
@@ -171,25 +270,49 @@ impl Systems {
         self.field = field;
     }
 
+    pub fn aim_confirm(&mut self, slot: ConfirmSlot) {
+        if let Some(prompt) = &mut self.confirm {
+            prompt.slot = slot;
+        }
+    }
+
     pub fn click_field(&mut self, field: Field) {
-        if self.rows.is_empty() {
+        if self.confirm.is_some() || self.adding() || self.rows.is_empty() {
             return;
         }
         if field == Field::Core && !self.retroarch_selected(self.split.index) {
             return;
         }
-        let open_here =
-            self.picker.is_open() && self.split.side == Side::Panel && self.field == field;
-        if open_here {
-            self.picker.close();
-            return;
+        match field {
+            Field::Emulator | Field::Core => {
+                let open_here =
+                    self.picker.is_open() && self.split.side == Side::Panel && self.field == field;
+                if open_here {
+                    self.picker.close();
+                    return;
+                }
+                self.split.enter();
+                self.field = field;
+                self.open_current();
+            }
+            Field::Args
+            | Field::AddPath
+            | Field::Path(_)
+            | Field::Browse
+            | Field::Rescan
+            | Field::Delete => {
+                self.picker.close();
+                self.split.enter();
+                self.field = field;
+            }
+            Field::Type => {}
         }
-        self.split.enter();
-        self.field = field;
-        self.open_current();
     }
 
     pub fn choose(&mut self, index: usize) -> Step {
+        if self.adding() {
+            return self.add_type(index);
+        }
         if !self.picker.is_open() {
             return Step::Stay;
         }
@@ -197,15 +320,19 @@ impl Systems {
         match self.field {
             Field::Emulator => self.set_emulator(index),
             Field::Core => self.set_core(index),
-            Field::Args => Step::Stay,
+            _ => Step::Stay,
         }
     }
 
     pub fn dismiss(&mut self) -> bool {
+        if self.confirm.take().is_some() {
+            return true;
+        }
         if !self.picker.is_open() {
             return false;
         }
         self.picker.close();
+        self.type_query.clear();
         true
     }
 
@@ -226,16 +353,52 @@ impl Systems {
         if len == 0 {
             return None;
         }
-        Some((self.field, cursor.min(len - 1)))
+        let field = if self.adding() {
+            Field::Type
+        } else {
+            self.field
+        };
+        Some((field, cursor.min(len - 1)))
     }
 
     pub fn move_dir(&mut self, dir: NavDir) -> Step {
+        if self.confirm.is_some() {
+            let slot = match dir {
+                NavDir::Left | NavDir::Up => ConfirmSlot::Cancel,
+                NavDir::Right | NavDir::Down => ConfirmSlot::Delete,
+            };
+            self.aim_confirm(slot);
+            return Step::Stay;
+        }
         if self.split.side == Side::List {
             match dir {
-                NavDir::Up => self.split.move_list(-1, self.rows.len()),
-                NavDir::Down => self.split.move_list(1, self.rows.len()),
+                NavDir::Up => self.split.move_list(-1, self.list_len()),
+                NavDir::Down => self.split.move_list(1, self.list_len()),
                 NavDir::Right => self.enter_panel(),
                 NavDir::Left => {}
+            }
+            return Step::Stay;
+        }
+        if self.adding() {
+            let len = self.type_choices().len();
+            if !self.picker.is_open() && len > 0 {
+                self.picker.open_at(0);
+            }
+            match dir {
+                NavDir::Up => {
+                    self.type_query.clear();
+                    self.picker.move_by(-1, len);
+                }
+                NavDir::Down => {
+                    self.type_query.clear();
+                    self.picker.move_by(1, len);
+                }
+                NavDir::Left => {
+                    self.picker.close();
+                    self.type_query.clear();
+                    self.split.leave();
+                }
+                NavDir::Right => {}
             }
             return Step::Stay;
         }
@@ -258,6 +421,15 @@ impl Systems {
     }
 
     pub fn tab(&mut self, backward: bool) {
+        if self.confirm.is_some() {
+            let slot = if backward {
+                ConfirmSlot::Cancel
+            } else {
+                ConfirmSlot::Delete
+            };
+            self.aim_confirm(slot);
+            return;
+        }
         self.picker.close();
         if self.split.side == Side::List {
             if !backward {
@@ -266,16 +438,35 @@ impl Systems {
             return;
         }
         if backward {
+            self.type_query.clear();
             self.split.leave();
+            return;
+        }
+        if self.adding() {
             return;
         }
         self.shift_field(1);
     }
 
     pub fn confirm(&mut self) -> Step {
+        if let Some(prompt) = self.confirm.clone() {
+            self.confirm = None;
+            if prompt.slot == ConfirmSlot::Delete {
+                return self.remove_selected();
+            }
+            return Step::Stay;
+        }
         if self.split.side == Side::List {
             self.enter_panel();
             return Step::Stay;
+        }
+        if self.adding() {
+            if !self.picker.is_open() {
+                self.enter_panel();
+                return Step::Stay;
+            }
+            let index = self.picker.cursor().unwrap_or(0);
+            return self.add_type(index);
         }
         match self.field {
             Field::Emulator | Field::Core => {
@@ -288,17 +479,47 @@ impl Systems {
                 }
             }
             Field::Args => Step::Write,
+            Field::Path(index) => self.remove_path(index),
+            Field::AddPath => self.commit_draft(),
+            Field::Browse => Step::Browse,
+            Field::Rescan => {
+                self.commit_draft();
+                Step::Rescan
+            }
+            Field::Delete => self.ask_delete(),
+            Field::Type => Step::Stay,
         }
     }
 
     pub fn accepts_text(&self) -> bool {
-        self.split.side == Side::Panel && self.field == Field::Args
+        if self.confirm.is_some() {
+            return false;
+        }
+        if self.adding() && self.split.side == Side::Panel {
+            return true;
+        }
+        self.split.side == Side::Panel
+            && matches!(self.field, Field::Args | Field::AddPath)
+            && !self.picker.is_open()
     }
 
     pub fn type_text(&mut self, text: &str) {
+        if self.confirm.is_some() {
+            return;
+        }
+        if self.adding() && self.split.side == Side::Panel {
+            self.push_type_query(text);
+            return;
+        }
         if self.picker.is_open() {
             let labels = self.choice_labels();
             self.picker.type_ahead(text, &labels);
+            return;
+        }
+        if self.field == Field::AddPath {
+            if let Some(edit) = self.draft_mut() {
+                edit.insert(text);
+            }
             return;
         }
         if self.accepts_text() {
@@ -309,7 +530,20 @@ impl Systems {
     }
 
     pub fn backspace(&mut self) {
+        if self.confirm.is_some() {
+            return;
+        }
+        if self.adding() && self.split.side == Side::Panel {
+            self.pop_type_query();
+            return;
+        }
         if self.picker.is_open() || !self.accepts_text() {
+            return;
+        }
+        if self.field == Field::AddPath {
+            if let Some(edit) = self.draft_mut() {
+                edit.backspace();
+            }
             return;
         }
         if let Some(edit) = self.args_mut() {
@@ -318,7 +552,14 @@ impl Systems {
     }
 
     pub fn delete_forward(&mut self) {
-        if self.picker.is_open() || !self.accepts_text() {
+        if self.confirm.is_some() || self.adding() || self.picker.is_open() || !self.accepts_text()
+        {
+            return;
+        }
+        if self.field == Field::AddPath {
+            if let Some(edit) = self.draft_mut() {
+                edit.delete_forward();
+            }
             return;
         }
         if let Some(edit) = self.args_mut() {
@@ -326,11 +567,46 @@ impl Systems {
         }
     }
 
+    pub fn add_rom_dir(&mut self, path: PathBuf) -> Step {
+        if self.adding() || self.confirm.is_some() {
+            return Step::Stay;
+        }
+        let Some(path) = normalize_path(&path.display().to_string()) else {
+            return Step::Stay;
+        };
+        let Some(row) = self.rows.get(self.split.index) else {
+            return Step::Stay;
+        };
+        if row.rom_dirs.iter().any(|have| same_path(have, &path)) {
+            return Step::Stay;
+        }
+        if let Some(row) = self.rows.get_mut(self.split.index) {
+            row.rom_dirs.push(path);
+        }
+        self.picker.close();
+        self.split.enter();
+        self.field = Field::AddPath;
+        Step::Write
+    }
+
     pub fn set_catalogs(&mut self, catalogs: Vec<CoreCatalog>) {
         self.catalogs = catalogs;
     }
 
     fn enter_panel(&mut self) {
+        self.confirm = None;
+        if self.adding() {
+            self.split.enter();
+            self.field = Field::Type;
+            self.type_query.clear();
+            let len = self.type_choices().len();
+            if len == 0 {
+                self.picker.close();
+            } else {
+                self.picker.open_at(0);
+            }
+            return;
+        }
         if self.rows.is_empty() {
             return;
         }
@@ -357,6 +633,18 @@ impl Systems {
             fields.push(Field::Core);
         }
         fields.push(Field::Args);
+        let count = self
+            .rows
+            .get(self.split.index)
+            .map(|row| row.rom_dirs.len())
+            .unwrap_or(0);
+        for index in 0..count {
+            fields.push(Field::Path(index));
+        }
+        fields.push(Field::AddPath);
+        fields.push(Field::Browse);
+        fields.push(Field::Rescan);
+        fields.push(Field::Delete);
         fields
     }
 
@@ -370,8 +658,12 @@ impl Systems {
                 }
                 Step::Stay
             }
-            Field::Args => {
-                let Some(edit) = self.args_mut() else {
+            Field::Args | Field::AddPath => {
+                let Some(edit) = (if self.field == Field::AddPath {
+                    self.draft_mut()
+                } else {
+                    self.args_mut()
+                }) else {
                     return Step::Stay;
                 };
                 if dir == NavDir::Left && !edit.replace && edit.caret == 0 {
@@ -382,12 +674,23 @@ impl Systems {
                 edit.move_caret(delta);
                 Step::Stay
             }
+            Field::Path(_) | Field::Browse | Field::Rescan | Field::Delete | Field::Type => {
+                if dir == NavDir::Left {
+                    self.split.leave();
+                }
+                Step::Stay
+            }
         }
     }
 
     fn args_mut(&mut self) -> Option<&mut LineEdit> {
         let index = self.split.index;
         self.rows.get_mut(index).map(|row| &mut row.args)
+    }
+
+    fn draft_mut(&mut self) -> Option<&mut LineEdit> {
+        let index = self.split.index;
+        self.rows.get_mut(index).map(|row| &mut row.path_draft)
     }
 
     fn open_current(&mut self) {
@@ -417,7 +720,7 @@ impl Systems {
                     .position(|choice| choice.path == current)
                     .unwrap_or(0)
             }
-            Field::Args => 0,
+            _ => 0,
         }
     }
 
@@ -462,10 +765,13 @@ impl Systems {
     }
 
     fn choice_len(&self) -> usize {
+        if self.adding() {
+            return self.type_choices().len();
+        }
         match self.field {
             Field::Emulator => self.emulator_choices().len(),
             Field::Core => self.core_choices().len(),
-            Field::Args => 0,
+            _ => 0,
         }
     }
 
@@ -481,7 +787,7 @@ impl Systems {
                 .into_iter()
                 .map(|choice| choice.label)
                 .collect(),
-            Field::Args => Vec::new(),
+            _ => Vec::new(),
         }
     }
 
@@ -519,7 +825,7 @@ impl Systems {
                     cursor,
                 )),
             ),
-            Field::Args => (None, None),
+            _ => (None, None),
         }
     }
 
@@ -598,6 +904,171 @@ impl Systems {
             .any(|emulator| emulator.id == id && emulator.kind == EmulatorKind::RetroArch)
     }
 
+    fn adding(&self) -> bool {
+        self.split.index >= self.rows.len()
+    }
+
+    fn list_len(&self) -> usize {
+        self.rows.len() + 1
+    }
+
+    fn type_choices(&self) -> Vec<&'static SystemEntry> {
+        let taken: Vec<_> = self.rows.iter().map(|row| row.id.as_str()).collect();
+        catalog::ordered()
+            .into_iter()
+            .filter(|entry| !taken.iter().any(|id| *id == entry.folder_id))
+            .collect()
+    }
+
+    fn type_menu(&self) -> Option<Menu> {
+        if self.split.side != Side::Panel {
+            return None;
+        }
+        let cursor = self.picker.cursor()?;
+        let items = self
+            .type_choices()
+            .into_iter()
+            .map(|entry| Item {
+                label: entry.display_name.clone(),
+                detail: type_detail(entry),
+            })
+            .collect();
+        Some(menu_from(items, cursor))
+    }
+
+    fn add_type(&mut self, index: usize) -> Step {
+        let choices = self.type_choices();
+        let Some(entry) = choices.get(index) else {
+            return Step::Stay;
+        };
+        if self.rows.iter().any(|row| row.id == entry.folder_id) {
+            return Step::Stay;
+        }
+        self.rows.push(SystemRow {
+            id: entry.folder_id.clone(),
+            name: entry.display_name.clone(),
+            extensions: entry.extensions.clone(),
+            emulator_id: None,
+            core: None,
+            args: LineEdit::plain(String::new()),
+            rom_dirs: Vec::new(),
+            path_draft: LineEdit::plain(String::new()),
+        });
+        let index = self.rows.len() - 1;
+        self.picker.close();
+        self.type_query.clear();
+        self.split.select(index);
+        self.split.enter();
+        self.field = Field::AddPath;
+        Step::Write
+    }
+
+    fn ask_delete(&mut self) -> Step {
+        let Some(row) = self.rows.get(self.split.index) else {
+            return Step::Stay;
+        };
+        self.picker.close();
+        self.confirm = Some(Confirm {
+            name: row.name.clone(),
+            slot: ConfirmSlot::Cancel,
+        });
+        Step::Stay
+    }
+
+    fn remove_selected(&mut self) -> Step {
+        if self.adding() || self.rows.is_empty() {
+            return Step::Stay;
+        }
+        let index = self.split.index.min(self.rows.len() - 1);
+        let id = self.rows[index].id.clone();
+        self.rows.remove(index);
+        self.dropped = Some(id);
+        if self.rows.is_empty() {
+            self.split.index = 0;
+        } else if self.split.index >= self.rows.len() {
+            self.split.index = self.rows.len() - 1;
+        }
+        self.picker.close();
+        self.split.leave();
+        self.field = Field::Emulator;
+        Step::Write
+    }
+
+    fn remove_path(&mut self, index: usize) -> Step {
+        let left = {
+            let Some(row) = self.rows.get_mut(self.split.index) else {
+                return Step::Stay;
+            };
+            if index >= row.rom_dirs.len() {
+                return Step::Stay;
+            }
+            row.rom_dirs.remove(index);
+            row.rom_dirs.len()
+        };
+        if left == 0 {
+            self.field = Field::AddPath;
+        } else if let Field::Path(current) = self.field {
+            if current >= left {
+                self.field = Field::Path(left - 1);
+            }
+        }
+        Step::Write
+    }
+
+    fn commit_draft(&mut self) -> Step {
+        let Some(row) = self.rows.get(self.split.index) else {
+            return Step::Stay;
+        };
+        let Some(path) = normalize_path(&row.path_draft.text) else {
+            return Step::Stay;
+        };
+        if row.rom_dirs.iter().any(|have| same_path(have, &path)) {
+            if let Some(row) = self.rows.get_mut(self.split.index) {
+                row.path_draft = LineEdit::plain(String::new());
+            }
+            return Step::Stay;
+        }
+        if let Some(row) = self.rows.get_mut(self.split.index) {
+            row.rom_dirs.push(path);
+            row.path_draft = LineEdit::plain(String::new());
+        }
+        Step::Write
+    }
+
+    fn push_type_query(&mut self, text: &str) {
+        let Some(extra) = query_letters(text) else {
+            return;
+        };
+        if !self.picker.is_open() {
+            let len = self.type_choices().len();
+            if len == 0 {
+                return;
+            }
+            self.picker.open_at(0);
+        }
+        let choices = self.type_choices();
+        let extended = format!("{}{extra}", self.type_query);
+        if let Some(index) = find_type(&choices, &extended) {
+            self.type_query = extended;
+            self.picker.seek(index);
+            return;
+        }
+        if let Some(index) = find_type(&choices, &extra) {
+            self.type_query = extra;
+            self.picker.seek(index);
+        }
+    }
+
+    fn pop_type_query(&mut self) {
+        if self.type_query.pop().is_none() {
+            return;
+        }
+        let choices = self.type_choices();
+        if let Some(index) = find_type(&choices, &self.type_query) {
+            self.picker.seek(index);
+        }
+    }
+
     fn emulator_label(&self, id: Option<&str>) -> String {
         let Some(id) = id else {
             return "None".to_string();
@@ -611,20 +1082,39 @@ impl Systems {
 }
 
 pub fn apply_systems(config: &mut Config, rows: &[SystemRow]) {
-    for console in &mut config.consoles {
-        let Some(row) = rows.iter().find(|row| row.id == console.id) else {
-            continue;
-        };
+    let mut next = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut console = config
+            .consoles
+            .iter()
+            .find(|console| console.id == row.id)
+            .cloned()
+            .unwrap_or_else(|| Console {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                rom_dirs: Vec::new(),
+                extensions: row.extensions.clone(),
+                emulator: None,
+                core: None,
+                extra_args: String::new(),
+                grid_art: GridArt::default(),
+                media: MediaToggles::default(),
+            });
         let retroarch = row.emulator_id.as_ref().is_some_and(|id| {
             config
                 .emulators
                 .iter()
                 .any(|emulator| emulator.id == *id && emulator.kind == EmulatorKind::RetroArch)
         });
+        console.name = row.name.clone();
+        console.extensions = row.extensions.clone();
+        console.rom_dirs = row.rom_dirs.iter().map(PathBuf::from).collect();
         console.emulator = row.emulator_id.clone().filter(|id| !id.is_empty());
         console.core = if retroarch { row.core.clone() } else { None };
         console.extra_args = row.args.text.clone();
+        next.push(console);
     }
+    config.consoles = next;
 }
 
 fn system_row(console: &Console) -> SystemRow {
@@ -635,7 +1125,106 @@ fn system_row(console: &Console) -> SystemRow {
         emulator_id: console.emulator.clone().filter(|id| !id.trim().is_empty()),
         core: console.core.clone(),
         args: LineEdit::plain(console.extra_args.clone()),
+        rom_dirs: console
+            .rom_dirs
+            .iter()
+            .map(|path| path.display().to_string())
+            .filter(|path| !path.trim().is_empty())
+            .collect(),
+        path_draft: LineEdit::plain(String::new()),
     }
+}
+
+fn empty_panel() -> Panel {
+    Panel {
+        empty: false,
+        name: String::new(),
+        emulator: "None".to_string(),
+        emulator_aimed: false,
+        core: "No core".to_string(),
+        core_missing: false,
+        core_enabled: false,
+        core_aimed: false,
+        args: LineEdit::plain(String::new()),
+        args_aimed: false,
+        paths: Vec::new(),
+        path_draft: LineEdit::plain(String::new()),
+        path_draft_aimed: false,
+        browse_aimed: false,
+        rescan_aimed: false,
+        delete_aimed: false,
+        adding: false,
+        types_available: false,
+        emulator_menu: None,
+        core_menu: None,
+        type_menu: None,
+        confirm: None,
+    }
+}
+
+fn type_detail(entry: &SystemEntry) -> String {
+    match config::console_year(&entry.folder_id) {
+        Some(year) => format!("{} · {year}", entry.folder_id),
+        None => entry.folder_id.clone(),
+    }
+}
+
+fn normalize_path(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let expanded = scanner::expand_home(Path::new(trimmed));
+    let shown = expanded.display().to_string();
+    let shown = shown.trim();
+    if shown.is_empty() {
+        None
+    } else {
+        Some(shown.to_string())
+    }
+}
+
+fn same_path(left: &str, right: &str) -> bool {
+    scanner::expand_home(Path::new(left.trim())) == scanner::expand_home(Path::new(right.trim()))
+}
+
+fn query_letters(text: &str) -> Option<String> {
+    let out: String = text
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn find_type(entries: &[&SystemEntry], query: &str) -> Option<usize> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let query = query.to_ascii_lowercase();
+    entries
+        .iter()
+        .position(|entry| entry.folder_id.to_ascii_lowercase().starts_with(&query))
+        .or_else(|| {
+            entries.iter().position(|entry| {
+                entry
+                    .display_name
+                    .to_ascii_lowercase()
+                    .split(|ch: char| !ch.is_ascii_alphanumeric())
+                    .filter(|word| !word.is_empty())
+                    .any(|word| word.starts_with(&query))
+            })
+        })
+        .or_else(|| {
+            entries.iter().position(|entry| {
+                entry.display_name.to_ascii_lowercase().contains(&query)
+                    || entry.folder_id.to_ascii_lowercase().contains(&query)
+            })
+        })
 }
 
 fn core_label(cores: &[Core], path: Option<&Path>) -> (String, bool) {
@@ -947,13 +1536,105 @@ mod tests {
         config.emulators.push(retroarch());
         config.consoles.push(snes());
         config.consoles[0].rom_dirs = vec![PathBuf::from("/keep")];
+        config.consoles[0].grid_art = GridArt::Screenshot;
+        config.consoles[0].media.manual = true;
         apply_systems(&mut config, screen.rows());
         assert_eq!(
             config.consoles[0].core.as_deref(),
             Some(Path::new("/cores/snes9x_libretro.so"))
         );
         assert_eq!(config.consoles[0].extra_args, "--region ntsc");
-        assert_eq!(config.consoles[0].rom_dirs, vec![PathBuf::from("/keep")]);
+        assert_eq!(
+            config.consoles[0].rom_dirs,
+            vec![PathBuf::from("/tmp/roms/snes")]
+        );
+        assert_eq!(config.consoles[0].grid_art, GridArt::Screenshot);
+        assert!(config.consoles[0].media.manual);
+    }
+
+    #[test]
+    fn add_skips_types_already_present_and_type_ahead_adds_one() {
+        let mut screen = screen();
+        screen.move_dir(NavDir::Down);
+        assert!(screen.list_rows().last().unwrap().add);
+        screen.move_dir(NavDir::Right);
+        let menu = screen.panel().type_menu.expect("type list");
+        assert!(menu
+            .items
+            .iter()
+            .all(|item| !item.detail.starts_with("snes ")));
+        screen.type_text("nes");
+        let menu = screen.panel().type_menu.expect("type list");
+        assert!(menu.items[menu.cursor].detail.starts_with("nes "));
+        assert_eq!(screen.rows().len(), 1);
+        assert_eq!(screen.confirm(), Step::Write);
+        let added = screen.rows().last().unwrap();
+        assert_eq!(added.id, "nes");
+        assert!(added.extensions.iter().any(|ext| ext == "nes"));
+        assert!(added.rom_dirs.is_empty());
+        assert!(screen.panel().path_draft_aimed);
+    }
+
+    #[test]
+    fn rom_paths_add_and_remove_and_tilde_expands() {
+        let root = tempfile::tempdir().unwrap();
+        let _env = crate::config::XdgEnv::sandbox(root.path());
+        let mut screen = screen();
+        screen.aim(Field::AddPath);
+        screen.type_text("/roms/a");
+        assert_eq!(screen.confirm(), Step::Write);
+        screen.type_text("~/roms/b");
+        assert_eq!(screen.confirm(), Step::Write);
+        screen.type_text("/roms/a");
+        assert_eq!(screen.confirm(), Step::Stay);
+        let home = root.path().join("home").join("roms").join("b");
+        assert_eq!(
+            screen.rows()[0].rom_dirs,
+            vec![
+                "/tmp/roms/snes".to_string(),
+                "/roms/a".to_string(),
+                home.display().to_string()
+            ]
+        );
+        screen.aim(Field::Path(1));
+        assert_eq!(screen.confirm(), Step::Write);
+        assert_eq!(
+            screen.rows()[0].rom_dirs,
+            vec!["/tmp/roms/snes".to_string(), home.display().to_string()]
+        );
+        let mut config = Config::default();
+        config.emulators.push(retroarch());
+        config.consoles.push(snes());
+        apply_systems(&mut config, screen.rows());
+        assert_eq!(config.consoles[0].rom_dirs[1], home);
+    }
+
+    #[test]
+    fn delete_starts_on_cancel_and_drops_the_system_from_config() {
+        let mut screen = screen();
+        screen.aim(Field::Delete);
+        assert_eq!(screen.confirm(), Step::Stay);
+        assert_eq!(
+            screen.panel().confirm.expect("dialog").slot,
+            ConfirmSlot::Cancel
+        );
+        assert_eq!(screen.confirm(), Step::Stay);
+        assert!(screen.panel().confirm.is_none());
+        assert_eq!(screen.rows().len(), 1);
+        screen.aim(Field::Delete);
+        assert_eq!(screen.confirm(), Step::Stay);
+        screen.move_dir(NavDir::Right);
+        assert_eq!(
+            screen.panel().confirm.expect("dialog").slot,
+            ConfirmSlot::Delete
+        );
+        assert_eq!(screen.confirm(), Step::Write);
+        assert!(screen.rows().is_empty());
+        assert_eq!(screen.take_dropped().as_deref(), Some("snes"));
+        let mut config = Config::default();
+        config.consoles.push(snes());
+        apply_systems(&mut config, screen.rows());
+        assert!(config.consoles.is_empty());
     }
 
     fn listed_core(name: &str, label: &str, systemname: &str, extensions: &[&str]) -> Core {

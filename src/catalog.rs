@@ -19,14 +19,46 @@ pub fn systems() -> &'static [SystemEntry] {
 }
 
 pub fn by_id() -> HashMap<&'static str, &'static SystemEntry> {
-    systems().iter().map(|s| (s.folder_id.as_str(), s)).collect()
+    systems()
+        .iter()
+        .map(|s| (s.folder_id.as_str(), s))
+        .collect()
 }
 
 const POPULAR: &[&str] = &[
-    "nes", "snes", "n64", "gc", "wii", "gb", "gbc", "gba", "nds", "n3ds", "genesis", "megadrive",
-    "mastersystem", "gamegear", "sega32x", "segacd", "saturn", "dreamcast", "neogeo", "ngp", "ngpc",
-    "psx", "ps2", "psp", "atari2600", "atari7800", "atarilynx", "pcengine", "tg16", "wonderswan",
-    "virtualboy", "xbox", "switch",
+    "nes",
+    "snes",
+    "n64",
+    "gc",
+    "wii",
+    "gb",
+    "gbc",
+    "gba",
+    "nds",
+    "n3ds",
+    "genesis",
+    "megadrive",
+    "mastersystem",
+    "gamegear",
+    "sega32x",
+    "segacd",
+    "saturn",
+    "dreamcast",
+    "neogeo",
+    "ngp",
+    "ngpc",
+    "psx",
+    "ps2",
+    "psp",
+    "atari2600",
+    "atari7800",
+    "atarilynx",
+    "pcengine",
+    "tg16",
+    "wonderswan",
+    "virtualboy",
+    "xbox",
+    "switch",
 ];
 
 pub fn ordered() -> Vec<&'static SystemEntry> {
@@ -37,7 +69,10 @@ pub fn ordered() -> Vec<&'static SystemEntry> {
             out.push(entry);
         }
     }
-    let mut rest: Vec<_> = all.iter().filter(|s| !POPULAR.contains(&s.folder_id.as_str())).collect();
+    let mut rest: Vec<_> = all
+        .iter()
+        .filter(|s| !POPULAR.contains(&s.folder_id.as_str()))
+        .collect();
     rest.sort_by(|a, b| a.display_name.cmp(&b.display_name));
     out.extend(rest);
     out
@@ -45,7 +80,10 @@ pub fn ordered() -> Vec<&'static SystemEntry> {
 
 pub fn match_folder(name: &str) -> Option<&'static SystemEntry> {
     let key = name.to_ascii_lowercase();
-    if let Some(entry) = systems().iter().find(|s| s.folder_id.eq_ignore_ascii_case(&key)) {
+    if let Some(entry) = systems()
+        .iter()
+        .find(|s| s.folder_id.eq_ignore_ascii_case(&key))
+    {
         return Some(entry);
     }
     let alias = match key.as_str() {
