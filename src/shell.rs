@@ -27,6 +27,7 @@ use crate::launcher;
 use crate::options::{
     self, options_key, Command as OptionsCommand, Options, Section as OptionsSection,
 };
+use crate::picker::{self, Jump};
 use crate::scanner;
 use crate::scraper::{self, NameSearch, ScrapeUpdate};
 use crate::scraper_settings::{
@@ -87,6 +88,8 @@ pub struct Shell {
     options: Option<Options>,
     emulator_scroll: ScrollHandle,
     systems_scroll: ScrollHandle,
+    picker_scroll: ScrollHandle,
+    picker_mark: Option<(SystemField, usize)>,
     options_scroll: ScrollHandle,
     /// Closing the dialog drops whatever control had focus. The next frame
     /// puts the keyboard back on the shell.
@@ -191,6 +194,8 @@ impl Shell {
             options: None,
             emulator_scroll: ScrollHandle::new(),
             systems_scroll: ScrollHandle::new(),
+            picker_scroll: ScrollHandle::new(),
+            picker_mark: None,
             options_scroll: ScrollHandle::new(),
             refocus: false,
             play_tx,
@@ -937,11 +942,21 @@ impl Shell {
         let modified =
             keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
         if key == "escape" {
-            self.finish_systems();
+            self.back_systems();
             cx.notify();
         } else if key == "enter" {
             self.confirm_systems();
             cx.notify();
+        } else if let Some(jump) = list_jump(key) {
+            if !modified {
+                let moved = self
+                    .systems
+                    .as_mut()
+                    .is_some_and(|dialog| dialog.jump(jump));
+                if moved {
+                    cx.notify();
+                }
+            }
         } else if key == "backspace" {
             if let Some(dialog) = &mut self.systems {
                 dialog.backspace();
@@ -985,7 +1000,7 @@ impl Shell {
                     changed = true;
                 }
                 Some(PadAction::Back) => {
-                    self.finish_systems();
+                    self.back_systems();
                     changed = true;
                 }
                 Some(PadAction::Favorite | PadAction::Menu) | None => {}
@@ -1316,10 +1331,28 @@ impl Shell {
         self.systems = Some(Systems::open(&config, catalogs));
     }
 
+    fn back_systems(&mut self) {
+        let closed_picker = self.systems.as_mut().is_some_and(|dialog| dialog.dismiss());
+        if !closed_picker {
+            self.finish_systems();
+        }
+    }
+
     fn finish_systems(&mut self) {
         if self.write_systems() {
             self.systems = None;
             self.refocus = true;
+        }
+    }
+
+    fn pick_system(&mut self, index: usize) {
+        let step = self
+            .systems
+            .as_mut()
+            .map(|dialog| dialog.choose(index))
+            .unwrap_or(SystemStep::Stay);
+        if step == SystemStep::Write {
+            self.write_systems();
         }
     }
 
@@ -2129,12 +2162,34 @@ impl Shell {
         }
     }
 
-    fn reveal_systems(&mut self) {
-        let Some(dialog) = &self.systems else {
-            return;
+    fn reveal_systems(&mut self, window: &mut Window) {
+        if let Some(dialog) = &self.systems {
+            if self.systems_scroll.bounds().size.height > px(0.) {
+                self.systems_scroll.scroll_to_item(dialog.selected_index());
+            }
+        }
+        if self.reveal_system_picker() {
+            window.request_animation_frame();
+        }
+    }
+
+    fn reveal_system_picker(&mut self) -> bool {
+        let mark = self.systems.as_ref().and_then(|dialog| dialog.open_mark());
+        if mark == self.picker_mark {
+            return false;
+        }
+        let Some((_, cursor)) = mark else {
+            self.picker_scroll.set_offset(point(px(0.), px(0.)));
+            self.picker_mark = None;
+            return false;
         };
-        if self.systems_scroll.bounds().size.height > px(0.) {
-            self.systems_scroll.scroll_to_item(dialog.selected_index());
+        let scroll = &self.picker_scroll;
+        if scroll.bounds().size.height > px(0.) && scroll.children_count() > cursor {
+            scroll.scroll_to_item(cursor);
+            self.picker_mark = mark;
+            false
+        } else {
+            true
         }
     }
 
@@ -2173,7 +2228,7 @@ impl Render for Shell {
         self.reveal_selection();
         self.reveal_import();
         self.reveal_emulators();
-        self.reveal_systems();
+        self.reveal_systems(window);
         self.reveal_options();
         if let Some(options) = &self.options {
             let width = options.cover_width();
@@ -2241,6 +2296,7 @@ impl Render for Shell {
             .children(systems_screen(
                 self.systems.as_ref(),
                 &self.systems_scroll,
+                &self.picker_scroll,
                 cx,
             ))
             .children(options_screen(
@@ -3785,6 +3841,16 @@ enum ArrowKey {
     Propagate,
 }
 
+fn list_jump(key: &str) -> Option<Jump> {
+    match key {
+        "home" => Some(Jump::Home),
+        "end" => Some(Jump::End),
+        "pageup" => Some(Jump::PageUp),
+        "pagedown" => Some(Jump::PageDown),
+        _ => None,
+    }
+}
+
 fn arrow_dir(keystroke: &Keystroke) -> Option<NavDir> {
     match key_from_parts(keystroke.key.as_ref(), keystroke.key_char.as_deref(), false) {
         Some(Key::Arrow(dir)) => Some(dir),
@@ -4508,6 +4574,7 @@ fn core_list(cores: &[crate::emulators::CoreLine], cx: &Context<Shell>) -> impl 
 fn systems_screen(
     dialog: Option<&Systems>,
     scroll: &ScrollHandle,
+    picker_scroll: &ScrollHandle,
     cx: &Context<Shell>,
 ) -> Option<gpui_kit::AnyElement> {
     let dialog = dialog?;
@@ -4516,7 +4583,7 @@ fn systems_screen(
         .into_iter()
         .map(|row| system_list_row(row, cx).into_any_element())
         .collect::<Vec<_>>();
-    let panel = systems_panel(&dialog.panel(), cx);
+    let panel = systems_panel(&dialog.panel(), picker_scroll, cx);
     Some(
         split::screen(
             "systems-list",
@@ -4545,7 +4612,11 @@ fn system_list_row(row: crate::systems::ListRow, cx: &Context<Shell>) -> impl In
     )
 }
 
-fn systems_panel(panel: &crate::systems::Panel, cx: &Context<Shell>) -> impl IntoElement {
+fn systems_panel(
+    panel: &crate::systems::Panel,
+    scroll: &ScrollHandle,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
     if panel.empty {
         return hint("No systems in this library.", cx).into_any_element();
     }
@@ -4553,22 +4624,27 @@ fn systems_panel(panel: &crate::systems::Panel, cx: &Context<Shell>) -> impl Int
         .w_full()
         .flex()
         .flex_col()
+        .flex_shrink_0()
         .gap(px(12.))
         .child(heading(&panel.name))
         .child(field_label("Emulator", cx))
-        .child(system_press(
+        .child(system_choice(
             "system-emulator".to_string(),
             format!("Emulator: {}", panel.emulator),
             panel.emulator_aimed,
             SystemField::Emulator,
+            panel.emulator_menu.as_ref(),
+            scroll,
             cx,
         ));
     if panel.core_enabled {
-        page = page.child(field_label("Core", cx)).child(system_press(
+        page = page.child(field_label("Core", cx)).child(system_choice(
             "system-core".to_string(),
             format!("Core: {}", panel.core),
             panel.core_aimed,
             SystemField::Core,
+            panel.core_menu.as_ref(),
+            scroll,
             cx,
         ));
         if panel.core_missing {
@@ -5205,6 +5281,32 @@ fn emulator_press(
         )))
 }
 
+fn system_choice(
+    id: String,
+    label: String,
+    aimed: bool,
+    field: SystemField,
+    menu: Option<&crate::picker::Menu>,
+    scroll: &ScrollHandle,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let mut column = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .gap(px(4.))
+        .child(system_press(id, label, aimed, field, cx));
+    if let Some(menu) = menu {
+        column = column.child(picker::menu(menu, scroll, cx, |this, index, window, cx| {
+            this.pick_system(index);
+            this.focus_handle.focus(window, cx);
+            cx.notify();
+        }));
+    }
+    column
+}
+
 fn system_press(
     id: String,
     label: String,
@@ -5224,9 +5326,8 @@ fn system_press(
             button(id, label, ButtonVariant::Secondary, cx).on_click(cx.listener(
                 move |this: &mut Shell, _: &ClickEvent, window, cx| {
                     if let Some(dialog) = &mut this.systems {
-                        dialog.aim(field);
+                        dialog.click_field(field);
                     }
-                    this.confirm_systems();
                     this.focus_handle.focus(window, cx);
                     cx.notify();
                 },
