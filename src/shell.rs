@@ -17,11 +17,6 @@ use crate::game_menu::{
     game_menu_key, Aim, DeleteSlot, Overlay, OverlayCommand, RenameSlot, ScrapeSlot,
 };
 use crate::gamepad::{NavDir, PadAction, PadHeld};
-use crate::import_wizard::{
-    import_key, ChooseSlot, FolderSlot, ImportCommand, ImportFocus, ImportWizard, PickSlot,
-    RootSlot, SystemsSlot, View as ImportView,
-};
-use crate::importer::{self, ImportUpdate};
 use crate::input_repeat::HoldRepeat;
 use crate::launcher;
 use crate::options::{
@@ -78,11 +73,6 @@ pub struct Shell {
     search: Option<std::sync::mpsc::Receiver<NameSearch>>,
     apply: Option<std::sync::mpsc::Receiver<ScrapeUpdate>>,
     scrape_scroll: ScrollHandle,
-    /// Import ROMs. First run with no consoles reaches it from the empty pane.
-    wizard: Option<ImportWizard>,
-    import_rx: Option<std::sync::mpsc::Receiver<ImportUpdate>>,
-    import_scroll: ScrollHandle,
-    pick_scroll: ScrollHandle,
     emulators: Option<Emulators>,
     systems: Option<Systems>,
     options: Option<Options>,
@@ -185,10 +175,6 @@ impl Shell {
             search: None,
             apply: None,
             scrape_scroll: ScrollHandle::new(),
-            wizard: None,
-            import_rx: None,
-            import_scroll: ScrollHandle::new(),
-            pick_scroll: ScrollHandle::new(),
             emulators: None,
             systems: None,
             options: None,
@@ -226,13 +212,6 @@ impl Shell {
         }
         if self.emulators.is_some() {
             changed |= self.poll_emulator_pad(&events, cx);
-            if changed {
-                cx.notify();
-            }
-            return;
-        }
-        if self.wizard.is_some() {
-            changed |= self.poll_wizard_pad(&events, cx);
             if changed {
                 cx.notify();
             }
@@ -342,24 +321,8 @@ impl Shell {
             self.on_emulator_key(&event.keystroke, false, cx);
             return;
         }
-        if self.wizard.is_some() {
-            self.on_wizard_key(&event.keystroke, false, cx);
-            return;
-        }
         if self.browse.overlay_open() {
             self.on_overlay_key(&event.keystroke, false, cx);
-            return;
-        }
-        if !event.is_held
-            && import_key(
-                event.keystroke.key.as_str(),
-                event.keystroke.key_char.as_deref(),
-                event.keystroke.modifiers.control,
-            )
-        {
-            self.open_import();
-            cx.notify();
-            cx.stop_propagation();
             return;
         }
         if !event.is_held
@@ -567,120 +530,11 @@ impl Shell {
             self.on_emulator_key(&event.keystroke, true, cx);
             return;
         }
-        if self.wizard.is_some() {
-            self.on_wizard_key(&event.keystroke, true, cx);
-            return;
-        }
         if self.browse.overlay_open() {
             self.on_overlay_key(&event.keystroke, true, cx);
             return;
         }
         self.on_arrow(&event.keystroke, true, cx);
-    }
-
-    /// Arrows and Tab move the wizard. Enter confirms the focused control.
-    /// Esc closes, except while a scan is writing the library.
-    fn on_wizard_key(&mut self, keystroke: &Keystroke, release: bool, cx: &mut Context<Self>) {
-        if let Some(dir) = arrow_dir(keystroke) {
-            let modified = keystroke.modifiers.control
-                || keystroke.modifiers.alt
-                || keystroke.modifiers.platform;
-            if !(modified && !release) {
-                let now = monotonic_ms(self.nav_started);
-                if release {
-                    self.hold.release(&self.input, dir, now);
-                } else if self.hold.press(&self.input, dir, now) > 0 {
-                    if let Some(wizard) = &mut self.wizard {
-                        wizard.move_dir(dir);
-                    }
-                    cx.notify();
-                }
-            }
-            cx.stop_propagation();
-            return;
-        }
-        if release {
-            cx.stop_propagation();
-            return;
-        }
-        let key = keystroke.key.as_str();
-        let modified =
-            keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
-        if key == "escape" {
-            self.dismiss_import();
-            cx.notify();
-        } else if key == "enter" {
-            self.confirm_import(cx);
-            cx.notify();
-        } else if key == "tab" {
-            if let Some(wizard) = &mut self.wizard {
-                wizard.tab(keystroke.modifiers.shift);
-            }
-            cx.notify();
-        } else if key == "backspace" {
-            if let Some(wizard) = &mut self.wizard {
-                wizard.backspace();
-            }
-            cx.notify();
-        } else if key == "delete" {
-            if let Some(wizard) = &mut self.wizard {
-                wizard.delete_forward();
-            }
-            cx.notify();
-        } else if key == "space" && !modified {
-            let typing = self
-                .wizard
-                .as_ref()
-                .is_some_and(|wizard| wizard.accepts_text());
-            let toggled = self
-                .wizard
-                .as_mut()
-                .is_some_and(|wizard| wizard.toggle_focused());
-            if typing {
-                if let Some(wizard) = &mut self.wizard {
-                    wizard.type_text(" ");
-                }
-            } else if !toggled {
-                self.confirm_import(cx);
-            }
-            cx.notify();
-        } else if !modified {
-            if let Some(text) = typed_text(keystroke) {
-                if let Some(wizard) = &mut self.wizard {
-                    wizard.type_text(text);
-                }
-                cx.notify();
-            }
-        }
-        cx.stop_propagation();
-    }
-
-    fn poll_wizard_pad(&mut self, events: &[gilrs::EventType], cx: &mut Context<Self>) -> bool {
-        let mut changed = false;
-        for event in events {
-            match self.pad.apply(event) {
-                Some(PadAction::Confirm) => {
-                    self.confirm_import(cx);
-                    changed = true;
-                }
-                Some(PadAction::Back) => {
-                    self.dismiss_import();
-                    changed = true;
-                }
-                Some(PadAction::Favorite | PadAction::Menu) | None => {}
-            }
-        }
-        let now = monotonic_ms(self.nav_started);
-        let (step_x, step_y) =
-            self.hold
-                .poll(&self.input, self.pad.horizontal(), self.pad.vertical(), now);
-        for dir in [step_x, step_y].into_iter().flatten() {
-            if let Some(wizard) = &mut self.wizard {
-                wizard.move_dir(dir);
-                changed = true;
-            }
-        }
-        changed
     }
 
     fn poll_emulator_pad(&mut self, events: &[gilrs::EventType], cx: &mut Context<Self>) -> bool {
@@ -919,9 +773,7 @@ impl Shell {
                         .as_mut()
                         .map(|dialog| dialog.move_dir(dir))
                         .unwrap_or(SystemStep::Stay);
-                    if step == SystemStep::Write {
-                        self.write_systems();
-                    }
+                    self.apply_system_step(step, cx);
                     cx.notify();
                 }
             }
@@ -945,7 +797,7 @@ impl Shell {
             self.back_systems();
             cx.notify();
         } else if key == "enter" {
-            self.confirm_systems();
+            self.confirm_systems(cx);
             cx.notify();
         } else if let Some(jump) = list_jump(key) {
             if !modified {
@@ -977,7 +829,7 @@ impl Shell {
                     dialog.type_text(" ");
                 }
             } else {
-                self.confirm_systems();
+                self.confirm_systems(cx);
             }
             cx.notify();
         } else if !modified {
@@ -991,12 +843,12 @@ impl Shell {
         cx.stop_propagation();
     }
 
-    fn poll_systems_pad(&mut self, events: &[gilrs::EventType], _cx: &mut Context<Self>) -> bool {
+    fn poll_systems_pad(&mut self, events: &[gilrs::EventType], cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         for event in events {
             match self.pad.apply(event) {
                 Some(PadAction::Confirm) => {
-                    self.confirm_systems();
+                    self.confirm_systems(cx);
                     changed = true;
                 }
                 Some(PadAction::Back) => {
@@ -1016,20 +868,14 @@ impl Shell {
                 .as_mut()
                 .map(|dialog| dialog.move_dir(dir))
                 .unwrap_or(SystemStep::Stay);
-            if step == SystemStep::Write {
-                self.write_systems();
-            }
+            self.apply_system_step(step, cx);
             changed = true;
         }
         changed
     }
 
     fn screen_busy(&self) -> bool {
-        self.import_rx.is_some()
-            || self.wizard.is_some()
-            || self.emulators.is_some()
-            || self.systems.is_some()
-            || self.options.is_some()
+        self.emulators.is_some() || self.systems.is_some() || self.options.is_some()
     }
 
     fn open_options(&mut self, section: OptionsSection) {
@@ -1345,25 +1191,42 @@ impl Shell {
         }
     }
 
-    fn pick_system(&mut self, index: usize) {
+    fn pick_system(&mut self, index: usize, cx: &mut Context<Self>) {
         let step = self
             .systems
             .as_mut()
             .map(|dialog| dialog.choose(index))
             .unwrap_or(SystemStep::Stay);
-        if step == SystemStep::Write {
-            self.write_systems();
-        }
+        self.apply_system_step(step, cx);
     }
 
-    fn confirm_systems(&mut self) {
+    fn confirm_systems(&mut self, cx: &mut Context<Self>) {
         let step = self
             .systems
             .as_mut()
             .map(|dialog| dialog.confirm())
             .unwrap_or(SystemStep::Stay);
-        if step == SystemStep::Write {
-            self.write_systems();
+        self.apply_system_step(step, cx);
+    }
+
+    fn apply_system_step(&mut self, step: SystemStep, cx: &mut Context<Self>) {
+        match step {
+            SystemStep::Stay => {}
+            SystemStep::Write => {
+                self.write_systems();
+            }
+            SystemStep::Rescan => {
+                if self.write_systems() {
+                    if let Some(id) = self
+                        .systems
+                        .as_ref()
+                        .and_then(|dialog| dialog.selected_id())
+                    {
+                        self.rescan_console_id(&id);
+                    }
+                }
+            }
+            SystemStep::Browse => self.pick_folder(cx),
         }
     }
 
@@ -1386,18 +1249,43 @@ impl Shell {
             self.browse.status = format!("Could not save config ({err}).");
             return false;
         }
+        if let Some(id) = self
+            .systems
+            .as_mut()
+            .and_then(|dialog| dialog.take_dropped())
+        {
+            match database::init_db() {
+                Ok(conn) => {
+                    if let Err(err) = database::delete_console_library(&conn, &id) {
+                        self.browse.status =
+                            format!("Removed {id} from config. Library rows stayed ({err}).");
+                    }
+                }
+                Err(err) => {
+                    self.browse.status =
+                        format!("Removed {id} from config. Library rows stayed ({err}).");
+                }
+            }
+        }
         self.copy_library(&config);
         true
     }
 
     fn copy_library(&mut self, config: &config::Config) {
         self.browse.library.emulators = config.emulators.clone();
+        if self.browse.library.kind == LibraryKind::Disk {
+            self.browse.sync_consoles(&config.consoles);
+            return;
+        }
         for shelf in &mut self.browse.library.shelves {
             if let Some(console) = config
                 .consoles
                 .iter()
                 .find(|item| item.id == shelf.console.id)
             {
+                shelf.console.name = console.name.clone();
+                shelf.console.extensions = console.extensions.clone();
+                shelf.console.rom_dirs = console.rom_dirs.clone();
                 shelf.console.emulator = console.emulator.clone();
                 shelf.console.core = console.core.clone();
                 shelf.console.extra_args = console.extra_args.clone();
@@ -1405,49 +1293,8 @@ impl Shell {
         }
     }
 
-    fn open_import(&mut self) {
-        if self.screen_busy() {
-            return;
-        }
-        self.browse.close_overlay();
-        self.search = None;
-        self.wizard = Some(ImportWizard::open());
-    }
-
-    fn dismiss_import(&mut self) {
-        if self.import_rx.is_some()
-            || self
-                .wizard
-                .as_ref()
-                .is_some_and(|wizard| wizard.blocks_escape())
-        {
-            return;
-        }
-        self.wizard = None;
-    }
-
-    fn confirm_import(&mut self, cx: &mut Context<Self>) {
-        if self.import_rx.is_some() {
-            return;
-        }
-        let Some(command) = self.wizard.as_mut().map(|wizard| wizard.confirm()) else {
-            return;
-        };
-        match command {
-            ImportCommand::None => {}
-            ImportCommand::Close => self.wizard = None,
-            ImportCommand::Discover(path) => {
-                self.import_rx = Some(importer::spawn_discover(path));
-            }
-            ImportCommand::Apply(choices) => {
-                self.import_rx = Some(importer::spawn_apply(choices));
-            }
-            ImportCommand::Browse => self.pick_folder(cx),
-        }
-    }
-
     /// Browse opens a folder through the XDG desktop portal
-    /// via [`App::prompt_for_paths`]. The path field stays editable either way.
+    /// via [`App::prompt_for_paths`]. A typed path still works when the portal is unavailable.
     fn pick_folder(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -1479,45 +1326,17 @@ impl Shell {
         match picked {
             Picked::Cancel => {}
             Picked::Path(path) => {
-                if let Some(wizard) = &mut self.wizard {
-                    wizard.set_path(path);
+                let step = self
+                    .systems
+                    .as_mut()
+                    .map(|dialog| dialog.add_rom_dir(path))
+                    .unwrap_or(SystemStep::Stay);
+                if step == SystemStep::Write {
+                    self.write_systems();
                 }
             }
-            Picked::Failed(message) => {
-                if let Some(wizard) = &mut self.wizard {
-                    wizard.set_error(message);
-                } else {
-                    self.browse.status = message;
-                }
-            }
+            Picked::Failed(message) => self.browse.status = message,
         }
-    }
-
-    fn reload_library(&mut self, status: String) {
-        let cover = self.browse.cover_width;
-        let details = self.browse.details_open;
-        let filter = self.browse.filter;
-        let library = match config::load_config() {
-            Ok(config) => match database::init_db() {
-                Ok(conn) => crate::browse::from_config(&config, &conn),
-                Err(err) => {
-                    self.browse.status = format!("Could not open the library database ({err}).");
-                    return;
-                }
-            },
-            Err(err) => {
-                self.browse.status = format!("Could not read config ({err}).");
-                return;
-            }
-        };
-        self.browse = Browse::with_cover_width(library, cover);
-        self.browse.details_open = details;
-        self.browse.filter = filter;
-        self.revealed_console = None;
-        self.revealed_game = None;
-        self.revealed_columns = 0;
-        self.input = load_input();
-        self.browse.status = status;
     }
 
     /// Arrows share the hold clock with the pad. Escape closes. Enter confirms.
@@ -1794,53 +1613,7 @@ impl Shell {
             }
             changed = true;
         }
-        changed |= self.poll_import();
         changed
-    }
-
-    fn poll_import(&mut self) -> bool {
-        let update = self.import_rx.as_ref().and_then(|rx| match rx.try_recv() {
-            Ok(update) => Some(update),
-            Err(std::sync::mpsc::TryRecvError::Empty) => None,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Some(ImportUpdate::Failed("Import stopped.".into()))
-            }
-        });
-        let Some(update) = update else {
-            return false;
-        };
-        match update {
-            ImportUpdate::Discover(found) => {
-                self.import_rx = None;
-                if let Some(wizard) = &mut self.wizard {
-                    wizard.show_folders(found);
-                }
-            }
-            ImportUpdate::Status(text) => {
-                if let Some(wizard) = &mut self.wizard {
-                    wizard.note_progress(text);
-                }
-            }
-            ImportUpdate::Done { systems, games } => {
-                self.import_rx = None;
-                self.wizard = None;
-                let status = if systems == 0 {
-                    "Nothing new to import.".into()
-                } else {
-                    format!("Scanned {games} games into {systems} systems.")
-                };
-                self.reload_library(status);
-            }
-            ImportUpdate::Failed(message) => {
-                self.import_rx = None;
-                if let Some(wizard) = &mut self.wizard {
-                    wizard.fail(message);
-                } else {
-                    self.browse.status = message;
-                }
-            }
-        }
-        true
     }
 
     fn store_media(&mut self, game_id: &str, media: &Media) {
@@ -1993,6 +1766,14 @@ impl Shell {
     }
 
     fn rescan_current(&mut self) {
+        let Some(id) = self.browse.shelf().map(|shelf| shelf.console.id.clone()) else {
+            self.browse.status = "Select a system before rescanning.".into();
+            return;
+        };
+        self.rescan_console_id(&id);
+    }
+
+    fn rescan_console_id(&mut self, id: &str) {
         if self.rescan_rx.is_some() {
             self.browse.status = "A rescan is already running.".into();
             return;
@@ -2001,7 +1782,14 @@ impl Shell {
             self.browse.status = "Demo library. Rescan needs a library on disk.".into();
             return;
         }
-        let Some(console) = self.browse.shelf().map(|shelf| shelf.console.clone()) else {
+        let Some(console) = self
+            .browse
+            .library
+            .shelves
+            .iter()
+            .find(|shelf| shelf.console.id == id)
+            .map(|shelf| shelf.console.clone())
+        else {
             self.browse.status = "Select a system before rescanning.".into();
             return;
         };
@@ -2201,22 +1989,6 @@ impl Shell {
             self.options_scroll.scroll_to_item(dialog.selected_index());
         }
     }
-
-    fn reveal_import(&mut self) {
-        let Some(wizard) = &self.wizard else {
-            return;
-        };
-        if self.import_scroll.bounds().size.height > px(0.) {
-            if let Some(row) = wizard.systems_row() {
-                self.import_scroll.scroll_to_item(row);
-            }
-        }
-        if self.pick_scroll.bounds().size.height > px(0.) {
-            if let Some(row) = wizard.pick_row() {
-                self.pick_scroll.scroll_to_item(row);
-            }
-        }
-    }
 }
 
 impl Render for Shell {
@@ -2226,7 +1998,6 @@ impl Render for Shell {
         self.browse
             .set_columns(columns_for(width, self.browse.details_open, frame.width));
         self.reveal_selection();
-        self.reveal_import();
         self.reveal_emulators();
         self.reveal_systems(window);
         self.reveal_options();
@@ -2282,12 +2053,6 @@ impl Render for Shell {
             ))
             .child(status_line(&self.browse, &self.cover_slider, window, cx))
             .children(game_dialog(&self.browse, &self.scrape_scroll, cx))
-            .children(import_dialog(
-                self.wizard.as_ref(),
-                &self.import_scroll,
-                &self.pick_scroll,
-                cx,
-            ))
             .children(emulator_screen(
                 self.emulators.as_ref(),
                 &self.emulator_scroll,
@@ -2343,7 +2108,6 @@ fn header(
             .flex_shrink_0()
             .items_center()
             .gap(px(2.))
-            .child(import_button(cx))
             .child(emulators_button(cx))
             .child(systems_button(cx))
             .child(scraper_button(cx))
@@ -2500,17 +2264,6 @@ fn emulators_button(cx: &Context<Shell>) -> impl IntoElement {
         this.focus_handle.focus(window, cx);
         cx.notify();
     }))
-}
-
-fn import_button(cx: &Context<Shell>) -> impl IntoElement {
-    button("import-roms", "Import ROMs", ButtonVariant::Secondary, cx)
-        .px(px(4.))
-        .flex_shrink_0()
-        .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-            this.open_import();
-            this.focus_handle.focus(window, cx);
-            cx.notify();
-        }))
 }
 
 fn scrape_button(missing: bool, cx: &Context<Shell>) -> impl IntoElement {
@@ -2819,13 +2572,13 @@ fn grid(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl Int
             theme.background
         });
     let Some(shelf) = shelf else {
-        return pane.child(import_empty(cx));
+        return pane.child(library_empty(cx));
     };
     let console_name = shelf.console.name.clone();
     let visible: Vec<&Game> = browse.visible_games().collect();
     if visible.is_empty() {
         if shelf.games.is_empty() {
-            return pane.child(import_empty(cx));
+            return pane.child(library_empty(cx));
         }
         if !browse.query().trim().is_empty() {
             return pane.child(empty_state(
@@ -3266,7 +3019,7 @@ fn status_line(
 ) -> impl IntoElement {
     let theme = cx.omarchy();
     let text = if browse.status.is_empty() {
-        "Ctrl+I imports. Ctrl+E emulators. Ctrl+P systems. Ctrl+O options. Ctrl+G scraper."
+        "Ctrl+E emulators. Ctrl+P systems. Ctrl+O options. Ctrl+G scraper."
     } else {
         browse.status.as_str()
     };
@@ -3772,10 +3525,8 @@ fn delete_notes(game: &Game, options: DeleteOptions) -> Vec<String> {
 fn rescan_console(
     console: crate::types::Console,
 ) -> Result<(String, String, Vec<Game>, database::LibraryStats), String> {
-    let scanned = scanner::scan_console(&console).map_err(|err| err.to_string())?;
     let conn = database::init_db().map_err(|err| err.to_string())?;
-    let games = database::replace_scanned_games(&conn, &console.id, &scanned)
-        .map_err(|err| err.to_string())?;
+    let games = scanner::rescan(&console, &conn).map_err(|err| err.to_string())?;
     let stats = crate::browse::stats_of(&games);
     Ok((console.id, console.name, games, stats))
 }
@@ -3864,7 +3615,7 @@ enum Picked {
     Failed(String),
 }
 
-fn import_empty(cx: &Context<Shell>) -> impl IntoElement {
+fn library_empty(cx: &Context<Shell>) -> impl IntoElement {
     let theme = cx.omarchy();
     div()
         .size_full()
@@ -3883,23 +3634,23 @@ fn import_empty(cx: &Context<Shell>) -> impl IntoElement {
         )
         .child(
             div()
-                .max_w(px(420.))
+                .max_w(px(460.))
                 .text_center()
                 .text_color(theme.secondary)
                 .whitespace_normal()
                 .child(
-                    "Import a ROM folder to add systems to the sidebar and scan games. Only paths are stored.",
+                    "Add a system in Manage Systems, set its ROM folders, and rescan. Only paths are stored.",
                 ),
         )
         .child(
             button(
-                "empty-import",
-                "Import ROMs",
+                "empty-systems",
+                "Manage Systems",
                 ButtonVariant::Primary,
                 cx,
             )
             .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-                this.open_import();
+                this.open_systems();
                 this.focus_handle.focus(window, cx);
                 cx.notify();
             })),
@@ -3917,475 +3668,6 @@ fn import_empty(cx: &Context<Shell>) -> impl IntoElement {
                 cx.notify();
             })),
         )
-}
-
-fn import_dialog(
-    wizard: Option<&ImportWizard>,
-    import_scroll: &ScrollHandle,
-    pick_scroll: &ScrollHandle,
-    cx: &Context<Shell>,
-) -> Option<gpui_kit::AnyElement> {
-    let wizard = wizard?;
-    let error = wizard.error().map(str::to_string);
-    let snap = match wizard.view() {
-        ImportView::Choose { slot } => ImportSnap::Choose(slot),
-        ImportView::Root { edit, slot } => ImportSnap::Root(edit.clone(), slot),
-        ImportView::Systems { .. } => ImportSnap::Systems,
-        ImportView::Pick { edit, slot } => ImportSnap::Pick(edit.clone(), slot),
-        ImportView::Folder { name, edit, slot } => {
-            ImportSnap::Folder(name.to_string(), edit.clone(), slot)
-        }
-        ImportView::Working { message } => ImportSnap::Working(message.to_string()),
-    };
-    let page = match snap {
-        ImportSnap::Choose(slot) => choose_page(slot, error.as_deref(), cx).into_any_element(),
-        ImportSnap::Root(edit, slot) => {
-            root_page(&edit, slot, error.as_deref(), cx).into_any_element()
-        }
-        ImportSnap::Systems => {
-            let (lines, slot) = wizard
-                .system_lines()
-                .unwrap_or_else(|| (Vec::new(), SystemsSlot::Import));
-            systems_page(&lines, slot, import_scroll, error.as_deref(), cx).into_any_element()
-        }
-        ImportSnap::Pick(edit, slot) => {
-            let matches: Vec<(String, String)> = wizard
-                .pick_matches()
-                .into_iter()
-                .map(|(id, name)| (id.to_string(), name.to_string()))
-                .collect();
-            pick_page(&edit, slot, &matches, pick_scroll, error.as_deref(), cx).into_any_element()
-        }
-        ImportSnap::Folder(name, edit, slot) => {
-            folder_page(&name, &edit, slot, error.as_deref(), cx).into_any_element()
-        }
-        ImportSnap::Working(message) => working_page(&message, cx).into_any_element(),
-    };
-    Some(modal(page).into_any_element())
-}
-
-enum ImportSnap {
-    Choose(ChooseSlot),
-    Root(crate::game_menu::LineEdit, RootSlot),
-    Systems,
-    Pick(crate::game_menu::LineEdit, PickSlot),
-    Folder(String, crate::game_menu::LineEdit, FolderSlot),
-    Working(String),
-}
-
-fn choose_page(slot: ChooseSlot, error: Option<&str>, cx: &Context<Shell>) -> impl IntoElement {
-    let mut page = dialog_page("import-dialog", "Import ROMs", 560., cx)
-        .child(
-            div()
-                .text_size(px(18.))
-                .font_weight(gpui_kit::FontWeight::BOLD)
-                .child("How would you like to import ROMs?"),
-        )
-        .child(hint("Paths are stored. ROM files are not copied.", cx))
-        .child(import_action(
-            "import-esde",
-            "Import ES-DE / EmulationStation library",
-            true,
-            slot == ChooseSlot::Esde,
-            ImportFocus::Choose(ChooseSlot::Esde),
-            cx,
-        ))
-        .child(import_action(
-            "import-single",
-            "Add one system",
-            false,
-            slot == ChooseSlot::Single,
-            ImportFocus::Choose(ChooseSlot::Single),
-            cx,
-        ));
-    if let Some(error) = error {
-        page = page.child(import_error(error, cx));
-    }
-    page
-}
-
-fn root_page(
-    edit: &crate::game_menu::LineEdit,
-    slot: RootSlot,
-    error: Option<&str>,
-    cx: &Context<Shell>,
-) -> impl IntoElement {
-    let mut page = dialog_page("import-dialog", "Import ROMs", 560., cx)
-        .child(hint(
-            "ROMs root (immediate subfolders are matched to systems)",
-            cx,
-        ))
-        .child(import_path(
-            "import-root",
-            edit,
-            slot == RootSlot::Path,
-            None,
-            ImportFocus::Root(RootSlot::Path),
-            cx,
-        ))
-        .child(import_action(
-            "import-browse",
-            "Browse…",
-            false,
-            slot == RootSlot::Browse,
-            ImportFocus::Root(RootSlot::Browse),
-            cx,
-        ))
-        .child(import_action(
-            "import-scan",
-            "Scan folders",
-            true,
-            slot == RootSlot::Scan,
-            ImportFocus::Root(RootSlot::Scan),
-            cx,
-        ));
-    if let Some(error) = error {
-        page = page.child(import_error(error, cx));
-    }
-    page
-}
-
-fn systems_page(
-    lines: &[crate::import_wizard::SystemLine],
-    slot: SystemsSlot,
-    scroll: &ScrollHandle,
-    error: Option<&str>,
-    cx: &Context<Shell>,
-) -> impl IntoElement {
-    let theme = cx.omarchy();
-    let mut list = div()
-        .id("import-systems")
-        .w_full()
-        .h(px(280.))
-        .overflow_y_scroll()
-        .track_scroll(scroll)
-        .flex()
-        .flex_col()
-        .gap(px(6.));
-    for (index, line) in lines.iter().enumerate() {
-        let check = matches!(slot, SystemsSlot::Check(row) if row == index);
-        let map = matches!(slot, SystemsSlot::Map(row) if row == index);
-        let state = if line.row.include {
-            CheckboxState::Checked
-        } else {
-            CheckboxState::Unchecked
-        };
-        let entity = cx.entity();
-        list = list.child(
-            div()
-                .id(("import-row", index))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .w_full()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .flex()
-                        .flex_col()
-                        .border_1()
-                        .border_color(if check {
-                            theme.accent
-                        } else {
-                            theme.background
-                        })
-                        .child(
-                            checkbox(
-                                ("import-check", index),
-                                line.row.discovered.clone(),
-                                state,
-                                cx,
-                            )
-                            .on_change(move |state, _, _, cx| {
-                                entity.update(cx, |this, cx| {
-                                    if let Some(wizard) = &mut this.wizard {
-                                        wizard.set_included(index, state == CheckboxState::Checked);
-                                    }
-                                    cx.notify();
-                                });
-                            }),
-                        )
-                        .child(
-                            div()
-                                .px(px(8.))
-                                .text_size(px(12.))
-                                .text_color(theme.secondary)
-                                .child(format!(
-                                    "{} · {} files",
-                                    line.row.folder_name, line.row.file_count
-                                )),
-                        ),
-                )
-                .child(
-                    div()
-                        .w(px(240.))
-                        .flex_shrink_0()
-                        .border_1()
-                        .border_color(if map { theme.accent } else { theme.background })
-                        .child(
-                            button(
-                                ("import-map", index),
-                                line.mapped.clone(),
-                                ButtonVariant::Secondary,
-                                cx,
-                            )
-                            .on_click(cx.listener(
-                                move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                                    if let Some(wizard) = &mut this.wizard {
-                                        wizard.aim(ImportFocus::Systems(SystemsSlot::Map(index)));
-                                        wizard.cycle_focused(1);
-                                    }
-                                    this.focus_handle.focus(window, cx);
-                                    cx.notify();
-                                },
-                            )),
-                        ),
-                ),
-        );
-    }
-    let mut page = dialog_page("import-dialog", "Import ROMs", 720., cx)
-        .child(hint(
-            "Check systems to import. Unmatched folders stay listed so you can remap them.",
-            cx,
-        ))
-        .child(list)
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap(px(8.))
-                .child(import_action(
-                    "import-cancel",
-                    "Cancel",
-                    false,
-                    slot == SystemsSlot::Cancel,
-                    ImportFocus::Systems(SystemsSlot::Cancel),
-                    cx,
-                ))
-                .child(import_action(
-                    "import-go",
-                    "Import",
-                    true,
-                    slot == SystemsSlot::Import,
-                    ImportFocus::Systems(SystemsSlot::Import),
-                    cx,
-                )),
-        );
-    if let Some(error) = error {
-        page = page.child(import_error(error, cx));
-    }
-    page
-}
-
-fn pick_page(
-    edit: &crate::game_menu::LineEdit,
-    slot: PickSlot,
-    matches: &[(String, String)],
-    scroll: &ScrollHandle,
-    error: Option<&str>,
-    cx: &Context<Shell>,
-) -> impl IntoElement {
-    let theme = cx.omarchy();
-    let mut list = div()
-        .id("import-pick")
-        .w_full()
-        .h(px(280.))
-        .overflow_y_scroll()
-        .track_scroll(scroll)
-        .flex()
-        .flex_col();
-    for (index, (id, name)) in matches.iter().enumerate() {
-        let chosen = matches!(slot, PickSlot::Row(row) if row == index);
-        let mut row = div()
-            .id(("import-system", index))
-            .w_full()
-            .px(px(8.))
-            .py(px(6.))
-            .cursor_pointer()
-            .on_click(
-                cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                    if let Some(wizard) = &mut this.wizard {
-                        wizard.aim(ImportFocus::Pick(PickSlot::Row(index)));
-                    }
-                    this.confirm_import(cx);
-                    this.focus_handle.focus(window, cx);
-                    cx.notify();
-                }),
-            );
-        if chosen {
-            row = row.bg(theme.selected_fill()).text_color(theme.accent);
-        } else {
-            row = row.hover(|style| style.bg(theme.hover_fill()));
-        }
-        list = list.child(row.child(format!("{name} ({id})")));
-    }
-    let mut page = dialog_page("import-dialog", "Import ROMs", 560., cx)
-        .child(import_path(
-            "import-search",
-            edit,
-            slot == PickSlot::Search,
-            Some("Search systems"),
-            ImportFocus::Pick(PickSlot::Search),
-            cx,
-        ))
-        .child(list)
-        .child(import_action(
-            "import-choose-folder",
-            "Choose folder",
-            true,
-            slot == PickSlot::Choose,
-            ImportFocus::Pick(PickSlot::Choose),
-            cx,
-        ));
-    if let Some(error) = error {
-        page = page.child(import_error(error, cx));
-    }
-    page
-}
-
-fn folder_page(
-    name: &str,
-    edit: &crate::game_menu::LineEdit,
-    slot: FolderSlot,
-    error: Option<&str>,
-    cx: &Context<Shell>,
-) -> impl IntoElement {
-    let mut page = dialog_page("import-dialog", "Import ROMs", 560., cx).child(hint(
-        &format!(
-            "Folder for {name}. Individual ROM files are not copied; the parent folder is stored and filtered by extension."
-        ),
-        cx,
-    ))
-    .child(import_path(
-        "import-folder",
-        edit,
-        slot == FolderSlot::Path,
-        None,
-        ImportFocus::Folder(FolderSlot::Path),
-        cx,
-    ))
-    .child(import_action(
-        "import-folder-browse",
-        "Browse…",
-        false,
-        slot == FolderSlot::Browse,
-        ImportFocus::Folder(FolderSlot::Browse),
-        cx,
-    ))
-    .child(import_action(
-        "import-add",
-        "Add system",
-        true,
-        slot == FolderSlot::Add,
-        ImportFocus::Folder(FolderSlot::Add),
-        cx,
-    ));
-    if let Some(error) = error {
-        page = page.child(import_error(error, cx));
-    }
-    page
-}
-
-fn working_page(message: &str, cx: &Context<Shell>) -> impl IntoElement {
-    dialog_page("import-dialog", "Import ROMs", 560., cx)
-        .child(hint("Paths are stored. ROM files are not copied.", cx))
-        .child(message.to_string())
-}
-
-fn import_path(
-    id: &'static str,
-    edit: &crate::game_menu::LineEdit,
-    focused: bool,
-    placeholder: Option<&'static str>,
-    aim: ImportFocus,
-    cx: &Context<Shell>,
-) -> impl IntoElement {
-    let theme = cx.omarchy();
-    let mut text = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .overflow_hidden()
-        .min_h(px(18.));
-    if edit.text.is_empty() {
-        if focused {
-            text = text.child(
-                div()
-                    .w(px(1.))
-                    .h(px(16.))
-                    .flex_shrink_0()
-                    .bg(theme.foreground),
-            );
-        }
-        if let Some(placeholder) = placeholder {
-            text = text.child(div().text_color(theme.secondary).child(placeholder));
-        }
-    } else {
-        let line = edit.caret_line();
-        text = text.child(line.head.clone());
-        if focused {
-            text = text.child(
-                div()
-                    .w(px(1.))
-                    .h(px(16.))
-                    .flex_shrink_0()
-                    .bg(theme.foreground),
-            );
-        }
-        text = text.child(line.tail.clone());
-    }
-    div()
-        .id(id)
-        .w_full()
-        .px(px(8.))
-        .py(px(6.))
-        .border_1()
-        .border_color(if focused { theme.accent } else { theme.border })
-        .bg(theme.surface)
-        .on_click(
-            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                if let Some(wizard) = &mut this.wizard {
-                    wizard.aim(aim);
-                }
-                this.focus_handle.focus(window, cx);
-                cx.notify();
-            }),
-        )
-        .child(text)
-}
-
-fn import_action(
-    id: &'static str,
-    label: &'static str,
-    primary: bool,
-    aimed: bool,
-    aim: ImportFocus,
-    cx: &Context<Shell>,
-) -> impl IntoElement {
-    let theme = cx.omarchy();
-    let variant = if primary {
-        ButtonVariant::Primary
-    } else {
-        ButtonVariant::Secondary
-    };
-    div()
-        .border_1()
-        .border_color(if aimed {
-            theme.accent
-        } else {
-            theme.background
-        })
-        .child(button(id, label, variant, cx).on_click(cx.listener(
-            move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                if let Some(wizard) = &mut this.wizard {
-                    wizard.aim(aim);
-                }
-                this.confirm_import(cx);
-                this.focus_handle.focus(window, cx);
-                cx.notify();
-            },
-        )))
 }
 
 fn import_error(text: &str, cx: &Context<Shell>) -> impl IntoElement {
@@ -4578,25 +3860,29 @@ fn systems_screen(
     cx: &Context<Shell>,
 ) -> Option<gpui_kit::AnyElement> {
     let dialog = dialog?;
+    let panel_view = dialog.panel();
+    let confirm = panel_view.confirm.clone();
     let rows = dialog
         .list_rows()
         .into_iter()
         .map(|row| system_list_row(row, cx).into_any_element())
         .collect::<Vec<_>>();
-    let panel = systems_panel(&dialog.panel(), picker_scroll, cx);
-    Some(
-        split::screen(
-            "systems-list",
-            "Manage Systems",
-            dialog.list_focused(),
-            scroll,
-            rows,
-            !dialog.list_focused(),
-            panel,
-            cx,
-        )
-        .into_any_element(),
-    )
+    let panel = systems_panel(&panel_view, picker_scroll, cx);
+    let screen = split::screen(
+        "systems-list",
+        "Manage Systems",
+        dialog.list_focused(),
+        scroll,
+        rows,
+        !dialog.list_focused(),
+        panel,
+        cx,
+    );
+    let mut layer = div().size_full().child(screen);
+    if let Some(confirm) = confirm {
+        layer = layer.child(system_delete_dialog(&confirm, cx));
+    }
+    Some(layer.into_any_element())
 }
 
 fn system_list_row(row: crate::systems::ListRow, cx: &Context<Shell>) -> impl IntoElement {
@@ -4617,6 +3903,39 @@ fn systems_panel(
     scroll: &ScrollHandle,
     cx: &Context<Shell>,
 ) -> impl IntoElement {
+    if panel.adding {
+        if let Some(menu) = &panel.type_menu {
+            return div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .flex_shrink_0()
+                .gap(px(12.))
+                .child(heading("Add system"))
+                .child(hint(
+                    "Type to jump by id or name. Enter adds it. Types already in the list are hidden.",
+                    cx,
+                ))
+                .child(picker::menu(
+                    menu,
+                    scroll,
+                    420.,
+                    cx,
+                    |this, index, window, cx| {
+                        this.pick_system(index, cx);
+                        this.focus_handle.focus(window, cx);
+                        cx.notify();
+                    },
+                ))
+                .into_any_element();
+        }
+        let text = if panel.types_available {
+            "Right or Enter to choose a system type."
+        } else {
+            "Every system type is already in the list."
+        };
+        return hint(text, cx).into_any_element();
+    }
     if panel.empty {
         return hint("No systems in this library.", cx).into_any_element();
     }
@@ -4667,9 +3986,167 @@ fn systems_panel(
             &panel.args,
             panel.args_aimed,
             "Extra arguments",
+            SystemField::Args,
+            cx,
+        ))
+        .child(field_label("ROM folders", cx))
+        .child(hint(
+            "Each folder is scanned for this system's extensions. Files stay where they are.",
+            cx,
+        ));
+    for path in &panel.paths {
+        page = page.child(system_path_row(path, cx));
+    }
+    page = page
+        .child(system_editor(
+            "system-add-path",
+            &panel.path_draft,
+            panel.path_draft_aimed,
+            "Type a folder path",
+            SystemField::AddPath,
+            cx,
+        ))
+        .child(
+            div()
+                .flex()
+                .gap(px(8.))
+                .child(system_action(
+                    "system-add-folder".to_string(),
+                    "Add path".to_string(),
+                    ButtonVariant::Secondary,
+                    panel.path_draft_aimed,
+                    SystemField::AddPath,
+                    cx,
+                ))
+                .child(system_action(
+                    "system-browse".to_string(),
+                    "Browse…".to_string(),
+                    ButtonVariant::Secondary,
+                    panel.browse_aimed,
+                    SystemField::Browse,
+                    cx,
+                )),
+        )
+        .child(system_action(
+            "system-rescan".to_string(),
+            "Rescan".to_string(),
+            ButtonVariant::Primary,
+            panel.rescan_aimed,
+            SystemField::Rescan,
+            cx,
+        ))
+        .child(system_action(
+            "system-delete".to_string(),
+            "Delete system".to_string(),
+            ButtonVariant::Danger,
+            panel.delete_aimed,
+            SystemField::Delete,
             cx,
         ));
     page.into_any_element()
+}
+
+fn system_path_row(path: &crate::systems::PathLine, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let index = path.index;
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .px(px(8.))
+                .py(px(6.))
+                .border_1()
+                .border_color(if path.aimed {
+                    theme.accent
+                } else {
+                    theme.border
+                })
+                .bg(theme.surface)
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(path.path.clone()),
+        )
+        .child(system_action(
+            format!("system-path-{index}"),
+            "Remove".to_string(),
+            ButtonVariant::Secondary,
+            path.aimed,
+            SystemField::Path(index),
+            cx,
+        ))
+}
+
+fn system_delete_dialog(prompt: &crate::systems::Confirm, cx: &Context<Shell>) -> impl IntoElement {
+    let name = prompt.name.clone();
+    modal(
+        dialog_page("system-delete-dialog", "Delete system", 460., cx)
+            .child(
+                div()
+                    .font_weight(gpui_kit::FontWeight::BOLD)
+                    .text_size(px(18.))
+                    .whitespace_normal()
+                    .child(name.clone()),
+            )
+            .child(hint(
+                "Remove this system from the library. ROM files stay on disk. Games, favorites, play stats, and scraped metadata for this system are dropped.",
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(system_confirm_button(
+                        "system-delete-cancel",
+                        "Cancel",
+                        ButtonVariant::Primary,
+                        prompt.slot == crate::systems::ConfirmSlot::Cancel,
+                        crate::systems::ConfirmSlot::Cancel,
+                        cx,
+                    ))
+                    .child(system_confirm_button(
+                        "system-delete-confirm",
+                        "Delete",
+                        ButtonVariant::Danger,
+                        prompt.slot == crate::systems::ConfirmSlot::Delete,
+                        crate::systems::ConfirmSlot::Delete,
+                        cx,
+                    )),
+            ),
+    )
+}
+
+fn system_confirm_button(
+    id: &'static str,
+    label: &'static str,
+    variant: ButtonVariant,
+    aimed: bool,
+    slot: crate::systems::ConfirmSlot,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .border_1()
+        .border_color(if aimed {
+            theme.accent
+        } else {
+            theme.background
+        })
+        .child(button(id, label, variant, cx).on_click(cx.listener(
+            move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                if let Some(dialog) = &mut this.systems {
+                    dialog.aim_confirm(slot);
+                }
+                this.confirm_systems(cx);
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            },
+        )))
 }
 
 fn options_screen(
@@ -5190,12 +4667,13 @@ fn system_editor(
     edit: &crate::game_menu::LineEdit,
     focused: bool,
     placeholder: &'static str,
+    field: SystemField,
     cx: &Context<Shell>,
 ) -> impl IntoElement {
     plain_editor(id, edit, focused, placeholder, cx).on_click(cx.listener(
         move |this: &mut Shell, _: &ClickEvent, window, cx| {
             if let Some(dialog) = &mut this.systems {
-                dialog.aim(SystemField::Args);
+                dialog.aim(field);
             }
             this.focus_handle.focus(window, cx);
             cx.notify();
@@ -5298,13 +4776,47 @@ fn system_choice(
         .gap(px(4.))
         .child(system_press(id, label, aimed, field, cx));
     if let Some(menu) = menu {
-        column = column.child(picker::menu(menu, scroll, cx, |this, index, window, cx| {
-            this.pick_system(index);
-            this.focus_handle.focus(window, cx);
-            cx.notify();
-        }));
+        column = column.child(picker::menu(
+            menu,
+            scroll,
+            240.,
+            cx,
+            |this, index, window, cx| {
+                this.pick_system(index, cx);
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            },
+        ));
     }
     column
+}
+
+fn system_action(
+    id: String,
+    label: String,
+    variant: ButtonVariant,
+    aimed: bool,
+    field: SystemField,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .border_1()
+        .border_color(if aimed {
+            theme.accent
+        } else {
+            theme.background
+        })
+        .child(button(id, label, variant, cx).on_click(cx.listener(
+            move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                if let Some(dialog) = &mut this.systems {
+                    dialog.aim(field);
+                }
+                this.confirm_systems(cx);
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            },
+        )))
 }
 
 fn system_press(

@@ -42,11 +42,14 @@ kind = "Standalone"
 path = "pcsx2"
 global_args = "--fullscreen"
 
-# Console definitions
+# Console definitions.
+# rom_dirs is a list, so one system can scan more than one folder.
+# A hand-edited rom_dir string or array still loads, and the next save writes rom_dirs.
+# ~ and ~/... expand with HOME when a folder is added and again when it is scanned.
 [[consoles]]
 id = "snes"
 name = "Super Nintendo"
-rom_dirs = ["/home/user/roms/snes"]
+rom_dirs = ["/home/user/roms/snes", "/home/user/roms/snes-translations"]
 extensions = ["sfc", "smc", "zip"]
 emulator = "retroarch"
 core = "/usr/lib/libretro/snes9x_libretro.so"

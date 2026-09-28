@@ -404,6 +404,20 @@ pub fn delete_game(conn: &Connection, game_id: &GameId) -> Result<()> {
     Ok(())
 }
 
+/// Drop every game for a system, and the media rows. Does not touch files on disk.
+pub fn delete_console_library(conn: &Connection, console: &ConsoleId) -> Result<usize> {
+    let mut stmt = conn.prepare("SELECT id FROM games WHERE console = ?1")?;
+    let ids = stmt
+        .query_map(params![console], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for id in &ids {
+        conn.execute("DELETE FROM media WHERE game_id = ?1", params![id])?;
+    }
+    let count = conn.execute("DELETE FROM games WHERE console = ?1", params![console])?;
+    Ok(count)
+}
+
 pub fn increment_play_stats(
     conn: &Connection,
     game_id: &GameId,
@@ -468,6 +482,7 @@ fn i32_to_source(val: i32) -> Source {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::PathBuf;
 
     fn sample(id: &str, title: &str, favorite: bool) -> Game {
@@ -565,10 +580,20 @@ mod tests {
         assert_eq!(beta.display_title(), "Beta Cleaned");
         assert_eq!(beta.file_title, "Beta Cleaned");
 
+        let rom = dir.path().join("keep.sfc");
+        fs::write(&rom, b"stay").unwrap();
+        delete_console_library(&conn, &"snes".to_string()).unwrap();
+        assert!(rom.is_file());
+        let left = load_games(&conn, None).unwrap();
+        assert!(left.is_empty());
+        let media_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(media_rows, 0);
+
         delete_game(&conn, &"a".to_string()).unwrap();
         let left = load_games(&conn, None).unwrap();
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].id, "b");
+        assert!(left.is_empty());
         let media_rows: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM media WHERE game_id = 'a'",

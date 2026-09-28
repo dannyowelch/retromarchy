@@ -835,6 +835,48 @@ impl Browse {
         self.game = keep.and_then(|id| self.visible_position(&id));
     }
 
+    /// Match the sidebar to `consoles`. Games already loaded stay with their system.
+    /// A system that is no longer configured leaves the sidebar. Its files are untouched.
+    pub fn sync_consoles(&mut self, consoles: &[Console]) {
+        let metadata = config::load_console_metadata().unwrap_or_default();
+        let current = self.shelf().map(|shelf| shelf.console.id.clone());
+        let mut shelves = Vec::with_capacity(consoles.len());
+        for console in consoles {
+            if let Some(existing) = self
+                .library
+                .shelves
+                .iter()
+                .find(|shelf| shelf.console.id == console.id)
+            {
+                let mut shelf = existing.clone();
+                shelf.console = console.clone();
+                shelves.push(shelf);
+            } else {
+                shelves.push(shelf(console.clone(), &metadata, Vec::new(), stats_of(&[])));
+            }
+        }
+        sort_shelves(&mut shelves, self.library.system_sort);
+        self.library.shelves = shelves;
+        match current {
+            Some(id) => {
+                if let Some(index) = self
+                    .library
+                    .shelves
+                    .iter()
+                    .position(|shelf| shelf.console.id == id)
+                {
+                    self.console = index;
+                } else {
+                    self.console = 0;
+                    self.game = None;
+                    self.pane = Pane::Sidebar;
+                }
+            }
+            None if self.console >= self.library.shelves.len() => self.console = 0,
+            None => {}
+        }
+    }
+
     /// Replace one console's rows after a rescan. The selected game stays when
     /// its id is still in the list. On the grid, a removed game leaves the
     /// highlight on the nearest remaining row.

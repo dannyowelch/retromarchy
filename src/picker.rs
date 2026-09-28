@@ -60,6 +60,14 @@ impl Picker {
         *self = Self::Closed;
     }
 
+    pub fn seek(&mut self, index: usize) {
+        let Self::Open { cursor, query } = self else {
+            return;
+        };
+        *cursor = index;
+        query.clear();
+    }
+
     pub fn move_by(&mut self, delta: isize, len: usize) {
         if len == 0 {
             return;
@@ -137,6 +145,7 @@ fn first_prefix(labels: &[String], prefix: &str) -> Option<usize> {
 pub fn menu<V, F>(
     menu: &Menu,
     scroll: &ScrollHandle,
+    max_height: f32,
     cx: &Context<V>,
     on_row: F,
 ) -> impl IntoElement
@@ -149,7 +158,7 @@ where
     let mut list = div()
         .id("picker-menu")
         .w_full()
-        .max_h(px(240.))
+        .max_h(px(max_height))
         .min_h(px(0.))
         .flex_shrink_0()
         .flex()
