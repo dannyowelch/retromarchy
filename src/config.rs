@@ -177,9 +177,9 @@ pub struct Config {
     /// Kept with the other values so it stays above the TOML tables.
     #[serde(default)]
     pub system_sort: SystemSort,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "slice_is_empty")]
     pub emulators: Vec<Emulator>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "slice_is_empty")]
     pub consoles: Vec<Console>,
     #[serde(default)]
     pub scraper: ScraperConfig,
@@ -189,6 +189,11 @@ pub struct Config {
 
 fn default_theme() -> String {
     "system".to_string()
+}
+
+/// An empty list is omitted. `consoles = []` after `[[emulators]]` is not valid TOML.
+fn slice_is_empty<T>(items: &[T]) -> bool {
+    items.is_empty()
 }
 
 fn default_true() -> bool {
@@ -646,8 +651,8 @@ pub fn save_system_sort(sort: SystemSort) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Console, GridArt, MediaToggles};
-    use std::path::Path;
+    use crate::types::{Console, Emulator, EmulatorKind, GridArt, MediaToggles};
+    use std::path::{Path, PathBuf};
     use std::sync::MutexGuard;
 
     struct EnvLock {
@@ -911,6 +916,27 @@ screenshot = false
         assert!(
             text.contains("system_sort = 'year'") || text.contains("system_sort = \"year\""),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn an_emulator_with_no_systems_still_saves() {
+        let mut config = Config::default();
+        config.emulators.push(Emulator {
+            id: "retroarch".into(),
+            name: "RetroArch".into(),
+            kind: EmulatorKind::RetroArch,
+            path: "retroarch".into(),
+            global_args: String::new(),
+            config: Some(PathBuf::from("/tmp/retroarch.cfg")),
+        });
+        let text = toml::to_string_pretty(&config).unwrap();
+        let loaded = config_from_toml(&text).unwrap();
+        assert_eq!(loaded.emulators.len(), 1);
+        assert!(loaded.consoles.is_empty());
+        assert_eq!(
+            loaded.emulators[0].config.as_deref(),
+            Some(Path::new("/tmp/retroarch.cfg"))
         );
     }
 

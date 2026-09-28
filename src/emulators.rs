@@ -1,9 +1,10 @@
 use crate::config::Config;
-use crate::cores::Core;
+use crate::cores::{Core, CoreCatalog};
 use crate::game_menu::LineEdit;
 use crate::gamepad::NavDir;
 use crate::split::{Side, Split};
 use crate::types::{Emulator, EmulatorKind};
+use std::path::PathBuf;
 
 /// Ctrl+E and Ctrl+M, including the shifted keysyms. The control mask must be set.
 pub fn emulator_key(key: &str, key_char: Option<&str>, control: bool) -> bool {
@@ -22,6 +23,7 @@ pub enum Field {
     Kind,
     Path,
     Args,
+    Config,
     Rescan,
     Delete,
     Save,
@@ -61,7 +63,12 @@ pub struct Panel {
     pub args: LineEdit,
     pub args_aimed: bool,
     pub show_cores: bool,
+    pub cfg: LineEdit,
+    pub cfg_aimed: bool,
+    pub cores_dir: String,
+    pub cores_note: Option<String>,
     pub cores: Vec<CoreLine>,
+    pub missing: bool,
     pub rescan_aimed: bool,
     pub show_delete: bool,
     pub delete_aimed: bool,
@@ -76,6 +83,7 @@ struct Draft {
     kind: EmulatorKind,
     path: LineEdit,
     args: LineEdit,
+    config: LineEdit,
 }
 
 impl Draft {
@@ -85,15 +93,27 @@ impl Draft {
             kind: EmulatorKind::Standalone,
             path: LineEdit::plain(String::new()),
             args: LineEdit::plain(String::new()),
+            config: LineEdit::plain(String::new()),
         }
     }
 
-    fn from_emulator(emulator: &Emulator) -> Self {
+    fn from_emulator(emulator: &Emulator, cfg: &PathBuf) -> Self {
+        let config = emulator
+            .config
+            .clone()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| cfg.clone());
+        let config = if config.as_os_str().is_empty() {
+            String::new()
+        } else {
+            config.display().to_string()
+        };
         Self {
             name: LineEdit::plain(emulator.name.clone()),
             kind: emulator.kind,
             path: LineEdit::plain(emulator.path.clone()),
             args: LineEdit::plain(emulator.global_args.clone()),
+            config: LineEdit::plain(config),
         }
     }
 }
@@ -101,7 +121,9 @@ impl Draft {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Emulators {
     emulators: Vec<Emulator>,
-    cores: Vec<Core>,
+    catalogs: Vec<CoreCatalog>,
+    missing: Vec<bool>,
+    draft_catalog: CoreCatalog,
     split: Split,
     draft: Draft,
     field: Field,
@@ -109,15 +131,21 @@ pub struct Emulators {
 }
 
 impl Emulators {
-    pub fn open(config: &Config, cores: Vec<Core>) -> Self {
+    pub fn open(config: &Config, catalogs: Vec<CoreCatalog>, missing: Vec<bool>) -> Self {
         let index = config
             .emulators
             .iter()
             .position(|emulator| emulator.kind == EmulatorKind::RetroArch)
             .unwrap_or(0);
+        let mut catalogs = catalogs;
+        catalogs.resize(config.emulators.len(), CoreCatalog::empty());
+        let mut missing = missing;
+        missing.resize(config.emulators.len(), false);
         let mut screen = Self {
             emulators: config.emulators.clone(),
-            cores,
+            catalogs,
+            missing,
+            draft_catalog: CoreCatalog::empty(),
             split: Split::at(index.min(config.emulators.len())),
             draft: Draft::blank(),
             field: Field::Name,
@@ -147,7 +175,10 @@ impl Emulators {
             .map(|(index, emulator)| ListRow {
                 index,
                 title: emulator.name.clone(),
-                detail: emulator_detail(emulator),
+                detail: emulator_detail(
+                    emulator,
+                    self.missing.get(index).copied().unwrap_or(false),
+                ),
                 selected: index == self.split.index,
                 add: false,
             })
@@ -166,6 +197,13 @@ impl Emulators {
         let editing = self.split.side == Side::Panel;
         let adding = self.adding();
         let show_cores = self.draft.kind == EmulatorKind::RetroArch;
+        let cores_dir = self.active_catalog().directory.display().to_string();
+        let cores_note = self.active_catalog().note.clone();
+        let cores = if show_cores {
+            core_lines(&self.active_catalog().cores)
+        } else {
+            Vec::new()
+        };
         Panel {
             adding,
             name: self.draft.name.clone(),
@@ -177,11 +215,12 @@ impl Emulators {
             args: self.draft.args.clone(),
             args_aimed: editing && self.field == Field::Args,
             show_cores,
-            cores: if show_cores {
-                self.core_lines()
-            } else {
-                Vec::new()
-            },
+            cfg: self.draft.config.clone(),
+            cfg_aimed: editing && self.field == Field::Config,
+            cores_dir,
+            cores_note,
+            cores,
+            missing: self.missing.get(self.split.index).copied().unwrap_or(false),
             rescan_aimed: editing && self.field == Field::Rescan,
             show_delete: !adding,
             delete_aimed: editing && self.field == Field::Delete,
@@ -191,8 +230,41 @@ impl Emulators {
         }
     }
 
-    pub fn set_cores(&mut self, cores: Vec<Core>) {
-        self.cores = cores;
+    pub fn set_catalog(&mut self, catalog: CoreCatalog) {
+        if self.adding() {
+            self.draft_catalog = catalog;
+            return;
+        }
+        let index = self.split.index;
+        if let Some(slot) = self.catalogs.get_mut(index) {
+            *slot = catalog;
+        }
+    }
+
+    pub fn selected_emulator(&self) -> Option<&Emulator> {
+        self.emulators.get(self.split.index)
+    }
+
+    /// The RetroArch row a rescan should read. An unsaved row uses the draft command.
+    pub fn retroarch_target(&self) -> Option<Emulator> {
+        if self.draft.kind != EmulatorKind::RetroArch {
+            return None;
+        }
+        if let Some(emulator) = self.selected_emulator() {
+            return Some(emulator.clone());
+        }
+        let path = self.draft.path.text.trim();
+        if path.is_empty() {
+            return None;
+        }
+        Some(Emulator {
+            id: String::new(),
+            name: self.draft.name.text.trim().to_string(),
+            kind: EmulatorKind::RetroArch,
+            path: path.to_string(),
+            global_args: self.draft.args.text.trim().to_string(),
+            config: config_path(&self.draft.config.text),
+        })
     }
 
     pub fn select(&mut self, index: usize) {
@@ -219,6 +291,9 @@ impl Emulators {
         self.draft.kind = kind;
         if kind == EmulatorKind::RetroArch && self.draft.path.text.trim().is_empty() {
             self.draft.path = LineEdit::plain("retroarch".to_string());
+        }
+        if !self.fields().contains(&self.field) {
+            self.field = Field::Kind;
         }
     }
 
@@ -279,7 +354,7 @@ impl Emulators {
                 Step::Write
             }
             Field::Save => self.save(),
-            Field::Name | Field::Path | Field::Args => {
+            Field::Name | Field::Path | Field::Args | Field::Config => {
                 self.shift_field(1);
                 Step::Stay
             }
@@ -295,7 +370,10 @@ impl Emulators {
 
     pub fn accepts_text(&self) -> bool {
         self.split.side == Side::Panel
-            && matches!(self.field, Field::Name | Field::Path | Field::Args)
+            && matches!(
+                self.field,
+                Field::Name | Field::Path | Field::Args | Field::Config
+            )
     }
 
     pub fn type_text(&mut self, text: &str) {
@@ -345,7 +423,12 @@ impl Emulators {
 
     fn load_draft(&mut self) {
         self.draft = if let Some(emulator) = self.emulators.get(self.split.index) {
-            Draft::from_emulator(emulator)
+            let cfg = self
+                .catalogs
+                .get(self.split.index)
+                .map(|catalog| catalog.cfg.clone())
+                .unwrap_or_default();
+            Draft::from_emulator(emulator, &cfg)
         } else {
             Draft::blank()
         };
@@ -383,7 +466,10 @@ impl Emulators {
                 kind: self.draft.kind,
                 path,
                 global_args: self.draft.args.text.trim().to_string(),
+                config: config_path(&self.draft.config.text),
             });
+            self.catalogs.push(self.draft_catalog.clone());
+            self.missing.push(false);
             self.split.index = self.emulators.len() - 1;
             self.load_draft();
             self.field = Field::Name;
@@ -409,6 +495,7 @@ impl Emulators {
         emulator.kind = self.draft.kind;
         emulator.path = path;
         emulator.global_args = self.draft.args.text.trim().to_string();
+        emulator.config = config_path(&self.draft.config.text);
         Some(())
     }
 
@@ -418,6 +505,12 @@ impl Emulators {
         }
         let index = self.split.index;
         self.emulators.remove(index);
+        if index < self.catalogs.len() {
+            self.catalogs.remove(index);
+        }
+        if index < self.missing.len() {
+            self.missing.remove(index);
+        }
         if self.split.index > self.emulators.len() {
             self.split.index = self.emulators.len();
         }
@@ -429,6 +522,7 @@ impl Emulators {
     fn fields(&self) -> Vec<Field> {
         let mut fields = vec![Field::Name, Field::Kind, Field::Path, Field::Args];
         if self.draft.kind == EmulatorKind::RetroArch {
+            fields.push(Field::Config);
             fields.push(Field::Rescan);
         }
         if !self.adding() {
@@ -457,7 +551,7 @@ impl Emulators {
                 self.cycle_kind(delta);
                 Step::Stay
             }
-            Field::Name | Field::Path | Field::Args => {
+            Field::Name | Field::Path | Field::Args | Field::Config => {
                 let Some(edit) = self.edit_mut() else {
                     return Step::Stay;
                 };
@@ -492,23 +586,42 @@ impl Emulators {
             Field::Name => Some(&mut self.draft.name),
             Field::Path => Some(&mut self.draft.path),
             Field::Args => Some(&mut self.draft.args),
+            Field::Config => Some(&mut self.draft.config),
             _ => None,
         }
     }
 
-    fn core_lines(&self) -> Vec<CoreLine> {
-        self.cores
-            .iter()
-            .map(|core| CoreLine {
-                label: core.label.clone(),
-                file_name: core
-                    .path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("")
-                    .to_string(),
-            })
-            .collect()
+    fn active_catalog(&self) -> &CoreCatalog {
+        if !self.adding() {
+            if let Some(catalog) = self.catalogs.get(self.split.index) {
+                return catalog;
+            }
+        }
+        &self.draft_catalog
+    }
+}
+
+fn core_lines(cores: &[Core]) -> Vec<CoreLine> {
+    cores
+        .iter()
+        .map(|core| CoreLine {
+            label: core.label.clone(),
+            file_name: core
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect()
+}
+
+fn config_path(text: &str) -> Option<PathBuf> {
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(text))
     }
 }
 
@@ -531,8 +644,8 @@ pub fn apply_emulators(config: &mut Config, emulators: &[Emulator]) {
     config.emulators = emulators.to_vec();
 }
 
-fn emulator_detail(emulator: &Emulator) -> String {
-    if emulator.global_args.trim().is_empty() {
+fn emulator_detail(emulator: &Emulator, missing: bool) -> String {
+    let mut detail = if emulator.global_args.trim().is_empty() {
         format!("{} · {}", emulator.kind.label(), emulator.path)
     } else {
         format!(
@@ -541,7 +654,11 @@ fn emulator_detail(emulator: &Emulator) -> String {
             emulator.path,
             emulator.global_args.trim()
         )
+    };
+    if missing {
+        detail.push_str(" · not found");
     }
+    detail
 }
 
 fn slug(name: &str) -> String {
@@ -599,6 +716,7 @@ mod tests {
             kind: EmulatorKind::RetroArch,
             path: "/usr/bin/retroarch".into(),
             global_args: String::new(),
+            config: None,
         }
     }
 
@@ -612,10 +730,19 @@ mod tests {
         }
     }
 
+    fn catalog(core: Core) -> CoreCatalog {
+        CoreCatalog {
+            directory: std::path::PathBuf::from("/cores"),
+            cores: vec![core],
+            cfg: std::path::PathBuf::from("/cfg/retroarch.cfg"),
+            note: None,
+        }
+    }
+
     fn screen() -> Emulators {
         let mut config = Config::default();
         config.emulators.push(retroarch());
-        Emulators::open(&config, vec![core()])
+        Emulators::open(&config, vec![catalog(core())], vec![false])
     }
 
     #[test]
@@ -656,7 +783,7 @@ mod tests {
 
     #[test]
     fn add_edit_and_delete_an_emulator() {
-        let mut screen = Emulators::open(&Config::default(), Vec::new());
+        let mut screen = Emulators::open(&Config::default(), Vec::new(), Vec::new());
         assert!(screen.list_rows()[0].add);
         screen.move_dir(NavDir::Right);
         screen.type_text("Dolphin");
@@ -685,7 +812,7 @@ mod tests {
 
     #[test]
     fn retroarch_kind_fills_an_empty_path() {
-        let mut screen = Emulators::open(&Config::default(), vec![core()]);
+        let mut screen = Emulators::open(&Config::default(), vec![catalog(core())], Vec::new());
         screen.move_dir(NavDir::Right);
         screen.set_kind(EmulatorKind::RetroArch);
         assert_eq!(screen.panel().path.text, "retroarch");

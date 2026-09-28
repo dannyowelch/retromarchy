@@ -8,7 +8,7 @@ use crate::browse::{
     TILE_GAP,
 };
 use crate::config::{self, InputSettings, SystemSort};
-use crate::cores::{self, CoreCatalog};
+use crate::cores;
 use crate::database;
 use crate::emulators::{
     self, emulator_key, Emulators, Field as EmulatorField, Step as EmulatorStep,
@@ -85,7 +85,6 @@ pub struct Shell {
     emulators: Option<Emulators>,
     systems: Option<Systems>,
     options: Option<Options>,
-    cores: CoreCatalog,
     emulator_scroll: ScrollHandle,
     systems_scroll: ScrollHandle,
     options_scroll: ScrollHandle,
@@ -190,7 +189,6 @@ impl Shell {
             emulators: None,
             systems: None,
             options: None,
-            cores: cores::catalog_for(&config::load_config().unwrap_or_default()),
             emulator_scroll: ScrollHandle::new(),
             systems_scroll: ScrollHandle::new(),
             options_scroll: ScrollHandle::new(),
@@ -1187,18 +1185,27 @@ impl Shell {
                 return;
             }
         };
-        let found = cores::find_retroarch(&cores::DetectEnv::process());
-        if cores::ensure_retroarch(&mut config.emulators, found) {
+        let env = cores::DetectEnv::process();
+        let found = cores::find_installs(&env);
+        if cores::ensure_installs(&mut config.emulators, &found) {
             if let Err(err) = config::save_config(&config) {
                 self.browse.status = format!("Could not save config ({err}).");
                 return;
             }
             self.browse.library.emulators = config.emulators.clone();
-            self.cores = cores::catalog_for(&config);
         }
+        let catalogs = cores::catalogs_for(&config, &env);
+        let missing = config
+            .emulators
+            .iter()
+            .map(|emulator| {
+                emulator.kind == crate::types::EmulatorKind::RetroArch
+                    && !cores::command_present(&emulator.path, &env, &found)
+            })
+            .collect();
         self.browse.close_overlay();
         self.search = None;
-        self.emulators = Some(Emulators::open(&config, self.cores.cores.clone()));
+        self.emulators = Some(Emulators::open(&config, catalogs, missing));
     }
 
     fn confirm_emulators(&mut self, _cx: &mut Context<Self>) {
@@ -1261,22 +1268,35 @@ impl Shell {
         if let Some(dialog) = &self.emulators {
             emulators::apply_emulators(&mut config, dialog.emulators());
         }
-        self.cores = cores::catalog_for(&config);
-        cores::repoint_consoles(&mut config.consoles, &self.cores);
+        let env = cores::DetectEnv::process();
+        let target = self
+            .emulators
+            .as_ref()
+            .and_then(|dialog| dialog.retroarch_target());
+        let Some(target) = target else {
+            return;
+        };
+        let catalog = cores::catalog_for_emulator(&target, &env);
+        if !target.id.is_empty() {
+            cores::repoint_id(&mut config.consoles, &target.id, &catalog);
+        }
         if let Err(err) = config::save_config(&config) {
             self.browse.status = format!("Could not save config ({err}).");
             return;
         }
         self.copy_library(&config);
-        let cores = self.cores.cores.clone();
+        let status = match &catalog.note {
+            Some(note) => note.clone(),
+            None => format!(
+                "Rescanned {} cores from {}.",
+                catalog.cores.len(),
+                catalog.directory.display()
+            ),
+        };
         if let Some(dialog) = &mut self.emulators {
-            dialog.set_cores(cores);
+            dialog.set_catalog(catalog);
         }
-        self.browse.status = format!(
-            "Rescanned {} cores from {}.",
-            self.cores.cores.len(),
-            self.cores.directory.display()
-        );
+        self.browse.status = status;
     }
 
     fn open_systems(&mut self) {
@@ -1292,7 +1312,8 @@ impl Shell {
         };
         self.browse.close_overlay();
         self.search = None;
-        self.systems = Some(Systems::open(&config, self.cores.cores.clone()));
+        let catalogs = cores::catalogs_for(&config, &cores::DetectEnv::process());
+        self.systems = Some(Systems::open(&config, catalogs));
     }
 
     fn finish_systems(&mut self) {
@@ -2214,7 +2235,6 @@ impl Render for Shell {
             ))
             .children(emulator_screen(
                 self.emulators.as_ref(),
-                &self.cores,
                 &self.emulator_scroll,
                 cx,
             ))
@@ -4311,7 +4331,6 @@ fn import_error(text: &str, cx: &Context<Shell>) -> impl IntoElement {
 
 fn emulator_screen(
     dialog: Option<&Emulators>,
-    catalog: &CoreCatalog,
     scroll: &ScrollHandle,
     cx: &Context<Shell>,
 ) -> Option<gpui_kit::AnyElement> {
@@ -4321,7 +4340,7 @@ fn emulator_screen(
         .into_iter()
         .map(|row| emulator_list_row(row, cx).into_any_element())
         .collect::<Vec<_>>();
-    let panel = emulator_panel(&dialog.panel(), catalog, cx);
+    let panel = emulator_panel(&dialog.panel(), cx);
     Some(
         split::screen(
             "emulator-list",
@@ -4350,11 +4369,7 @@ fn emulator_list_row(row: crate::emulators::ListRow, cx: &Context<Shell>) -> imp
     )
 }
 
-fn emulator_panel(
-    panel: &crate::emulators::Panel,
-    catalog: &CoreCatalog,
-    cx: &Context<Shell>,
-) -> impl IntoElement {
+fn emulator_panel(panel: &crate::emulators::Panel, cx: &Context<Shell>) -> impl IntoElement {
     let title = if panel.adding {
         "New emulator".to_string()
     } else {
@@ -4400,10 +4415,28 @@ fn emulator_panel(
             EmulatorField::Args,
             cx,
         ));
+    if panel.missing {
+        page = page.child(import_error("Not found.", cx));
+    }
     if panel.show_cores {
         page = page
             .child(heading("Cores"))
-            .child(hint(&format!("From {}", catalog.directory.display()), cx))
+            .child(field_label("Config", cx))
+            .child(emulator_editor(
+                "emulator-config",
+                &panel.cfg,
+                panel.cfg_aimed,
+                "retroarch.cfg",
+                EmulatorField::Config,
+                cx,
+            ))
+            .child(hint(&format!("Cores {}", panel.cores_dir), cx));
+        if let Some(note) = &panel.cores_note {
+            page = page.child(hint(note, cx));
+        } else if panel.cores.is_empty() {
+            page = page.child(hint("No cores in that directory.", cx));
+        }
+        page = page
             .child(core_list(&panel.cores, cx))
             .child(emulator_press(
                 "emulator-rescan".to_string(),
@@ -4443,7 +4476,7 @@ fn emulator_panel(
 fn core_list(cores: &[crate::emulators::CoreLine], cx: &Context<Shell>) -> impl IntoElement {
     let theme = cx.omarchy();
     if cores.is_empty() {
-        return hint("No cores in that directory.", cx).into_any_element();
+        return div().into_any_element();
     }
     let mut list = div().flex().flex_col().gap(px(4.));
     for (index, core) in cores.iter().enumerate() {
