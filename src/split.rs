@@ -59,6 +59,8 @@ impl Split {
 
 pub const HINT: &str = "Up and down move the list. Right, Enter, or Tab edits. Left at the edge, or Shift-Tab, returns. Esc saves and closes.";
 
+/// List and panel for one settings screen. The shell places this in the slot
+/// between the menu bar and the status bar, in place of the game grid.
 pub fn screen<R, E>(
     list_id: &'static str,
     title: &'static str,
@@ -75,26 +77,12 @@ where
 {
     let theme = cx.omarchy();
     div()
-        .absolute()
-        .top(px(0.))
-        .left(px(0.))
-        .size_full()
+        .flex_1()
+        .min_h_0()
+        .w_full()
         .flex()
         .flex_col()
         .bg(theme.background)
-        .occlude()
-        .on_mouse_down(
-            gpui_kit::MouseButton::Left,
-            |_: &gpui_kit::MouseDownEvent, _, cx| {
-                cx.stop_propagation();
-            },
-        )
-        .on_mouse_down(
-            gpui_kit::MouseButton::Right,
-            |_: &gpui_kit::MouseDownEvent, _, cx| {
-                cx.stop_propagation();
-            },
-        )
         .child(
             div()
                 .flex_none()
