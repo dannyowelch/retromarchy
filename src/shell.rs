@@ -2162,29 +2162,34 @@ impl Shell {
         }
     }
 
-    fn reveal_systems(&mut self) {
+    fn reveal_systems(&mut self, window: &mut Window) {
         if let Some(dialog) = &self.systems {
             if self.systems_scroll.bounds().size.height > px(0.) {
                 self.systems_scroll.scroll_to_item(dialog.selected_index());
             }
         }
-        self.reveal_system_picker();
+        if self.reveal_system_picker() {
+            window.request_animation_frame();
+        }
     }
 
-    fn reveal_system_picker(&mut self) {
+    fn reveal_system_picker(&mut self) -> bool {
         let mark = self.systems.as_ref().and_then(|dialog| dialog.open_mark());
         if mark == self.picker_mark {
-            return;
+            return false;
         }
         let Some((_, cursor)) = mark else {
             self.picker_scroll.set_offset(point(px(0.), px(0.)));
             self.picker_mark = None;
-            return;
+            return false;
         };
         let scroll = &self.picker_scroll;
         if scroll.bounds().size.height > px(0.) && scroll.children_count() > cursor {
             scroll.scroll_to_item(cursor);
             self.picker_mark = mark;
+            false
+        } else {
+            true
         }
     }
 
@@ -2223,7 +2228,7 @@ impl Render for Shell {
         self.reveal_selection();
         self.reveal_import();
         self.reveal_emulators();
-        self.reveal_systems();
+        self.reveal_systems(window);
         self.reveal_options();
         if let Some(options) = &self.options {
             let width = options.cover_width();
