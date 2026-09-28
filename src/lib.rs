@@ -17,4 +17,6 @@ pub mod scraper;
 pub mod scraper_settings;
 pub mod shell;
 pub mod softname;
+pub mod split;
+pub mod systems;
 pub mod types;

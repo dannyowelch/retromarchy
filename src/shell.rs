@@ -8,9 +8,11 @@ use crate::browse::{
     TILE_GAP,
 };
 use crate::config::{self, InputSettings, SystemSort};
-use crate::cores;
+use crate::cores::{self, CoreCatalog};
 use crate::database;
-use crate::emulators::{emulator_key, Block, EmulatorCommand, Emulators, Slot, Tab, HINT};
+use crate::emulators::{
+    self, emulator_key, Emulators, Field as EmulatorField, Step as EmulatorStep,
+};
 use crate::game_menu::{
     game_menu_key, Aim, DeleteSlot, Overlay, OverlayCommand, RenameSlot, ScrapeSlot,
 };
@@ -22,13 +24,16 @@ use crate::import_wizard::{
 use crate::importer::{self, ImportUpdate};
 use crate::input_repeat::HoldRepeat;
 use crate::launcher;
-use crate::options::{self, InputOptions};
+use crate::options::{
+    self, options_key, Command as OptionsCommand, Options, Section as OptionsSection,
+};
 use crate::scanner;
 use crate::scraper::{self, NameSearch, ScrapeUpdate};
 use crate::scraper_settings::{
-    self, scraper_key, Block as ScraperBlock, Command as ScraperCommand, Part as ScraperPart,
-    ScraperSettings, Slot as ScraperSlot,
+    scraper_key, Block as ScraperBlock, Part as ScraperPart, Slot as ScraperSlot,
 };
+use crate::split;
+use crate::systems::{self, systems_key, Field as SystemField, Step as SystemStep, Systems};
 use crate::types::{
     DeleteOptions, EmulatorKind, Game, GameMetadata, GridArt, GridFilter, Media, MediaKind,
 };
@@ -77,14 +82,13 @@ pub struct Shell {
     import_rx: Option<std::sync::mpsc::Receiver<ImportUpdate>>,
     import_scroll: ScrollHandle,
     pick_scroll: ScrollHandle,
-    /// Manage Emulators. Writes `config.toml` as each change is confirmed.
     emulators: Option<Emulators>,
-    /// Options → Input. Writes `[input]` as each spin changes.
-    options: Option<InputOptions>,
-    /// Scraper settings. Writes `[scraper]` when Save is confirmed.
-    scraper: Option<ScraperSettings>,
+    systems: Option<Systems>,
+    options: Option<Options>,
+    cores: CoreCatalog,
     emulator_scroll: ScrollHandle,
-    scraper_scroll: ScrollHandle,
+    systems_scroll: ScrollHandle,
+    options_scroll: ScrollHandle,
     /// Closing the dialog drops whatever control had focus. The next frame
     /// puts the keyboard back on the shell.
     refocus: bool,
@@ -184,10 +188,12 @@ impl Shell {
             import_scroll: ScrollHandle::new(),
             pick_scroll: ScrollHandle::new(),
             emulators: None,
+            systems: None,
             options: None,
-            scraper: None,
+            cores: cores::catalog_for(&config::load_config().unwrap_or_default()),
             emulator_scroll: ScrollHandle::new(),
-            scraper_scroll: ScrollHandle::new(),
+            systems_scroll: ScrollHandle::new(),
+            options_scroll: ScrollHandle::new(),
             refocus: false,
             play_tx,
             play_rx,
@@ -201,15 +207,15 @@ impl Shell {
     fn poll_nav(&mut self, cx: &mut Context<Self>) {
         let events = self.drain_pad_events();
         let mut changed = self.poll_jobs();
-        if self.scraper.is_some() {
-            changed |= self.poll_scraper_pad(&events, cx);
+        if self.options.is_some() {
+            changed |= self.poll_options_pad(&events, cx);
             if changed {
                 cx.notify();
             }
             return;
         }
-        if self.options.is_some() {
-            changed |= self.poll_options_pad(&events, cx);
+        if self.systems.is_some() {
+            changed |= self.poll_systems_pad(&events, cx);
             if changed {
                 cx.notify();
             }
@@ -321,12 +327,12 @@ impl Shell {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.scraper.is_some() {
-            self.on_scraper_key(&event.keystroke, false, cx);
-            return;
-        }
         if self.options.is_some() {
             self.on_options_key(&event.keystroke, false, cx);
+            return;
+        }
+        if self.systems.is_some() {
+            self.on_systems_key(&event.keystroke, false, cx);
             return;
         }
         if self.emulators.is_some() {
@@ -366,13 +372,37 @@ impl Shell {
             return;
         }
         if !event.is_held
+            && systems_key(
+                event.keystroke.key.as_str(),
+                event.keystroke.key_char.as_deref(),
+                event.keystroke.modifiers.control,
+            )
+        {
+            self.open_systems();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if !event.is_held
+            && options_key(
+                event.keystroke.key.as_str(),
+                event.keystroke.key_char.as_deref(),
+                event.keystroke.modifiers.control,
+            )
+        {
+            self.open_options(OptionsSection::Input);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if !event.is_held
             && scraper_key(
                 event.keystroke.key.as_str(),
                 event.keystroke.key_char.as_deref(),
                 event.keystroke.modifiers.control,
             )
         {
-            self.open_scraper();
+            self.open_options(OptionsSection::Scraper);
             cx.notify();
             cx.stop_propagation();
             return;
@@ -522,12 +552,12 @@ impl Shell {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
-        if self.scraper.is_some() {
-            self.on_scraper_key(&event.keystroke, true, cx);
-            return;
-        }
         if self.options.is_some() {
             self.on_options_key(&event.keystroke, true, cx);
+            return;
+        }
+        if self.systems.is_some() {
+            self.on_systems_key(&event.keystroke, true, cx);
             return;
         }
         if self.emulators.is_some() {
@@ -670,20 +700,17 @@ impl Shell {
             self.hold
                 .poll(&self.input, self.pad.horizontal(), self.pad.vertical(), now);
         for dir in [step_x, step_y].into_iter().flatten() {
-            let write = self
+            let step = self
                 .emulators
                 .as_mut()
-                .is_some_and(|dialog| dialog.move_dir(dir));
-            if write {
-                self.write_emulators();
-            }
+                .map(|dialog| dialog.move_dir(dir))
+                .unwrap_or(EmulatorStep::Stay);
+            self.apply_emulator_step(step);
             changed = true;
         }
         changed
     }
 
-    /// Tab, 1, and 2 switch tabs. Arrows move. Enter confirms. Esc closes.
-    /// A system's left/right choice is written immediately.
     fn on_emulator_key(&mut self, keystroke: &Keystroke, release: bool, cx: &mut Context<Self>) {
         if let Some(dir) = arrow_dir(keystroke) {
             let modified = keystroke.modifiers.control
@@ -694,13 +721,12 @@ impl Shell {
                 if release {
                     self.hold.release(&self.input, dir, now);
                 } else if self.hold.press(&self.input, dir, now) > 0 {
-                    let write = self
+                    let step = self
                         .emulators
                         .as_mut()
-                        .is_some_and(|dialog| dialog.move_dir(dir));
-                    if write {
-                        self.write_emulators();
-                    }
+                        .map(|dialog| dialog.move_dir(dir))
+                        .unwrap_or(EmulatorStep::Stay);
+                    self.apply_emulator_step(step);
                     cx.notify();
                 }
             }
@@ -712,7 +738,7 @@ impl Shell {
             // keydown. The keyup still arrives, and that is what moves this dialog.
             if keystroke.key == "tab" {
                 if let Some(dialog) = &mut self.emulators {
-                    dialog.cycle_tab();
+                    dialog.tab(keystroke.modifiers.shift);
                 }
                 cx.notify();
             }
@@ -752,19 +778,12 @@ impl Shell {
             }
             cx.notify();
         } else if !modified {
-            let typing = self
+            let rescan = self
                 .emulators
                 .as_ref()
-                .is_some_and(|dialog| dialog.accepts_text());
-            if !typing && matches!(key, "1" | "digit1" | "numpad1") {
-                if let Some(dialog) = &mut self.emulators {
-                    dialog.show(Tab::Emulators);
-                }
-                cx.notify();
-            } else if !typing && matches!(key, "2" | "digit2" | "numpad2") {
-                if let Some(dialog) = &mut self.emulators {
-                    dialog.show(Tab::Systems);
-                }
+                .is_some_and(|dialog| dialog.rescan_key(key, keystroke.key_char.as_deref()));
+            if rescan {
+                self.rescan_cores();
                 cx.notify();
             } else if let Some(text) = typed_text(keystroke) {
                 if let Some(dialog) = &mut self.emulators {
@@ -786,13 +805,12 @@ impl Shell {
                 if release {
                     self.hold.release(&self.input, dir, now);
                 } else if self.hold.press(&self.input, dir, now) > 0 {
-                    let changed = self
+                    let command = self
                         .options
                         .as_mut()
-                        .is_some_and(|dialog| dialog.move_dir(dir));
-                    if changed {
-                        self.commit_input();
-                    }
+                        .map(|dialog| dialog.move_dir(dir))
+                        .unwrap_or(OptionsCommand::None);
+                    self.apply_options_command(command, cx);
                     cx.notify();
                 }
             }
@@ -813,25 +831,55 @@ impl Shell {
         let modified =
             keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
         if key == "escape" {
-            self.close_options();
+            self.finish_options();
             cx.notify();
-        } else if key == "enter" || (key == "space" && !modified) {
-            self.confirm_options();
+        } else if key == "enter" {
+            self.confirm_options(cx);
             cx.notify();
+        } else if key == "backspace" {
+            if let Some(dialog) = &mut self.options {
+                dialog.backspace();
+            }
+            cx.notify();
+        } else if key == "delete" {
+            if let Some(dialog) = &mut self.options {
+                dialog.delete_forward();
+            }
+            cx.notify();
+        } else if key == "space" && !modified {
+            let typing = self
+                .options
+                .as_ref()
+                .is_some_and(|dialog| dialog.accepts_text());
+            if typing {
+                if let Some(dialog) = &mut self.options {
+                    dialog.type_text(" ");
+                }
+            } else {
+                self.confirm_options(cx);
+            }
+            cx.notify();
+        } else if !modified {
+            if let Some(text) = typed_text(keystroke) {
+                if let Some(dialog) = &mut self.options {
+                    dialog.type_text(text);
+                }
+                cx.notify();
+            }
         }
         cx.stop_propagation();
     }
 
-    fn poll_options_pad(&mut self, events: &[gilrs::EventType], _cx: &mut Context<Self>) -> bool {
+    fn poll_options_pad(&mut self, events: &[gilrs::EventType], cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         for event in events {
             match self.pad.apply(event) {
                 Some(PadAction::Confirm) => {
-                    self.confirm_options();
+                    self.confirm_options(cx);
                     changed = true;
                 }
                 Some(PadAction::Back) => {
-                    self.close_options();
+                    self.finish_options();
                     changed = true;
                 }
                 Some(PadAction::Favorite | PadAction::Menu) | None => {}
@@ -842,21 +890,18 @@ impl Shell {
             self.hold
                 .poll(&self.input, self.pad.horizontal(), self.pad.vertical(), now);
         for dir in [step_x, step_y].into_iter().flatten() {
-            let write = self
+            let command = self
                 .options
                 .as_mut()
-                .is_some_and(|dialog| dialog.move_dir(dir));
-            if write {
-                self.commit_input();
-            }
+                .map(|dialog| dialog.move_dir(dir))
+                .unwrap_or(OptionsCommand::None);
+            self.apply_options_command(command, cx);
             changed = true;
         }
         changed
     }
 
-    /// Arrows and Tab move. Enter confirms the focused control. Esc closes
-    /// without writing. A credential field takes characters.
-    fn on_scraper_key(&mut self, keystroke: &Keystroke, release: bool, cx: &mut Context<Self>) {
+    fn on_systems_key(&mut self, keystroke: &Keystroke, release: bool, cx: &mut Context<Self>) {
         if let Some(dir) = arrow_dir(keystroke) {
             let modified = keystroke.modifiers.control
                 || keystroke.modifiers.alt
@@ -866,8 +911,13 @@ impl Shell {
                 if release {
                     self.hold.release(&self.input, dir, now);
                 } else if self.hold.press(&self.input, dir, now) > 0 {
-                    if let Some(dialog) = &mut self.scraper {
-                        dialog.move_dir(dir);
+                    let step = self
+                        .systems
+                        .as_mut()
+                        .map(|dialog| dialog.move_dir(dir))
+                        .unwrap_or(SystemStep::Stay);
+                    if step == SystemStep::Write {
+                        self.write_systems();
                     }
                     cx.notify();
                 }
@@ -877,7 +927,7 @@ impl Shell {
         }
         if release {
             if keystroke.key == "tab" {
-                if let Some(dialog) = &mut self.scraper {
+                if let Some(dialog) = &mut self.systems {
                     dialog.tab(keystroke.modifiers.shift);
                 }
                 cx.notify();
@@ -889,37 +939,37 @@ impl Shell {
         let modified =
             keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
         if key == "escape" {
-            self.close_scraper();
+            self.finish_systems();
             cx.notify();
         } else if key == "enter" {
-            self.confirm_scraper();
+            self.confirm_systems();
             cx.notify();
         } else if key == "backspace" {
-            if let Some(dialog) = &mut self.scraper {
+            if let Some(dialog) = &mut self.systems {
                 dialog.backspace();
             }
             cx.notify();
         } else if key == "delete" {
-            if let Some(dialog) = &mut self.scraper {
+            if let Some(dialog) = &mut self.systems {
                 dialog.delete_forward();
             }
             cx.notify();
         } else if key == "space" && !modified {
             let typing = self
-                .scraper
+                .systems
                 .as_ref()
                 .is_some_and(|dialog| dialog.accepts_text());
             if typing {
-                if let Some(dialog) = &mut self.scraper {
+                if let Some(dialog) = &mut self.systems {
                     dialog.type_text(" ");
                 }
             } else {
-                self.confirm_scraper();
+                self.confirm_systems();
             }
             cx.notify();
         } else if !modified {
             if let Some(text) = typed_text(keystroke) {
-                if let Some(dialog) = &mut self.scraper {
+                if let Some(dialog) = &mut self.systems {
                     dialog.type_text(text);
                 }
                 cx.notify();
@@ -928,16 +978,16 @@ impl Shell {
         cx.stop_propagation();
     }
 
-    fn poll_scraper_pad(&mut self, events: &[gilrs::EventType], _cx: &mut Context<Self>) -> bool {
+    fn poll_systems_pad(&mut self, events: &[gilrs::EventType], _cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         for event in events {
             match self.pad.apply(event) {
                 Some(PadAction::Confirm) => {
-                    self.confirm_scraper();
+                    self.confirm_systems();
                     changed = true;
                 }
                 Some(PadAction::Back) => {
-                    self.close_scraper();
+                    self.finish_systems();
                     changed = true;
                 }
                 Some(PadAction::Favorite | PadAction::Menu) | None => {}
@@ -948,25 +998,33 @@ impl Shell {
             self.hold
                 .poll(&self.input, self.pad.horizontal(), self.pad.vertical(), now);
         for dir in [step_x, step_y].into_iter().flatten() {
-            if let Some(dialog) = &mut self.scraper {
-                dialog.move_dir(dir);
+            let step = self
+                .systems
+                .as_mut()
+                .map(|dialog| dialog.move_dir(dir))
+                .unwrap_or(SystemStep::Stay);
+            if step == SystemStep::Write {
+                self.write_systems();
             }
             changed = true;
         }
         changed
     }
 
-    fn open_scraper(&mut self) {
-        if self.import_rx.is_some()
+    fn screen_busy(&self) -> bool {
+        self.import_rx.is_some()
             || self.wizard.is_some()
             || self.emulators.is_some()
+            || self.systems.is_some()
             || self.options.is_some()
-            || self.scraper.is_some()
-        {
+    }
+
+    fn open_options(&mut self, section: OptionsSection) {
+        if self.screen_busy() {
             return;
         }
-        let scraper = match config::load_config() {
-            Ok(config) => config.scraper,
+        let config = match config::load_config() {
+            Ok(config) => config,
             Err(err) => {
                 self.browse.status = format!("Could not read config ({err}).");
                 return;
@@ -974,72 +1032,49 @@ impl Shell {
         };
         self.browse.close_overlay();
         self.search = None;
-        self.scraper = Some(ScraperSettings::open(scraper));
+        self.input = config.input.sanitized();
+        self.options = Some(Options::open(&config, section));
     }
 
-    fn close_scraper(&mut self) {
-        self.scraper = None;
-        self.refocus = true;
-    }
-
-    fn confirm_scraper(&mut self) {
-        let Some(command) = self.scraper.as_mut().map(|dialog| dialog.confirm()) else {
+    fn finish_options(&mut self) {
+        if self.options.is_none() {
             return;
-        };
-        if command == ScraperCommand::Save {
-            self.write_scraper();
+        }
+        if self.write_options_scraper() {
+            self.options = None;
+            self.refocus = true;
         }
     }
 
-    fn write_scraper(&mut self) {
-        let Some(draft) = self.scraper.as_ref().map(|dialog| dialog.draft()) else {
-            return;
-        };
-        if let Err(err) = config::save_scraper_settings(draft) {
-            let message = format!("Could not save scraper settings ({err}).");
-            self.browse.status = message.clone();
-            if let Some(dialog) = &mut self.scraper {
-                dialog.set_error(message);
-            }
-            return;
-        }
-        self.close_scraper();
-    }
-
-    fn open_options(&mut self) {
-        if self.import_rx.is_some()
-            || self.wizard.is_some()
-            || self.emulators.is_some()
-            || self.options.is_some()
-            || self.scraper.is_some()
-        {
-            return;
-        }
-        let input = match config::load_config() {
-            Ok(config) => config.input,
-            Err(err) => {
-                self.browse.status = format!("Could not read config ({err}).");
-                return;
-            }
-        };
-        self.browse.close_overlay();
-        self.search = None;
-        self.input = input.sanitized();
-        self.options = Some(InputOptions::open(self.input));
-    }
-
-    fn close_options(&mut self) {
-        self.options = None;
-        self.refocus = true;
-    }
-
-    fn confirm_options(&mut self) {
-        if self
+    fn confirm_options(&mut self, cx: &mut Context<Self>) {
+        let command = self
             .options
-            .as_ref()
-            .is_some_and(|dialog| dialog.close_aimed())
-        {
-            self.close_options();
+            .as_mut()
+            .map(|dialog| dialog.confirm())
+            .unwrap_or(OptionsCommand::None);
+        self.apply_options_command(command, cx);
+    }
+
+    fn apply_options_command(&mut self, command: OptionsCommand, cx: &mut Context<Self>) {
+        match command {
+            OptionsCommand::None => {}
+            OptionsCommand::Close => self.finish_options(),
+            OptionsCommand::Input => self.commit_input(),
+            OptionsCommand::Theme => self.commit_theme_from_options(cx),
+            OptionsCommand::Cover => {
+                if let Some(width) = self.options.as_ref().map(|dialog| dialog.cover_width()) {
+                    self.browse.cover_width = width;
+                    self.persist_cover_width();
+                }
+            }
+            OptionsCommand::Sort => {
+                if let Some(sort) = self.options.as_ref().map(|dialog| dialog.system_sort()) {
+                    self.choose_system_sort(sort);
+                }
+            }
+            OptionsCommand::SaveScraper => {
+                self.write_options_scraper();
+            }
         }
     }
 
@@ -1053,12 +1088,47 @@ impl Shell {
         }
     }
 
+    fn commit_theme_from_options(&mut self, cx: &mut Context<Self>) {
+        let Some(theme) = self
+            .options
+            .as_ref()
+            .map(|dialog| dialog.theme().to_string())
+        else {
+            return;
+        };
+        if theme == self.appearance {
+            return;
+        }
+        let previous = self.appearance.clone();
+        self.appearance = theme;
+        self.apply_appearance(cx);
+        if let Err(err) = config::save_theme_name(&self.appearance) {
+            self.appearance = previous;
+            self.apply_appearance(cx);
+            self.browse.status = format!("Could not save theme ({err}).");
+        }
+    }
+
+    fn write_options_scraper(&mut self) -> bool {
+        let Some(draft) = self.options.as_ref().map(|dialog| dialog.scraper().draft()) else {
+            return false;
+        };
+        if let Err(err) = config::save_scraper_settings(draft) {
+            let message = format!("Could not save scraper settings ({err}).");
+            self.browse.status = message.clone();
+            if let Some(dialog) = &mut self.options {
+                dialog.scraper_mut().set_error(message);
+            }
+            return false;
+        }
+        true
+    }
+
     fn choose_system_sort(&mut self, sort: SystemSort) {
         let previous = self.browse.library.system_sort;
         if !self.browse.set_system_sort(sort) {
             return;
         }
-        // The console index moved with the shelf. Keep the grid where it is.
         self.revealed_console = Some(self.browse.console);
         self.scroll_sidebar_to_console(self.browse.console);
         if self.browse.library.kind != LibraryKind::Disk {
@@ -1098,18 +1168,119 @@ impl Shell {
     }
 
     fn finish_emulators(&mut self) {
+        if let Some(dialog) = &mut self.emulators {
+            dialog.commit();
+        }
         if self.write_emulators() {
             self.close_emulators();
         }
     }
 
     fn open_emulators(&mut self) {
-        if self.import_rx.is_some()
-            || self.wizard.is_some()
-            || self.emulators.is_some()
-            || self.options.is_some()
-            || self.scraper.is_some()
-        {
+        if self.screen_busy() {
+            return;
+        }
+        let mut config = match config::load_config() {
+            Ok(config) => config,
+            Err(err) => {
+                self.browse.status = format!("Could not read config ({err}).");
+                return;
+            }
+        };
+        let found = cores::find_retroarch(&cores::DetectEnv::process());
+        if cores::ensure_retroarch(&mut config.emulators, found) {
+            if let Err(err) = config::save_config(&config) {
+                self.browse.status = format!("Could not save config ({err}).");
+                return;
+            }
+            self.browse.library.emulators = config.emulators.clone();
+            self.cores = cores::catalog_for(&config);
+        }
+        self.browse.close_overlay();
+        self.search = None;
+        self.emulators = Some(Emulators::open(&config, self.cores.cores.clone()));
+    }
+
+    fn confirm_emulators(&mut self, _cx: &mut Context<Self>) {
+        let step = self
+            .emulators
+            .as_mut()
+            .map(|dialog| dialog.confirm())
+            .unwrap_or(EmulatorStep::Stay);
+        self.apply_emulator_step(step);
+    }
+
+    fn apply_emulator_step(&mut self, step: EmulatorStep) {
+        match step {
+            EmulatorStep::Stay => {}
+            EmulatorStep::Write => {
+                self.write_emulators();
+            }
+            EmulatorStep::Rescan => self.rescan_cores(),
+        }
+    }
+
+    fn write_emulators(&mut self) -> bool {
+        let emulators = {
+            let Some(dialog) = &self.emulators else {
+                return false;
+            };
+            dialog.emulators().to_vec()
+        };
+        let mut config = match config::load_config() {
+            Ok(config) => config,
+            Err(err) => {
+                if let Some(dialog) = &mut self.emulators {
+                    dialog.set_error(format!("Could not read config ({err})."));
+                }
+                return false;
+            }
+        };
+        emulators::apply_emulators(&mut config, &emulators);
+        if let Err(err) = config::save_config(&config) {
+            if let Some(dialog) = &mut self.emulators {
+                dialog.set_error(format!("Could not save config ({err})."));
+            }
+            return false;
+        }
+        self.copy_library(&config);
+        true
+    }
+
+    fn rescan_cores(&mut self) {
+        if let Some(dialog) = &mut self.emulators {
+            dialog.commit();
+        }
+        let mut config = match config::load_config() {
+            Ok(config) => config,
+            Err(err) => {
+                self.browse.status = format!("Could not read config ({err}).");
+                return;
+            }
+        };
+        if let Some(dialog) = &self.emulators {
+            emulators::apply_emulators(&mut config, dialog.emulators());
+        }
+        self.cores = cores::catalog_for(&config);
+        cores::repoint_consoles(&mut config.consoles, &self.cores);
+        if let Err(err) = config::save_config(&config) {
+            self.browse.status = format!("Could not save config ({err}).");
+            return;
+        }
+        self.copy_library(&config);
+        let cores = self.cores.cores.clone();
+        if let Some(dialog) = &mut self.emulators {
+            dialog.set_cores(cores);
+        }
+        self.browse.status = format!(
+            "Rescanned {} cores from {}.",
+            self.cores.cores.len(),
+            self.cores.directory.display()
+        );
+    }
+
+    fn open_systems(&mut self) {
+        if self.screen_busy() {
             return;
         }
         let config = match config::load_config() {
@@ -1121,64 +1292,67 @@ impl Shell {
         };
         self.browse.close_overlay();
         self.search = None;
-        let cores = cores::discover_cores();
-        self.emulators = Some(Emulators::open(&config, cores));
+        self.systems = Some(Systems::open(&config, self.cores.cores.clone()));
     }
 
-    fn confirm_emulators(&mut self, _cx: &mut Context<Self>) {
-        let Some(command) = self.emulators.as_mut().map(|dialog| dialog.confirm()) else {
-            return;
-        };
-        match command {
-            EmulatorCommand::None => {}
-            EmulatorCommand::Close => self.finish_emulators(),
-            EmulatorCommand::Write => {
-                self.write_emulators();
-            }
+    fn finish_systems(&mut self) {
+        if self.write_systems() {
+            self.systems = None;
+            self.refocus = true;
         }
     }
 
-    fn write_emulators(&mut self) -> bool {
-        let (emulators, systems) = {
-            let Some(dialog) = &self.emulators else {
+    fn confirm_systems(&mut self) {
+        let step = self
+            .systems
+            .as_mut()
+            .map(|dialog| dialog.confirm())
+            .unwrap_or(SystemStep::Stay);
+        if step == SystemStep::Write {
+            self.write_systems();
+        }
+    }
+
+    fn write_systems(&mut self) -> bool {
+        let rows = {
+            let Some(dialog) = &self.systems else {
                 return false;
             };
-            (dialog.emulators().to_vec(), dialog.systems().to_vec())
+            dialog.rows().to_vec()
         };
         let mut config = match config::load_config() {
             Ok(config) => config,
             Err(err) => {
-                if let Some(dialog) = &mut self.emulators {
-                    dialog.set_error(format!("Could not read config ({err})."));
-                }
+                self.browse.status = format!("Could not read config ({err}).");
                 return false;
             }
         };
-        crate::emulators::apply_assignments(&mut config, &emulators, &systems);
+        systems::apply_systems(&mut config, &rows);
         if let Err(err) = config::save_config(&config) {
-            if let Some(dialog) = &mut self.emulators {
-                dialog.set_error(format!("Could not save config ({err})."));
-            }
+            self.browse.status = format!("Could not save config ({err}).");
             return false;
         }
+        self.copy_library(&config);
+        true
+    }
+
+    fn copy_library(&mut self, config: &config::Config) {
         self.browse.library.emulators = config.emulators.clone();
         for shelf in &mut self.browse.library.shelves {
-            if let Some(console) = config.consoles.iter().find(|c| c.id == shelf.console.id) {
+            if let Some(console) = config
+                .consoles
+                .iter()
+                .find(|item| item.id == shelf.console.id)
+            {
                 shelf.console.emulator = console.emulator.clone();
                 shelf.console.core = console.core.clone();
                 shelf.console.extra_args = console.extra_args.clone();
             }
         }
-        true
     }
 
     fn open_import(&mut self) {
-        if self.import_rx.is_some()
-            || self.wizard.is_some()
-            || self.emulators.is_some()
-            || self.options.is_some()
-            || self.scraper.is_some()
-        {
+        if self.screen_busy() {
             return;
         }
         self.browse.close_overlay();
@@ -1930,16 +2104,25 @@ impl Shell {
             return;
         };
         if self.emulator_scroll.bounds().size.height > px(0.) {
-            self.emulator_scroll.scroll_to_item(dialog.scroll_index());
+            self.emulator_scroll.scroll_to_item(dialog.selected_index());
         }
     }
 
-    fn reveal_scraper(&mut self) {
-        let Some(dialog) = &self.scraper else {
+    fn reveal_systems(&mut self) {
+        let Some(dialog) = &self.systems else {
             return;
         };
-        if self.scraper_scroll.bounds().size.height > px(0.) {
-            self.scraper_scroll.scroll_to_item(dialog.scroll_index());
+        if self.systems_scroll.bounds().size.height > px(0.) {
+            self.systems_scroll.scroll_to_item(dialog.selected_index());
+        }
+    }
+
+    fn reveal_options(&mut self) {
+        let Some(dialog) = &self.options else {
+            return;
+        };
+        if self.options_scroll.bounds().size.height > px(0.) {
+            self.options_scroll.scroll_to_item(dialog.selected_index());
         }
     }
 
@@ -1969,7 +2152,17 @@ impl Render for Shell {
         self.reveal_selection();
         self.reveal_import();
         self.reveal_emulators();
-        self.reveal_scraper();
+        self.reveal_systems();
+        self.reveal_options();
+        if let Some(options) = &self.options {
+            let width = options.cover_width();
+            if (self.browse.cover_width - width).abs() >= 0.5 {
+                self.browse.cover_width = width;
+                self.cover_slider.update(cx, |state, cx| {
+                    state.set_value(width, window, cx);
+                });
+            }
+        }
         if let Overlay::Scrape(prompt) = &self.browse.overlay {
             if prompt.slot == ScrapeSlot::Results {
                 self.scrape_scroll.scroll_to_item(prompt.cursor);
@@ -2019,17 +2212,20 @@ impl Render for Shell {
                 &self.pick_scroll,
                 cx,
             ))
-            .children(emulator_dialog(
+            .children(emulator_screen(
                 self.emulators.as_ref(),
+                &self.cores,
                 &self.emulator_scroll,
-                window.viewport_size().width.as_f32(),
-                window.viewport_size().height.as_f32(),
                 cx,
             ))
-            .children(options_dialog(self.options.as_ref(), cx))
-            .children(scraper_dialog(
-                self.scraper.as_ref(),
-                &self.scraper_scroll,
+            .children(systems_screen(
+                self.systems.as_ref(),
+                &self.systems_scroll,
+                cx,
+            ))
+            .children(options_screen(
+                self.options.as_ref(),
+                &self.options_scroll,
                 cx,
             ))
     }
@@ -2073,6 +2269,7 @@ fn header(
             .gap(px(2.))
             .child(import_button(cx))
             .child(emulators_button(cx))
+            .child(systems_button(cx))
             .child(scraper_button(cx))
             .child(options_button(cx))
             .child(scrape_button(false, cx))
@@ -2160,7 +2357,7 @@ fn scraper_button(cx: &Context<Shell>) -> impl IntoElement {
             .px(px(4.))
             .flex_shrink_0()
             .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-                this.open_scraper();
+                this.open_options(OptionsSection::Scraper);
                 this.focus_handle.focus(window, cx);
                 cx.notify();
             })),
@@ -2173,7 +2370,7 @@ fn options_button(cx: &Context<Shell>) -> impl IntoElement {
         .px(px(4.))
         .flex_shrink_0()
         .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-            this.open_options();
+            this.open_options(OptionsSection::Input);
             this.focus_handle.focus(window, cx);
             cx.notify();
         }))
@@ -2195,6 +2392,22 @@ fn theme_button(appearance: &str, cx: &Context<Shell>) -> impl IntoElement {
                     cx.notify();
                 })),
         )
+}
+
+fn systems_button(cx: &Context<Shell>) -> impl IntoElement {
+    button(
+        "manage-systems",
+        "Manage Systems",
+        ButtonVariant::Secondary,
+        cx,
+    )
+    .px(px(4.))
+    .flex_shrink_0()
+    .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
+        this.open_systems();
+        this.focus_handle.focus(window, cx);
+        cx.notify();
+    }))
 }
 
 fn emulators_button(cx: &Context<Shell>) -> impl IntoElement {
@@ -2977,7 +3190,7 @@ fn status_line(
 ) -> impl IntoElement {
     let theme = cx.omarchy();
     let text = if browse.status.is_empty() {
-        "Ctrl+I imports ROMs. Ctrl+G scraper settings. Ctrl+M or Ctrl+E manages emulators."
+        "Ctrl+I imports. Ctrl+E emulators. Ctrl+P systems. Ctrl+O options. Ctrl+G scraper."
     } else {
         browse.status.as_str()
     };
@@ -4096,69 +4309,596 @@ fn import_error(text: &str, cx: &Context<Shell>) -> impl IntoElement {
         .child(text.to_string())
 }
 
-fn emulator_dialog(
+fn emulator_screen(
     dialog: Option<&Emulators>,
+    catalog: &CoreCatalog,
     scroll: &ScrollHandle,
-    viewport_w: f32,
-    viewport_h: f32,
     cx: &Context<Shell>,
 ) -> Option<gpui_kit::AnyElement> {
     let dialog = dialog?;
-    let width = (viewport_w - 32.0).clamp(520.0, 880.0);
-    let scroll_h = (viewport_h - 220.0).clamp(160.0, 520.0);
-    let mut list = div()
-        .id("emulator-list")
-        .w_full()
-        .h(px(scroll_h))
-        .overflow_y_scroll()
-        .track_scroll(scroll)
-        .flex()
-        .flex_col()
-        .gap(px(8.))
-        .pt(px(4.));
-    for block in dialog.scroll_blocks() {
-        list = list.child(emulator_block(block, cx));
-    }
+    let rows = dialog
+        .list_rows()
+        .into_iter()
+        .map(|row| emulator_list_row(row, cx).into_any_element())
+        .collect::<Vec<_>>();
+    let panel = emulator_panel(&dialog.panel(), catalog, cx);
     Some(
-        modal(
-            dialog_page("emulator-dialog", "Manage Emulators", width, cx)
-                .max_h(px((viewport_h - 24.0).max(240.0)))
-                .child(hint(HINT, cx))
-                .child(emulator_tabs(dialog, cx))
-                .child(list)
-                .child(div().flex().justify_end().child(emulator_action(
-                    "emulator-close".to_string(),
-                    "Close".to_string(),
-                    ButtonVariant::Secondary,
-                    dialog.focus() == Slot::Close,
-                    Slot::Close,
-                    cx,
-                ))),
+        split::screen(
+            "emulator-list",
+            "Manage Emulators",
+            dialog.list_focused(),
+            scroll,
+            rows,
+            !dialog.list_focused(),
+            panel,
+            cx,
         )
         .into_any_element(),
     )
 }
 
-fn options_dialog(
-    dialog: Option<&InputOptions>,
+fn emulator_list_row(row: crate::emulators::ListRow, cx: &Context<Shell>) -> impl IntoElement {
+    let index = row.index;
+    split_list_row(("emulator", index), row.title, row.detail, row.selected, cx).on_click(
+        cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+            if let Some(dialog) = &mut this.emulators {
+                dialog.select(index);
+            }
+            this.focus_handle.focus(window, cx);
+            cx.notify();
+        }),
+    )
+}
+
+fn emulator_panel(
+    panel: &crate::emulators::Panel,
+    catalog: &CoreCatalog,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let title = if panel.adding {
+        "New emulator".to_string()
+    } else {
+        let name = panel.name.text.trim();
+        if name.is_empty() {
+            "Emulator".to_string()
+        } else {
+            name.to_string()
+        }
+    };
+    let mut page = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading(&title))
+        .child(field_label("Name", cx))
+        .child(emulator_editor(
+            "emulator-name",
+            &panel.name,
+            panel.name_aimed,
+            "Name",
+            EmulatorField::Name,
+            cx,
+        ))
+        .child(field_label("Kind", cx))
+        .child(kind_block(panel.kind, panel.kind_aimed, cx))
+        .child(field_label("Path", cx))
+        .child(emulator_editor(
+            "emulator-path",
+            &panel.path,
+            panel.path_aimed,
+            "Executable path",
+            EmulatorField::Path,
+            cx,
+        ))
+        .child(field_label("Global arguments", cx))
+        .child(emulator_editor(
+            "emulator-global-args",
+            &panel.args,
+            panel.args_aimed,
+            "Global arguments",
+            EmulatorField::Args,
+            cx,
+        ));
+    if panel.show_cores {
+        page = page
+            .child(heading("Cores"))
+            .child(hint(&format!("From {}", catalog.directory.display()), cx))
+            .child(core_list(&panel.cores, cx))
+            .child(emulator_press(
+                "emulator-rescan".to_string(),
+                "Rescan cores".to_string(),
+                ButtonVariant::Secondary,
+                panel.rescan_aimed,
+                EmulatorField::Rescan,
+                cx,
+            ));
+    }
+    let mut actions = div().flex().justify_end().gap(px(8.));
+    if panel.show_delete {
+        actions = actions.child(emulator_press(
+            "emulator-delete".to_string(),
+            "Delete".to_string(),
+            ButtonVariant::Danger,
+            panel.delete_aimed,
+            EmulatorField::Delete,
+            cx,
+        ));
+    }
+    actions = actions.child(emulator_press(
+        "emulator-save".to_string(),
+        panel.save_label.to_string(),
+        ButtonVariant::Primary,
+        panel.save_aimed,
+        EmulatorField::Save,
+        cx,
+    ));
+    page = page.child(actions);
+    if let Some(error) = &panel.error {
+        page = page.child(import_error(error, cx));
+    }
+    page
+}
+
+fn core_list(cores: &[crate::emulators::CoreLine], cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    if cores.is_empty() {
+        return hint("No cores in that directory.", cx).into_any_element();
+    }
+    let mut list = div().flex().flex_col().gap(px(4.));
+    for (index, core) in cores.iter().enumerate() {
+        list = list.child(
+            div()
+                .id(("emulator-core", index))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .px(px(8.))
+                .py(px(6.))
+                .bg(theme.surface)
+                .border_1()
+                .border_color(theme.border)
+                .child(core.label.clone())
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(12.))
+                        .text_color(theme.secondary)
+                        .child(core.file_name.clone()),
+                ),
+        );
+    }
+    list.into_any_element()
+}
+
+fn systems_screen(
+    dialog: Option<&Systems>,
+    scroll: &ScrollHandle,
     cx: &Context<Shell>,
 ) -> Option<gpui_kit::AnyElement> {
     let dialog = dialog?;
-    let mut page = dialog_page("options-dialog", "Options", 520., cx)
+    let rows = dialog
+        .list_rows()
+        .into_iter()
+        .map(|row| system_list_row(row, cx).into_any_element())
+        .collect::<Vec<_>>();
+    let panel = systems_panel(&dialog.panel(), cx);
+    Some(
+        split::screen(
+            "systems-list",
+            "Manage Systems",
+            dialog.list_focused(),
+            scroll,
+            rows,
+            !dialog.list_focused(),
+            panel,
+            cx,
+        )
+        .into_any_element(),
+    )
+}
+
+fn system_list_row(row: crate::systems::ListRow, cx: &Context<Shell>) -> impl IntoElement {
+    let index = row.index;
+    split_list_row(("system", index), row.title, row.detail, row.selected, cx).on_click(
+        cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+            if let Some(dialog) = &mut this.systems {
+                dialog.select(index);
+            }
+            this.focus_handle.focus(window, cx);
+            cx.notify();
+        }),
+    )
+}
+
+fn systems_panel(panel: &crate::systems::Panel, cx: &Context<Shell>) -> impl IntoElement {
+    if panel.empty {
+        return hint("No systems in this library.", cx).into_any_element();
+    }
+    let mut page = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading(&panel.name))
+        .child(field_label("Emulator", cx))
+        .child(system_press(
+            "system-emulator".to_string(),
+            format!("Emulator: {}", panel.emulator),
+            panel.emulator_aimed,
+            SystemField::Emulator,
+            cx,
+        ));
+    if panel.core_enabled {
+        page = page.child(field_label("Core", cx)).child(system_press(
+            "system-core".to_string(),
+            format!("Core: {}", panel.core),
+            panel.core_aimed,
+            SystemField::Core,
+            cx,
+        ));
+        if panel.core_missing {
+            page = page.child(import_error(
+                "That core is not in the active RetroArch directory.",
+                cx,
+            ));
+        }
+    } else {
+        page = page.child(
+            div()
+                .text_color(cx.omarchy().secondary)
+                .child("Core: No core"),
+        );
+    }
+    page = page
+        .child(field_label("Extra arguments", cx))
+        .child(system_editor(
+            "system-args",
+            &panel.args,
+            panel.args_aimed,
+            "Extra arguments",
+            cx,
+        ));
+    page.into_any_element()
+}
+
+fn options_screen(
+    dialog: Option<&Options>,
+    scroll: &ScrollHandle,
+    cx: &Context<Shell>,
+) -> Option<gpui_kit::AnyElement> {
+    let dialog = dialog?;
+    let rows = dialog
+        .sections()
+        .into_iter()
+        .map(|row| options_list_row(row, cx).into_any_element())
+        .collect::<Vec<_>>();
+    let panel = options_panel(dialog, cx);
+    Some(
+        split::screen(
+            "options-list",
+            "Options",
+            dialog.list_focused(),
+            scroll,
+            rows,
+            !dialog.list_focused(),
+            panel,
+            cx,
+        )
+        .into_any_element(),
+    )
+}
+
+fn options_list_row(row: crate::options::SectionRow, cx: &Context<Shell>) -> impl IntoElement {
+    let section = row.section;
+    split_list_row(
+        options_section_id(section),
+        row.title.to_string(),
+        row.detail.to_string(),
+        row.selected,
+        cx,
+    )
+    .on_click(
+        cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+            if let Some(dialog) = &mut this.options {
+                dialog.select(section);
+            }
+            this.focus_handle.focus(window, cx);
+            cx.notify();
+        }),
+    )
+}
+
+fn options_section_id(section: OptionsSection) -> &'static str {
+    match section {
+        OptionsSection::Input => "options-section-input",
+        OptionsSection::Theme => "options-section-theme",
+        OptionsSection::Scraper => "options-section-scraper",
+        OptionsSection::Grid => "options-section-grid",
+    }
+}
+
+fn options_panel(dialog: &Options, cx: &Context<Shell>) -> impl IntoElement {
+    match dialog.section() {
+        OptionsSection::Input => input_panel(dialog, cx).into_any_element(),
+        OptionsSection::Theme => theme_panel(dialog, cx).into_any_element(),
+        OptionsSection::Scraper => scraper_panel(dialog, cx).into_any_element(),
+        OptionsSection::Grid => grid_options_panel(dialog, cx).into_any_element(),
+    }
+}
+
+fn input_panel(dialog: &Options, cx: &Context<Shell>) -> impl IntoElement {
+    let mut page = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
         .child(heading(options::SECTION))
-        .child(hint(options::INTRO, cx))
-        .child(hint("Left and right step by 10. Esc closes.", cx));
-    for row in dialog.rows() {
+        .child(hint(options::INTRO, cx));
+    for row in dialog.input_rows() {
         page = page.child(input_row(row, cx));
     }
-    page = page.child(
-        div()
-            .flex()
-            .justify_end()
-            .flex_none()
-            .child(options_close(dialog.close_aimed(), cx)),
-    );
-    Some(modal(page).into_any_element())
+    page.child(div().flex().justify_end().child(options_close(dialog, cx)))
+}
+
+fn theme_panel(dialog: &Options, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading("Theme"))
+        .child(hint(
+            "System follows Omarchy. LaunchBox is the built-in palette.",
+            cx,
+        ))
+        .child(
+            div()
+                .id("options-theme")
+                .flex()
+                .border_1()
+                .border_color(if dialog.theme_aimed() {
+                    theme.accent
+                } else {
+                    theme.border
+                })
+                .child(theme_segment(false, !dialog.theme_launchbox(), cx))
+                .child(theme_segment(true, dialog.theme_launchbox(), cx)),
+        )
+}
+
+fn theme_segment(launchbox: bool, on: bool, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .id(if launchbox {
+            "options-theme-launchbox"
+        } else {
+            "options-theme-system"
+        })
+        .flex_1()
+        .px(px(10.))
+        .py(px(6.))
+        .cursor_pointer()
+        .bg(if on {
+            theme.selected_fill()
+        } else {
+            theme.background
+        })
+        .text_color(if on { theme.accent } else { theme.foreground })
+        .hover(|style| style.bg(theme.hover_fill()))
+        .border_l_1()
+        .border_color(if launchbox {
+            theme.border
+        } else {
+            theme.background
+        })
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                let changed = this
+                    .options
+                    .as_mut()
+                    .is_some_and(|dialog| dialog.choose_theme(launchbox));
+                if changed {
+                    this.commit_theme_from_options(cx);
+                }
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+        .child(if launchbox { "LaunchBox" } else { "System" })
+}
+
+fn scraper_panel(dialog: &Options, cx: &Context<Shell>) -> impl IntoElement {
+    let mut list = div().w_full().flex().flex_col().gap(px(12.));
+    for block in scraper_panel_blocks(dialog) {
+        list = list.child(scraper_block(block, cx));
+    }
+    list
+}
+
+fn scraper_panel_blocks(dialog: &Options) -> Vec<ScraperBlock> {
+    let mut blocks = dialog.scraper().blocks();
+    if dialog.list_focused() {
+        for block in &mut blocks {
+            match block {
+                ScraperBlock::Art(line) => line.aimed = false,
+                ScraperBlock::Provider(line) => {
+                    line.check_aimed = false;
+                    line.up_aimed = false;
+                    line.down_aimed = false;
+                }
+                ScraperBlock::Field(line) => line.aimed = false,
+                ScraperBlock::Save { aimed } => *aimed = false,
+                ScraperBlock::Heading(_) | ScraperBlock::Note(_) | ScraperBlock::Error(_) => {}
+            }
+        }
+    }
+    blocks
+}
+
+fn grid_options_panel(dialog: &Options, cx: &Context<Shell>) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading("Grid"))
+        .child(hint(
+            "Cover width is the tile size. System order is the sidebar.",
+            cx,
+        ))
+        .child(field_label("Cover width", cx))
+        .child(
+            div()
+                .id("options-cover")
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(8.))
+                .py(px(6.))
+                .border_1()
+                .border_color(if dialog.cover_aimed() {
+                    theme.accent
+                } else {
+                    theme.border
+                })
+                .bg(theme.surface)
+                .child(cover_step(-1, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .child(format!("{:.0}px", dialog.cover_width())),
+                )
+                .child(cover_step(1, cx)),
+        )
+        .child(field_label("System order", cx))
+        .child(
+            div()
+                .id("options-sort")
+                .flex()
+                .border_1()
+                .border_color(if dialog.sort_aimed() {
+                    theme.accent
+                } else {
+                    theme.border
+                })
+                .child(options_sort_segment(dialog, SystemSort::Name, false, cx))
+                .child(options_sort_segment(dialog, SystemSort::Year, true, cx)),
+        )
+}
+
+fn cover_step(steps: i32, cx: &Context<Shell>) -> impl IntoElement {
+    let label = if steps < 0 { "−" } else { "+" };
+    let id = if steps < 0 {
+        "options-cover-dec"
+    } else {
+        "options-cover-inc"
+    };
+    button(id, label, ButtonVariant::Secondary, cx).on_click(cx.listener(
+        move |this: &mut Shell, _: &ClickEvent, window, cx| {
+            let changed = this
+                .options
+                .as_mut()
+                .is_some_and(|dialog| dialog.adjust_cover(steps));
+            if changed {
+                if let Some(width) = this.options.as_ref().map(|dialog| dialog.cover_width()) {
+                    this.browse.cover_width = width;
+                    this.persist_cover_width();
+                }
+            }
+            this.focus_handle.focus(window, cx);
+            cx.notify();
+        },
+    ))
+}
+
+fn options_sort_segment(
+    dialog: &Options,
+    sort: SystemSort,
+    divider: bool,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let on = dialog.system_sort() == sort;
+    let mut segment = div()
+        .id(match sort {
+            SystemSort::Name => "options-sort-name",
+            SystemSort::Year => "options-sort-year",
+        })
+        .flex_1()
+        .px(px(10.))
+        .py(px(6.))
+        .cursor_pointer()
+        .bg(if on {
+            theme.selected_fill()
+        } else {
+            theme.background
+        })
+        .text_color(if on { theme.accent } else { theme.foreground })
+        .hover(|style| style.bg(theme.hover_fill()))
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                if let Some(dialog) = &mut this.options {
+                    dialog.set_system_sort(sort);
+                }
+                this.choose_system_sort(sort);
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+        .child(sort.label());
+    if divider {
+        segment = segment.border_l_1().border_color(theme.border);
+    }
+    segment
+}
+
+fn split_list_row(
+    id: impl Into<gpui_kit::ElementId>,
+    title: String,
+    detail: String,
+    selected: bool,
+    cx: &Context<Shell>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let theme = cx.omarchy();
+    let mut row = div()
+        .id(id)
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .px(px(8.))
+        .py(px(8.))
+        .cursor_pointer()
+        .bg(if selected {
+            theme.selected_fill()
+        } else {
+            theme.background
+        })
+        .border_1()
+        .border_color(if selected { theme.accent } else { theme.border })
+        .hover(|style| style.bg(theme.hover_fill()))
+        .child(title);
+    if !detail.is_empty() {
+        row = row.child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme.secondary)
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(detail),
+        );
+    }
+    row
+}
+
+fn field_label(text: &str, cx: &Context<Shell>) -> impl IntoElement {
+    div()
+        .text_size(px(12.))
+        .text_color(cx.omarchy().secondary)
+        .child(text.to_string())
 }
 
 fn input_row(row: options::Row, cx: &Context<Shell>) -> impl IntoElement {
@@ -4181,7 +4921,7 @@ fn input_row(row: options::Row, cx: &Context<Shell>) -> impl IntoElement {
         .on_click(
             cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
                 if let Some(dialog) = &mut this.options {
-                    dialog.aim(slot);
+                    dialog.aim_input(slot);
                 }
                 this.focus_handle.focus(window, cx);
                 cx.notify();
@@ -4234,7 +4974,7 @@ fn input_step(slot: options::Slot, steps: i32, cx: &Context<Shell>) -> impl Into
             let changed = this
                 .options
                 .as_mut()
-                .is_some_and(|dialog| dialog.step(slot, steps));
+                .is_some_and(|dialog| dialog.step_input(slot, steps));
             if changed {
                 this.commit_input();
             }
@@ -4244,11 +4984,11 @@ fn input_step(slot: options::Slot, steps: i32, cx: &Context<Shell>) -> impl Into
     ))
 }
 
-fn options_close(aimed: bool, cx: &Context<Shell>) -> impl IntoElement {
+fn options_close(dialog: &Options, cx: &Context<Shell>) -> impl IntoElement {
     let theme = cx.omarchy();
     div()
         .border_1()
-        .border_color(if aimed {
+        .border_color(if dialog.input_close_aimed() {
             theme.accent
         } else {
             theme.background
@@ -4257,214 +4997,14 @@ fn options_close(aimed: bool, cx: &Context<Shell>) -> impl IntoElement {
             button("options-close", "Close", ButtonVariant::Secondary, cx).on_click(cx.listener(
                 |this: &mut Shell, _: &ClickEvent, window, cx| {
                     if let Some(dialog) = &mut this.options {
-                        dialog.aim(options::Slot::Close);
+                        dialog.aim_input(options::Slot::Close);
                     }
-                    this.confirm_options();
+                    this.confirm_options(cx);
                     this.focus_handle.focus(window, cx);
                     cx.notify();
                 },
             )),
         )
-}
-
-fn emulator_block(block: Block, cx: &Context<Shell>) -> gpui_kit::AnyElement {
-    match block {
-        Block::Note(text) => hint(text, cx).into_any_element(),
-        Block::Error(text) => import_error(&text, cx).into_any_element(),
-        Block::Label(text) => div()
-            .text_size(px(12.))
-            .text_color(cx.omarchy().secondary)
-            .child(text.to_string())
-            .into_any_element(),
-        Block::Emulator(line) => emulator_row(line, cx).into_any_element(),
-        Block::Field {
-            edit,
-            aimed,
-            placeholder,
-            slot,
-        } => emulator_field(field_id(slot), &edit, aimed, placeholder, slot, cx).into_any_element(),
-        Block::Kind { kind, aimed } => kind_block(kind, aimed, cx).into_any_element(),
-        Block::Save { label, aimed } => emulator_action(
-            "emulator-save".to_string(),
-            label.to_string(),
-            ButtonVariant::Primary,
-            aimed,
-            Slot::Save,
-            cx,
-        )
-        .into_any_element(),
-        Block::System(line) => system_row(line, cx).into_any_element(),
-    }
-}
-
-fn field_id(slot: Slot) -> &'static str {
-    match slot {
-        Slot::Name => "emulator-name",
-        Slot::Path => "emulator-path",
-        Slot::GlobalArgs => "emulator-global-args",
-        _ => "emulator-field",
-    }
-}
-
-fn emulator_tabs(dialog: &Emulators, cx: &Context<Shell>) -> impl IntoElement {
-    let theme = cx.omarchy();
-    div()
-        .id("emulator-tabs")
-        .flex()
-        .flex_none()
-        .border_1()
-        .border_color(if dialog.focus() == Slot::Tabs {
-            theme.accent
-        } else {
-            theme.border
-        })
-        .child(tab_segment(Tab::Emulators, dialog.tab(), false, cx))
-        .child(tab_segment(Tab::Systems, dialog.tab(), true, cx))
-}
-
-fn tab_segment(tab: Tab, selected: Tab, divider: bool, cx: &Context<Shell>) -> impl IntoElement {
-    let theme = cx.omarchy();
-    let on = tab == selected;
-    let mut segment = div()
-        .id(match tab {
-            Tab::Emulators => "emulator-tab-emulators",
-            Tab::Systems => "emulator-tab-systems",
-        })
-        .flex_1()
-        .px(px(10.))
-        .py(px(6.))
-        .cursor_pointer()
-        .bg(if on {
-            theme.selected_fill()
-        } else {
-            theme.background
-        })
-        .text_color(if on { theme.accent } else { theme.foreground })
-        .hover(|style| style.bg(theme.hover_fill()))
-        .on_click(
-            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                if let Some(dialog) = &mut this.emulators {
-                    dialog.show(tab);
-                }
-                this.focus_handle.focus(window, cx);
-                cx.notify();
-            }),
-        )
-        .child(tab.label());
-    if divider {
-        segment = segment.border_l_1().border_color(theme.border);
-    }
-    segment
-}
-
-fn emulator_row(line: crate::emulators::EmulatorLine, cx: &Context<Shell>) -> impl IntoElement {
-    let theme = cx.omarchy();
-    let index = line.index;
-    div()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .p(px(8.))
-        .border_1()
-        .border_color(if line.row_aimed {
-            theme.accent
-        } else {
-            theme.border
-        })
-        .bg(theme.surface)
-        .child(
-            div()
-                .id(format!("emulator-row-{index}"))
-                .flex_1()
-                .min_w(px(0.))
-                .overflow_hidden()
-                .cursor_pointer()
-                .on_click(
-                    cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                        let aimed = this
-                            .emulators
-                            .as_mut()
-                            .is_some_and(|dialog| dialog.aim(Slot::Row(index)));
-                        if aimed {
-                            this.confirm_emulators(cx);
-                        }
-                        this.focus_handle.focus(window, cx);
-                        cx.notify();
-                    }),
-                )
-                .child(line.name)
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(theme.secondary)
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .child(line.detail),
-                ),
-        )
-        .child(emulator_action(
-            format!("emulator-delete-{index}"),
-            "Delete".to_string(),
-            ButtonVariant::Danger,
-            line.delete_aimed,
-            Slot::Delete(index),
-            cx,
-        ))
-}
-
-fn system_row(line: crate::emulators::SystemLine, cx: &Context<Shell>) -> impl IntoElement {
-    let theme = cx.omarchy();
-    let index = line.index;
-    let core = if line.core_enabled {
-        emulator_action(
-            format!("emulator-core-{index}"),
-            format!("Core: {}", line.core),
-            ButtonVariant::Secondary,
-            line.core_aimed,
-            Slot::SystemCore(index),
-            cx,
-        )
-        .into_any_element()
-    } else {
-        div()
-            .px(px(8.))
-            .py(px(6.))
-            .text_color(theme.secondary)
-            .child("Core: No core")
-            .into_any_element()
-    };
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(6.))
-        .p(px(8.))
-        .border_1()
-        .border_color(
-            if line.emulator_aimed || line.core_aimed || line.args_aimed {
-                theme.accent
-            } else {
-                theme.border
-            },
-        )
-        .bg(theme.surface)
-        .child(line.name)
-        .child(emulator_action(
-            format!("emulator-system-{index}"),
-            format!("Emulator: {}", line.emulator),
-            ButtonVariant::Secondary,
-            line.emulator_aimed,
-            Slot::SystemEmulator(index),
-            cx,
-        ))
-        .child(core)
-        .child(emulator_field(
-            format!("emulator-system-args-{index}"),
-            &line.args,
-            line.args_aimed,
-            "Extra arguments",
-            Slot::SystemArgs(index),
-            cx,
-        ))
 }
 
 fn kind_block(kind: EmulatorKind, aimed: bool, cx: &Context<Shell>) -> impl IntoElement {
@@ -4517,14 +5057,50 @@ fn kind_segment(
     segment
 }
 
-fn emulator_field(
+fn emulator_editor(
+    id: &'static str,
+    edit: &crate::game_menu::LineEdit,
+    focused: bool,
+    placeholder: &'static str,
+    field: EmulatorField,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    plain_editor(id, edit, focused, placeholder, cx).on_click(cx.listener(
+        move |this: &mut Shell, _: &ClickEvent, window, cx| {
+            if let Some(dialog) = &mut this.emulators {
+                dialog.aim(field);
+            }
+            this.focus_handle.focus(window, cx);
+            cx.notify();
+        },
+    ))
+}
+
+fn system_editor(
+    id: &'static str,
+    edit: &crate::game_menu::LineEdit,
+    focused: bool,
+    placeholder: &'static str,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    plain_editor(id, edit, focused, placeholder, cx).on_click(cx.listener(
+        move |this: &mut Shell, _: &ClickEvent, window, cx| {
+            if let Some(dialog) = &mut this.systems {
+                dialog.aim(SystemField::Args);
+            }
+            this.focus_handle.focus(window, cx);
+            cx.notify();
+        },
+    ))
+}
+
+fn plain_editor(
     id: impl Into<gpui_kit::ElementId>,
     edit: &crate::game_menu::LineEdit,
     focused: bool,
     placeholder: &'static str,
-    slot: Slot,
     cx: &Context<Shell>,
-) -> impl IntoElement {
+) -> gpui_kit::Stateful<gpui_kit::Div> {
     let theme = cx.omarchy();
     let mut text = div()
         .flex()
@@ -4559,31 +5135,21 @@ fn emulator_field(
     }
     div()
         .id(id)
-        .flex_1()
-        .min_w(px(0.))
+        .w_full()
         .px(px(8.))
         .py(px(6.))
         .border_1()
         .border_color(if focused { theme.accent } else { theme.border })
         .bg(theme.surface)
-        .on_click(
-            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                if let Some(dialog) = &mut this.emulators {
-                    dialog.aim(slot);
-                }
-                this.focus_handle.focus(window, cx);
-                cx.notify();
-            }),
-        )
         .child(text)
 }
 
-fn emulator_action(
+fn emulator_press(
     id: String,
     label: String,
     variant: ButtonVariant,
     aimed: bool,
-    slot: Slot,
+    field: EmulatorField,
     cx: &Context<Shell>,
 ) -> impl IntoElement {
     let theme = cx.omarchy();
@@ -4596,48 +5162,43 @@ fn emulator_action(
         })
         .child(button(id, label, variant, cx).on_click(cx.listener(
             move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                let aimed = this
-                    .emulators
-                    .as_mut()
-                    .is_some_and(|dialog| dialog.aim(slot));
-                if aimed {
-                    this.confirm_emulators(cx);
+                if let Some(dialog) = &mut this.emulators {
+                    dialog.aim(field);
                 }
+                this.confirm_emulators(cx);
                 this.focus_handle.focus(window, cx);
                 cx.notify();
             },
         )))
 }
 
-fn scraper_dialog(
-    dialog: Option<&ScraperSettings>,
-    scroll: &ScrollHandle,
+fn system_press(
+    id: String,
+    label: String,
+    aimed: bool,
+    field: SystemField,
     cx: &Context<Shell>,
-) -> Option<gpui_kit::AnyElement> {
-    let dialog = dialog?;
-    let mut list = div()
-        .id("scraper-list")
-        .w_full()
-        .max_h(px(560.))
-        .overflow_y_scroll()
-        .track_scroll(scroll)
-        .flex()
-        .flex_col()
-        .gap(px(12.));
-    for block in dialog.blocks() {
-        list = list.child(scraper_block(block, cx));
-    }
-    Some(
-        modal(
-            dialog_page("scraper-dialog", scraper_settings::TITLE, 560., cx)
-                .child(hint(
-                    "Arrows and Tab move. Enter toggles, reorders, or saves. Esc closes.",
-                    cx,
-                ))
-                .child(list),
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    div()
+        .border_1()
+        .border_color(if aimed {
+            theme.accent
+        } else {
+            theme.background
+        })
+        .child(
+            button(id, label, ButtonVariant::Secondary, cx).on_click(cx.listener(
+                move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                    if let Some(dialog) = &mut this.systems {
+                        dialog.aim(field);
+                    }
+                    this.confirm_systems();
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                },
+            )),
         )
-        .into_any_element(),
-    )
 }
 
 fn scraper_block(block: ScraperBlock, cx: &Context<Shell>) -> gpui_kit::AnyElement {
@@ -4687,9 +5248,11 @@ fn scraper_check(line: crate::scraper_settings::ArtLine, cx: &Context<Shell>) ->
         .child(
             checkbox(id, line.label, state, cx).on_change(move |state, _, window, cx| {
                 entity.update(cx, |this, cx| {
-                    if let Some(dialog) = &mut this.scraper {
-                        dialog.aim(slot);
-                        dialog.set_checked(slot, state == CheckboxState::Checked);
+                    if let Some(dialog) = &mut this.options {
+                        dialog.focus_panel();
+                        let scraper = dialog.scraper_mut();
+                        scraper.aim(slot);
+                        scraper.set_checked(slot, state == CheckboxState::Checked);
                     }
                     this.focus_handle.focus(window, cx);
                     cx.notify();
@@ -4732,9 +5295,11 @@ fn scraper_provider(
                     checkbox(("scraper-enable", index), line.label, state, cx).on_change(
                         move |state, _, window, cx| {
                             entity.update(cx, |this, cx| {
-                                if let Some(dialog) = &mut this.scraper {
-                                    dialog.aim(enable);
-                                    dialog.set_checked(enable, state == CheckboxState::Checked);
+                                if let Some(dialog) = &mut this.options {
+                                    dialog.focus_panel();
+                                    let scraper = dialog.scraper_mut();
+                                    scraper.aim(enable);
+                                    scraper.set_checked(enable, state == CheckboxState::Checked);
                                 }
                                 this.focus_handle.focus(window, cx);
                                 cx.notify();
@@ -4779,9 +5344,12 @@ fn scraper_move(
     let control = if enabled {
         control.on_click(
             cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                let aimed = this.scraper.as_mut().is_some_and(|dialog| dialog.aim(slot));
+                let aimed = this.options.as_mut().is_some_and(|dialog| {
+                    dialog.focus_panel();
+                    dialog.scraper_mut().aim(slot)
+                });
                 if aimed {
-                    this.confirm_scraper();
+                    this.confirm_options(cx);
                 }
                 this.focus_handle.focus(window, cx);
                 cx.notify();
@@ -4857,8 +5425,9 @@ fn scraper_field(
         .bg(theme.surface)
         .on_click(
             cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                if let Some(dialog) = &mut this.scraper {
-                    dialog.aim(slot);
+                if let Some(dialog) = &mut this.options {
+                    dialog.focus_panel();
+                    dialog.scraper_mut().aim(slot);
                 }
                 this.focus_handle.focus(window, cx);
                 cx.notify();
@@ -4885,9 +5454,12 @@ fn scraper_action(
         })
         .child(button(id, label, variant, cx).on_click(cx.listener(
             move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                let aimed = this.scraper.as_mut().is_some_and(|dialog| dialog.aim(slot));
+                let aimed = this.options.as_mut().is_some_and(|dialog| {
+                    dialog.focus_panel();
+                    dialog.scraper_mut().aim(slot)
+                });
                 if aimed {
-                    this.confirm_scraper();
+                    this.confirm_options(cx);
                 }
                 this.focus_handle.focus(window, cx);
                 cx.notify();
