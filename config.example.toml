@@ -15,17 +15,18 @@
 # The GPUI shell slider and - / + keys step by 10 between 120 and 400.
 # cover_width = 216
 
-# Emulators are installed programs. RetroArch is one entry. Cores are per system.
+# Emulators are installed programs. Each RetroArch install is its own entry.
 # Launch is: path, global_args, then `-L <core>` for RetroArch, then extra_args, then the ROM.
 # `{rom}` in global_args or extra_args is replaced, and the ROM is not added again.
-# Cores are read from RetroArch's libretro_directory, not from this file's core paths
-# except as the selected core for each system.
+# `config` is that install's retroarch.cfg. Leave it out to derive the path from `path`.
+# Cores are read from that cfg's libretro_directory.
 [[emulators]]
 id = "retroarch"
 name = "RetroArch"
 kind = "RetroArch"
 path = "retroarch"
 global_args = ""
+# config = "/home/user/.config/retroarch/retroarch.cfg"
 
 [[emulators]]
 id = "dolphin"

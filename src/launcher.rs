@@ -85,6 +85,7 @@ mod tests {
             kind: EmulatorKind::RetroArch,
             path: "/usr/bin/retroarch".into(),
             global_args: global_args.into(),
+            config: None,
         }
     }
 
@@ -125,6 +126,7 @@ mod tests {
             kind: EmulatorKind::Standalone,
             path: "dolphin-emu".into(),
             global_args: "-b -e {rom}".into(),
+            config: None,
         };
         let rom = PathBuf::from("/roms/game.iso");
         let (program, args) = build_launch_command(&emulator, None, "", &rom).unwrap();
@@ -140,6 +142,7 @@ mod tests {
             kind: EmulatorKind::Standalone,
             path: "pcsx2".into(),
             global_args: "--fullscreen".into(),
+            config: None,
         };
         let rom = PathBuf::from("/roms/game with spaces.iso");
         let (program, args) = build_launch_command(&emulator, None, "", &rom).unwrap();
@@ -155,6 +158,7 @@ mod tests {
             kind: EmulatorKind::RetroArch,
             path: "flatpak run org.libretro.RetroArch".into(),
             global_args: String::new(),
+            config: None,
         };
         let rom = PathBuf::from("/roms/game.sfc");
         let core = PathBuf::from("/cores/active/snes9x_libretro.so");
@@ -180,6 +184,7 @@ mod tests {
             kind: EmulatorKind::Standalone,
             path: "pcsx2".into(),
             global_args: "--fullscreen \"{rom}\"".into(),
+            config: None,
         };
         let rom = PathBuf::from("/roms/game with spaces.iso");
         let (program, args) = build_launch_command(&emulator, None, "-f", &rom).unwrap();

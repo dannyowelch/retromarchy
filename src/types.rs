@@ -446,7 +446,8 @@ impl<'de> Deserialize<'de> for EmulatorKind {
     }
 }
 
-/// One installed emulator. RetroArch is a single entry. Cores live on systems.
+/// One installed emulator. Each RetroArch install is its own entry.
+/// `config` is that install's `retroarch.cfg`. Empty means derive it from `path`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Emulator {
     pub id: String,
@@ -455,6 +456,8 @@ pub struct Emulator {
     pub path: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub global_args: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<PathBuf>,
 }
 
 /// Which emulator launches one library system, and the args added for that system.

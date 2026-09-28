@@ -18,11 +18,14 @@ pub struct Core {
     pub extensions: Vec<String>,
 }
 
-/// Cores from the active libretro directory. `cores` has one entry per `name`.
+/// Cores from one install's libretro directory. `cores` has one entry per `name`.
+/// `note` is set when that directory is missing or has no cores.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreCatalog {
     pub directory: PathBuf,
     pub cores: Vec<Core>,
+    pub cfg: PathBuf,
+    pub note: Option<String>,
 }
 
 impl CoreCatalog {
@@ -30,14 +33,59 @@ impl CoreCatalog {
         Self {
             directory: PathBuf::from(FALLBACK_CORE_DIR),
             cores: Vec::new(),
+            cfg: PathBuf::new(),
+            note: None,
         }
     }
 }
 
+/// Which RetroArch this entry launches. Native and Flatpak do not share a cfg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallKind {
+    Native,
+    Flatpak,
+}
+
+/// User and system Flatpaks share `~/.var/app/<id>` but they are different installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlatpakScope {
+    User,
+    System,
+}
+
+/// A launch command plus the cfg that install reads. Cores come from `cfg` only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetroArchInstall {
-    Native { path: PathBuf },
-    Flatpak,
+    Native {
+        command: String,
+        cfg: PathBuf,
+    },
+    Flatpak {
+        command: String,
+        cfg: PathBuf,
+        scope: FlatpakScope,
+    },
+}
+
+impl RetroArchInstall {
+    pub fn command(&self) -> &str {
+        match self {
+            Self::Native { command, .. } | Self::Flatpak { command, .. } => command,
+        }
+    }
+
+    pub fn cfg(&self) -> &Path {
+        match self {
+            Self::Native { cfg, .. } | Self::Flatpak { cfg, .. } => cfg,
+        }
+    }
+
+    pub fn kind(&self) -> InstallKind {
+        match self {
+            Self::Native { .. } => InstallKind::Native,
+            Self::Flatpak { .. } => InstallKind::Flatpak,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,14 +120,18 @@ pub struct Prepared {
     pub changed: bool,
 }
 
-/// Add RetroArch when none is configured, then repoint cores at the active directory.
-/// Does not write the file. [`bootstrap`] saves when `changed` is set.
+/// Add every RetroArch install that is not already configured, then repoint
+/// each system's core inside that system's install. Does not write the file.
 pub fn prepare(config: &mut Config, env: &DetectEnv) -> Prepared {
-    let found = find_retroarch(env);
-    let added = ensure_retroarch(&mut config.emulators, found);
-    let install = config.emulators.iter().find_map(install_of);
-    let catalog = discover(install.as_ref(), env);
-    let repointed = repoint_consoles(&mut config.consoles, &catalog);
+    let found = find_installs(env);
+    let added = ensure_installs(&mut config.emulators, &found);
+    let repointed = repoint_owned(&mut config.consoles, &config.emulators, env);
+    let catalog = config
+        .emulators
+        .iter()
+        .find_map(|emulator| install_of(emulator, env))
+        .map(|install| discover(&install, env))
+        .unwrap_or_else(CoreCatalog::empty);
     Prepared {
         catalog,
         changed: added || repointed,
@@ -95,109 +147,161 @@ pub fn bootstrap(config: &mut Config) -> CoreCatalog {
     prepared.catalog
 }
 
-pub fn catalog_for(config: &Config) -> CoreCatalog {
-    let install = config.emulators.iter().find_map(install_of);
-    discover(install.as_ref(), &DetectEnv::process())
+pub fn catalog_for_emulator(emulator: &Emulator, env: &DetectEnv) -> CoreCatalog {
+    match install_of(emulator, env) {
+        Some(install) => discover(&install, env),
+        None => CoreCatalog::empty(),
+    }
 }
 
-pub fn find_retroarch(env: &DetectEnv) -> Option<RetroArchInstall> {
-    if let Some(path) = env
-        .path
-        .as_deref()
-        .and_then(|path| executable_on_path(path, "retroarch"))
-    {
-        return Some(RetroArchInstall::Native { path });
-    }
-    if is_executable(&env.native_bin) {
-        return Some(RetroArchInstall::Native {
-            path: env.native_bin.clone(),
+pub fn catalogs_for(config: &Config, env: &DetectEnv) -> Vec<CoreCatalog> {
+    config
+        .emulators
+        .iter()
+        .map(|emulator| catalog_for_emulator(emulator, env))
+        .collect()
+}
+
+/// Every install that is present. Native, user Flatpak, and system Flatpak.
+pub fn find_installs(env: &DetectEnv) -> Vec<RetroArchInstall> {
+    let mut installs = Vec::new();
+    if let Some(path) = native_executable(env) {
+        installs.push(RetroArchInstall::Native {
+            command: path.to_string_lossy().into_owned(),
+            cfg: native_cfg(env),
         });
     }
-    if flatpak_in_home(&env.home)
-        || env
-            .system_flatpak
-            .as_ref()
-            .is_some_and(|path| path.is_dir())
-    {
-        return Some(RetroArchInstall::Flatpak);
+    let scopes = flatpak_scopes(env);
+    let both = scopes.len() > 1;
+    for scope in scopes {
+        installs.push(RetroArchInstall::Flatpak {
+            command: flatpak_launch(scope, both),
+            cfg: flatpak_cfg(env),
+            scope,
+        });
     }
-    None
+    installs
 }
 
-pub fn ensure_retroarch(emulators: &mut Vec<Emulator>, found: Option<RetroArchInstall>) -> bool {
-    if emulators
-        .iter()
-        .any(|emulator| emulator.kind == EmulatorKind::RetroArch)
-    {
-        return false;
+/// Append installs that no existing RetroArch entry already represents.
+/// An entry whose binary is gone stays in the list.
+pub fn ensure_installs(emulators: &mut Vec<Emulator>, found: &[RetroArchInstall]) -> bool {
+    let mut changed = false;
+    for install in found {
+        if emulators
+            .iter()
+            .any(|emulator| covers(emulator, install, found))
+        {
+            continue;
+        }
+        let (id_base, name) = install_label(install, found);
+        let id = fresh_id(id_base, emulators);
+        emulators.push(Emulator {
+            id,
+            name,
+            kind: EmulatorKind::RetroArch,
+            path: install.command().to_string(),
+            global_args: String::new(),
+            config: Some(install.cfg().to_path_buf()),
+        });
+        changed = true;
     }
-    let Some(found) = found else {
-        return false;
-    };
-    let path = match found {
-        RetroArchInstall::Native { path } => path.to_string_lossy().into_owned(),
-        RetroArchInstall::Flatpak => FLATPAK_COMMAND.to_string(),
-    };
-    let id = fresh_id("retroarch", emulators);
-    emulators.push(Emulator {
-        id,
-        name: "RetroArch".to_string(),
-        kind: EmulatorKind::RetroArch,
-        path,
-        global_args: String::new(),
-    });
-    true
+    changed
 }
 
-pub fn install_of(emulator: &Emulator) -> Option<RetroArchInstall> {
+pub fn install_of(emulator: &Emulator, env: &DetectEnv) -> Option<RetroArchInstall> {
     if emulator.kind != EmulatorKind::RetroArch {
         return None;
     }
+    let cfg = emulator
+        .config
+        .clone()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| derived_cfg(&emulator.path, env));
     if flatpak_command(&emulator.path) {
-        Some(RetroArchInstall::Flatpak)
+        Some(RetroArchInstall::Flatpak {
+            command: emulator.path.clone(),
+            cfg,
+            scope: scope_flag(&emulator.path).unwrap_or(FlatpakScope::User),
+        })
     } else {
-        let path = program_token(&emulator.path).unwrap_or_else(|| emulator.path.clone());
         Some(RetroArchInstall::Native {
-            path: PathBuf::from(path),
+            command: emulator.path.clone(),
+            cfg,
         })
     }
 }
 
-pub fn discover(install: Option<&RetroArchInstall>, env: &DetectEnv) -> CoreCatalog {
-    let cfg_path = retroarch_cfg(install, env);
-    let text = fs::read_to_string(&cfg_path).unwrap_or_default();
+/// The command's program is still on disk, or the Flatpak scope is still installed.
+pub fn command_present(path: &str, env: &DetectEnv, found: &[RetroArchInstall]) -> bool {
+    if flatpak_command(path) {
+        return found
+            .iter()
+            .any(|install| covers_path(path, install, found));
+    }
+    program_resolves(path, env)
+}
+
+pub fn discover(install: &RetroArchInstall, env: &DetectEnv) -> CoreCatalog {
+    let cfg_path = install.cfg();
+    let text = fs::read_to_string(cfg_path).unwrap_or_default();
     let cfg_dir = cfg_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    catalog_from_cfg_text(&text, &cfg_dir, Some(&env.home))
+    let mut catalog = catalog_from_cfg_text(&text, &cfg_dir, Some(&env.home), install.kind());
+    catalog.cfg = cfg_path.to_path_buf();
+    catalog
 }
 
-pub fn retroarch_cfg(install: Option<&RetroArchInstall>, env: &DetectEnv) -> PathBuf {
-    if matches!(install, Some(RetroArchInstall::Flatpak)) {
-        return env
-            .home
-            .join(".var/app")
-            .join(FLATPAK_ID)
-            .join("config/retroarch/retroarch.cfg");
-    }
+pub fn native_cfg(env: &DetectEnv) -> PathBuf {
     if let Some(xdg) = &env.xdg_config_home {
-        return xdg.join("retroarch/retroarch.cfg");
+        xdg.join("retroarch/retroarch.cfg")
+    } else {
+        env.home.join(".config/retroarch/retroarch.cfg")
     }
-    env.home.join(".config/retroarch/retroarch.cfg")
 }
 
-pub fn catalog_from_cfg_text(text: &str, cfg_dir: &Path, home: Option<&Path>) -> CoreCatalog {
+pub fn flatpak_cfg(env: &DetectEnv) -> PathBuf {
+    env.home
+        .join(".var/app")
+        .join(FLATPAK_ID)
+        .join("config/retroarch/retroarch.cfg")
+}
+
+pub fn catalog_from_cfg_text(
+    text: &str,
+    cfg_dir: &Path,
+    home: Option<&Path>,
+    kind: InstallKind,
+) -> CoreCatalog {
     let parsed = parse_cfg(text, cfg_dir, home);
-    let directory = if parsed.default_cores {
-        PathBuf::from(FALLBACK_CORE_DIR)
-    } else {
-        parsed
+    let directory = core_directory(&parsed, cfg_dir, kind);
+    let (cores, note) = read_cores(&directory, parsed.info_directory.as_deref());
+    CoreCatalog {
+        directory,
+        cores,
+        cfg: cfg_dir.join("retroarch.cfg"),
+        note,
+    }
+}
+
+fn core_directory(parsed: &ParsedCfg, cfg_dir: &Path, kind: InstallKind) -> PathBuf {
+    let flatpak_default = cfg_dir.join("cores");
+    match kind {
+        InstallKind::Flatpak => {
+            if parsed.saw_libretro {
+                parsed.libretro_directory.clone().unwrap_or(flatpak_default)
+            } else {
+                flatpak_default
+            }
+        }
+        InstallKind::Native if parsed.default_cores => PathBuf::from(FALLBACK_CORE_DIR),
+        InstallKind::Native => parsed
             .libretro_directory
-            .unwrap_or_else(|| PathBuf::from(FALLBACK_CORE_DIR))
-    };
-    let cores = scan_cores(&directory, parsed.info_directory.as_deref());
-    CoreCatalog { directory, cores }
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(FALLBACK_CORE_DIR)),
+    }
 }
 
 pub fn repoint_path(saved: &Path, catalog: &CoreCatalog) -> Option<PathBuf> {
@@ -214,9 +318,55 @@ pub fn repoint_path(saved: &Path, catalog: &CoreCatalog) -> Option<PathBuf> {
     }
 }
 
+pub fn repoint_id(consoles: &mut [Console], emulator_id: &str, catalog: &CoreCatalog) -> bool {
+    let mut changed = false;
+    for console in consoles {
+        if console.emulator.as_deref() != Some(emulator_id) {
+            continue;
+        }
+        let Some(path) = console.core.clone() else {
+            continue;
+        };
+        if let Some(next) = repoint_path(&path, catalog) {
+            console.core = Some(next);
+            changed = true;
+        }
+    }
+    changed
+}
+
 pub fn repoint_consoles(consoles: &mut [Console], catalog: &CoreCatalog) -> bool {
     let mut changed = false;
     for console in consoles {
+        let Some(path) = console.core.clone() else {
+            continue;
+        };
+        if let Some(next) = repoint_path(&path, catalog) {
+            console.core = Some(next);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Repoint each system using only the emulator that system is assigned to.
+pub fn repoint_owned(consoles: &mut [Console], emulators: &[Emulator], env: &DetectEnv) -> bool {
+    let mut catalogs: Vec<(String, CoreCatalog)> = Vec::new();
+    let mut changed = false;
+    for console in consoles {
+        let Some(id) = console.emulator.clone() else {
+            continue;
+        };
+        let Some(emulator) = emulators.iter().find(|emulator| emulator.id == id) else {
+            continue;
+        };
+        if !catalogs.iter().any(|(known, _)| known == &id) {
+            let catalog = catalog_for_emulator(emulator, env);
+            catalogs.push((id.clone(), catalog));
+        }
+        let Some((_, catalog)) = catalogs.iter().find(|(known, _)| known == &id) else {
+            continue;
+        };
         let Some(path) = console.core.clone() else {
             continue;
         };
@@ -241,6 +391,7 @@ pub fn core_name(path: &Path) -> Option<String> {
 
 struct ParsedCfg {
     libretro_directory: Option<PathBuf>,
+    saw_libretro: bool,
     default_cores: bool,
     info_directory: Option<PathBuf>,
 }
@@ -276,6 +427,7 @@ fn parse_cfg(text: &str, cfg_dir: &Path, home: Option<&Path>) -> ParsedCfg {
         .filter(|path| !path.as_os_str().is_empty());
     ParsedCfg {
         libretro_directory: expanded,
+        saw_libretro,
         default_cores,
         info_directory,
     }
@@ -433,6 +585,21 @@ fn scan_cores(dir: &Path, info_dir: Option<&Path>) -> Vec<Core> {
     cores
 }
 
+fn read_cores(dir: &Path, info_dir: Option<&Path>) -> (Vec<Core>, Option<String>) {
+    if !dir.is_dir() {
+        return (
+            Vec::new(),
+            Some(format!("No core directory at {}.", dir.display())),
+        );
+    }
+    let cores = scan_cores(dir, info_dir);
+    if cores.is_empty() {
+        (cores, Some(format!("No cores in {}.", dir.display())))
+    } else {
+        (cores, None)
+    }
+}
+
 fn read_info(so_path: &Path, info_dir: Option<&Path>) -> InfoText {
     let Some(info_dir) = info_dir else {
         return InfoText::empty();
@@ -506,11 +673,241 @@ fn is_executable(path: &Path) -> bool {
     true
 }
 
-fn flatpak_in_home(home: &Path) -> bool {
-    home.join(".local/share/flatpak/app")
+fn native_executable(env: &DetectEnv) -> Option<PathBuf> {
+    if let Some(path) = env
+        .path
+        .as_deref()
+        .and_then(|path| executable_on_path(path, "retroarch"))
+    {
+        return Some(path);
+    }
+    is_executable(&env.native_bin).then(|| env.native_bin.clone())
+}
+
+fn derived_cfg(command: &str, env: &DetectEnv) -> PathBuf {
+    if flatpak_command(command) {
+        flatpak_cfg(env)
+    } else {
+        native_cfg(env)
+    }
+}
+
+fn flatpak_launch(scope: FlatpakScope, both: bool) -> String {
+    if !both {
+        return FLATPAK_COMMAND.to_string();
+    }
+    match scope {
+        FlatpakScope::User => format!("flatpak run --user {FLATPAK_ID}"),
+        FlatpakScope::System => format!("flatpak run --system {FLATPAK_ID}"),
+    }
+}
+
+fn install_label(install: &RetroArchInstall, found: &[RetroArchInstall]) -> (&'static str, String) {
+    match install {
+        RetroArchInstall::Native { .. } => ("retroarch", "RetroArch".to_string()),
+        RetroArchInstall::Flatpak {
+            scope: FlatpakScope::System,
+            ..
+        } if found.iter().any(|item| {
+            matches!(
+                item,
+                RetroArchInstall::Flatpak {
+                    scope: FlatpakScope::User,
+                    ..
+                }
+            )
+        }) =>
+        {
+            (
+                "retroarch-flatpak-system",
+                "RetroArch (Flatpak system)".to_string(),
+            )
+        }
+        RetroArchInstall::Flatpak { .. } => {
+            ("retroarch-flatpak", "RetroArch (Flatpak)".to_string())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Native,
+    User,
+    System,
+    Plain,
+}
+
+fn entry_kind(path: &str) -> EntryKind {
+    if !flatpak_command(path) {
+        return EntryKind::Native;
+    }
+    match scope_flag(path) {
+        Some(FlatpakScope::System) => EntryKind::System,
+        Some(FlatpakScope::User) => EntryKind::User,
+        None => EntryKind::Plain,
+    }
+}
+
+fn scope_flag(path: &str) -> Option<FlatpakScope> {
+    let Ok(parts) = shell_words::split(path) else {
+        return None;
+    };
+    if parts.iter().any(|part| part == "--system") {
+        Some(FlatpakScope::System)
+    } else if parts.iter().any(|part| part == "--user") {
+        Some(FlatpakScope::User)
+    } else {
+        None
+    }
+}
+
+fn covers(emulator: &Emulator, install: &RetroArchInstall, found: &[RetroArchInstall]) -> bool {
+    emulator.kind == EmulatorKind::RetroArch && covers_path(&emulator.path, install, found)
+}
+
+fn covers_path(path: &str, install: &RetroArchInstall, found: &[RetroArchInstall]) -> bool {
+    let user_found = found.iter().any(|item| {
+        matches!(
+            item,
+            RetroArchInstall::Flatpak {
+                scope: FlatpakScope::User,
+                ..
+            }
+        )
+    });
+    match (entry_kind(path), install) {
+        (EntryKind::Native, RetroArchInstall::Native { .. }) => true,
+        (
+            EntryKind::User | EntryKind::Plain,
+            RetroArchInstall::Flatpak {
+                scope: FlatpakScope::User,
+                ..
+            },
+        ) => true,
+        (
+            EntryKind::System,
+            RetroArchInstall::Flatpak {
+                scope: FlatpakScope::System,
+                ..
+            },
+        ) => true,
+        (
+            EntryKind::Plain,
+            RetroArchInstall::Flatpak {
+                scope: FlatpakScope::System,
+                ..
+            },
+        ) => !user_found,
+        _ => false,
+    }
+}
+
+fn program_resolves(path: &str, env: &DetectEnv) -> bool {
+    let Some(token) = program_token(path) else {
+        return false;
+    };
+    let program = Path::new(&token);
+    if program.is_absolute() {
+        return is_executable(program);
+    }
+    env.path
+        .as_deref()
+        .and_then(|path_env| executable_on_path(path_env, &token))
+        .is_some()
+}
+
+fn flatpak_scopes(env: &DetectEnv) -> Vec<FlatpakScope> {
+    if let Some(bin) = env
+        .path
+        .as_deref()
+        .and_then(|path| executable_on_path(path, "flatpak"))
+    {
+        return flatpak_scopes_from_cli(&bin);
+    }
+    directory_scopes(env)
+}
+
+fn flatpak_scopes_from_cli(bin: &Path) -> Vec<FlatpakScope> {
+    let list = command_stdout(bin, &["list", "--app"]).unwrap_or_default();
+    let mut scopes = parse_flatpak_list(&list);
+    let info = command_stdout(bin, &["info", FLATPAK_ID]).unwrap_or_default();
+    if scopes.is_empty() {
+        if let Some(scope) = parse_flatpak_info(&info) {
+            scopes.push(scope);
+        }
+    }
+    scopes
+}
+
+fn command_stdout(program: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn parse_flatpak_list(text: &str) -> Vec<FlatpakScope> {
+    let mut scopes = Vec::new();
+    for line in text.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if !tokens.iter().any(|token| *token == FLATPAK_ID) {
+            continue;
+        }
+        let scope = tokens.iter().rev().find_map(|token| match *token {
+            "user" => Some(FlatpakScope::User),
+            "system" => Some(FlatpakScope::System),
+            _ => None,
+        });
+        if let Some(scope) = scope {
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+        }
+    }
+    scopes
+}
+
+fn parse_flatpak_info(text: &str) -> Option<FlatpakScope> {
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("Installation") {
+            return match value.trim() {
+                "user" => Some(FlatpakScope::User),
+                "system" => Some(FlatpakScope::System),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+fn directory_scopes(env: &DetectEnv) -> Vec<FlatpakScope> {
+    let mut scopes = Vec::new();
+    if env
+        .home
+        .join(".local/share/flatpak/app")
         .join(FLATPAK_ID)
         .is_dir()
-        || home.join(".var/app").join(FLATPAK_ID).is_dir()
+    {
+        scopes.push(FlatpakScope::User);
+    }
+    if env
+        .system_flatpak
+        .as_ref()
+        .is_some_and(|path| path.is_dir())
+    {
+        scopes.push(FlatpakScope::System);
+    }
+    if scopes.is_empty() && env.home.join(".var/app").join(FLATPAK_ID).is_dir() {
+        scopes.push(FlatpakScope::User);
+    }
+    scopes
 }
 
 fn flatpak_command(path: &str) -> bool {
@@ -580,7 +977,7 @@ video_driver = "gl"
 libretro_info_path = ":info" # trailing comment
 libretro_directory = "local-cores"
 "#;
-        let custom = catalog_from_cfg_text(text, cfg_dir, Some(home));
+        let custom = catalog_from_cfg_text(text, cfg_dir, Some(home), InstallKind::Native);
         assert_eq!(custom.directory, cfg_dir.join("local-cores"));
 
         let quoted = "libretro_directory = \"~/retro-cores\"\nlibretro_info_path = \"~/.config/retroarch/info\"\n";
@@ -596,19 +993,20 @@ libretro_directory = "local-cores"
         );
 
         let hashed = "libretro_directory = \"/cores/dir#name\"\n";
-        let hashed = catalog_from_cfg_text(hashed, cfg_dir, Some(home));
+        let hashed = catalog_from_cfg_text(hashed, cfg_dir, Some(home), InstallKind::Native);
         assert_eq!(hashed.directory, PathBuf::from("/cores/dir#name"));
 
         let colon = "libretro_directory = \":/custom\"\n";
-        let colon = catalog_from_cfg_text(colon, cfg_dir, Some(home));
+        let colon = catalog_from_cfg_text(colon, cfg_dir, Some(home), InstallKind::Native);
         assert_eq!(colon.directory, cfg_dir.join("custom"));
 
         let stock = "libretro_directory = \":cores\"\n";
-        let stock = catalog_from_cfg_text(stock, cfg_dir, Some(home));
+        let stock = catalog_from_cfg_text(stock, cfg_dir, Some(home), InstallKind::Native);
         assert_eq!(stock.directory, PathBuf::from(FALLBACK_CORE_DIR));
 
         let tilde_stock = "libretro_directory = \"~/.config/retroarch/cores\"\n";
-        let tilde_stock = catalog_from_cfg_text(tilde_stock, cfg_dir, Some(home));
+        let tilde_stock =
+            catalog_from_cfg_text(tilde_stock, cfg_dir, Some(home), InstallKind::Native);
         assert_eq!(tilde_stock.directory, PathBuf::from(FALLBACK_CORE_DIR));
     }
 
@@ -636,7 +1034,8 @@ libretro_directory = "local-cores"
             active.display(),
             info.display()
         );
-        let catalog = catalog_from_cfg_text(&cfg, root.path(), Some(root.path()));
+        let catalog =
+            catalog_from_cfg_text(&cfg, root.path(), Some(root.path()), InstallKind::Native);
         assert_eq!(catalog.cores.len(), 1);
         assert_eq!(catalog.cores[0].name, "snes9x");
         assert_eq!(catalog.cores[0].path, active.join("snes9x_libretro.so"));
@@ -662,6 +1061,7 @@ libretro_directory = "local-cores"
             "libretro_directory = \":cores\"\n",
             &cfg_dir,
             Some(root.path()),
+            InstallKind::Native,
         );
         assert!(catalog.cores.iter().all(|core| core.name != "only_stock"));
         assert_eq!(catalog.directory, PathBuf::from(FALLBACK_CORE_DIR));
@@ -674,7 +1074,8 @@ libretro_directory = "local-cores"
         fs::create_dir_all(&active).unwrap();
         fs::write(active.join("snes9x_libretro.so"), b"core").unwrap();
         let cfg = format!("libretro_directory = \"{}\"\n", active.display());
-        let catalog = catalog_from_cfg_text(&cfg, root.path(), Some(root.path()));
+        let catalog =
+            catalog_from_cfg_text(&cfg, root.path(), Some(root.path()), InstallKind::Native);
         let outside = root.path().join("old/snes9x_libretro.so");
         assert_eq!(
             repoint_path(&outside, &catalog).as_deref(),
@@ -695,8 +1096,19 @@ libretro_directory = "local-cores"
         assert!(!repoint_consoles(&mut consoles, &catalog));
     }
 
+    fn retroarch_emulator(id: &str, path: &str) -> Emulator {
+        Emulator {
+            id: id.into(),
+            name: "RetroArch".into(),
+            kind: EmulatorKind::RetroArch,
+            path: path.into(),
+            global_args: String::new(),
+            config: None,
+        }
+    }
+
     #[test]
-    fn detection_prefers_path_then_usr_bin_then_flatpak_and_does_not_duplicate() {
+    fn detection_finds_each_install_and_does_not_duplicate() {
         let root = tempfile::tempdir().unwrap();
         let bin = root.path().join("bin");
         let on_path = bin.join("retroarch");
@@ -716,10 +1128,12 @@ libretro_directory = "local-cores"
             native_bin: usr.clone(),
             system_flatpak: None,
         };
-        match find_retroarch(&env) {
-            Some(RetroArchInstall::Native { path }) => assert_eq!(path, on_path),
-            other => panic!("expected the PATH binary, got {other:?}"),
-        }
+        let both = find_installs(&env);
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0].command(), on_path.to_string_lossy());
+        assert_eq!(both[0].cfg(), native_cfg(&env));
+        assert_eq!(both[1].command(), FLATPAK_COMMAND);
+        assert_eq!(both[1].cfg(), flatpak_cfg(&env));
 
         let no_path = DetectEnv {
             path: Some(root.path().join("empty").into()),
@@ -728,10 +1142,9 @@ libretro_directory = "local-cores"
             native_bin: usr.clone(),
             system_flatpak: None,
         };
-        match find_retroarch(&no_path) {
-            Some(RetroArchInstall::Native { path }) => assert_eq!(path, usr),
-            other => panic!("expected /usr-style binary, got {other:?}"),
-        }
+        let from_usr = find_installs(&no_path);
+        assert_eq!(from_usr[0].command(), usr.to_string_lossy());
+        assert!(matches!(from_usr[1], RetroArchInstall::Flatpak { .. }));
 
         let flatpak_only = DetectEnv {
             path: Some(root.path().join("empty").into()),
@@ -740,37 +1153,36 @@ libretro_directory = "local-cores"
             native_bin: root.path().join("missing"),
             system_flatpak: None,
         };
-        assert_eq!(
-            find_retroarch(&flatpak_only),
-            Some(RetroArchInstall::Flatpak)
-        );
+        let only = find_installs(&flatpak_only);
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].command(), FLATPAK_COMMAND);
 
         let mut emulators = Vec::new();
-        assert!(ensure_retroarch(
-            &mut emulators,
-            Some(RetroArchInstall::Flatpak)
-        ));
-        assert_eq!(emulators[0].path, FLATPAK_COMMAND);
-        assert_eq!(emulators[0].kind, EmulatorKind::RetroArch);
-        assert!(!ensure_retroarch(
-            &mut emulators,
-            Some(RetroArchInstall::Native { path: on_path })
-        ));
-        assert_eq!(emulators.len(), 1);
+        assert!(ensure_installs(&mut emulators, &both));
+        assert_eq!(emulators.len(), 2);
+        assert_eq!(emulators[0].id, "retroarch");
+        assert_eq!(emulators[0].name, "RetroArch");
+        assert_eq!(emulators[1].id, "retroarch-flatpak");
+        assert_eq!(emulators[1].name, "RetroArch (Flatpak)");
+        assert_eq!(
+            emulators[1].config.as_deref(),
+            Some(flatpak_cfg(&env).as_path())
+        );
+        assert!(!ensure_installs(&mut emulators, &both));
+        assert_eq!(emulators.len(), 2);
 
-        let mut existing = vec![Emulator {
-            id: "custom".into(),
-            name: "My RetroArch".into(),
-            kind: EmulatorKind::RetroArch,
-            path: "/opt/retroarch".into(),
-            global_args: String::new(),
-        }];
-        assert!(!ensure_retroarch(
-            &mut existing,
-            Some(RetroArchInstall::Flatpak)
-        ));
-        assert_eq!(existing.len(), 1);
-        assert_eq!(existing[0].path, "/opt/retroarch");
+        let mut existing = vec![retroarch_emulator("retroarch", FLATPAK_COMMAND)];
+        assert!(ensure_installs(&mut existing, &both));
+        assert_eq!(existing.len(), 2);
+        assert_eq!(existing[0].id, "retroarch");
+        assert_eq!(existing[0].path, FLATPAK_COMMAND);
+        assert_eq!(existing[1].path, on_path.to_string_lossy());
+
+        let mut custom = vec![retroarch_emulator("custom", "/opt/retroarch")];
+        assert!(ensure_installs(&mut custom, &both));
+        assert_eq!(custom.len(), 2);
+        assert_eq!(custom[0].path, "/opt/retroarch");
+        assert_eq!(custom[1].path, FLATPAK_COMMAND);
     }
 
     #[test]
@@ -852,37 +1264,224 @@ libretro_directory = "local-cores"
         };
         let text = fs::read_to_string(flatpak_dir.join("retroarch.cfg")).unwrap();
         let parsed = parse_cfg(&text, &flatpak_dir, Some(home));
-        assert_eq!(
-            parsed.libretro_directory.as_deref(),
-            Some(cores.as_path()),
-            "tilde expansion"
-        );
-        assert!(
-            !parsed.default_cores,
-            "explicit flatpak cores dir was treated as the native stock default"
-        );
+        assert_eq!(parsed.libretro_directory.as_deref(), Some(cores.as_path()));
+        assert!(parsed.default_cores);
 
-        let flatpak = discover(Some(&RetroArchInstall::Flatpak), &env);
+        let flatpak_install = RetroArchInstall::Flatpak {
+            command: FLATPAK_COMMAND.into(),
+            cfg: flatpak_dir.join("retroarch.cfg"),
+            scope: FlatpakScope::User,
+        };
+        let flatpak = discover(&flatpak_install, &env);
         assert_eq!(flatpak.directory, cores);
         assert_eq!(flatpak.cores.len(), 91);
+        assert!(flatpak.note.is_none());
 
-        let native = discover(
-            Some(&RetroArchInstall::Native {
-                path: PathBuf::from("retroarch"),
-            }),
-            &env,
-        );
+        let native_install = RetroArchInstall::Native {
+            command: "retroarch".into(),
+            cfg: native_cfg.clone(),
+        };
+        let native = discover(&native_install, &env);
         assert!(native.cores.is_empty());
         assert_eq!(native.directory, PathBuf::from(FALLBACK_CORE_DIR));
-        assert_ne!(
-            retroarch_cfg(Some(&RetroArchInstall::Flatpak), &env),
-            retroarch_cfg(
-                Some(&RetroArchInstall::Native {
-                    path: PathBuf::from("retroarch"),
-                }),
-                &env
-            )
+        assert_eq!(
+            native.note.as_deref(),
+            Some("No core directory at /usr/lib/libretro.")
         );
+        assert_ne!(flatpak_install.cfg(), native_install.cfg());
+
+        let entry = retroarch_emulator("retroarch", FLATPAK_COMMAND);
+        let from_entry = catalog_for_emulator(&entry, &env);
+        assert_eq!(from_entry.cores.len(), 91);
+        assert_eq!(from_entry.directory, cores);
+        assert_eq!(from_entry.cfg, flatpak_dir.join("retroarch.cfg"));
+    }
+
+    #[test]
+    fn cfg_resolution_uses_each_installs_default_when_the_key_is_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        let flatpak_dir = home
+            .join(".var/app")
+            .join(FLATPAK_ID)
+            .join("config/retroarch");
+        fs::create_dir_all(flatpak_dir.join("cores")).unwrap();
+        fs::write(flatpak_dir.join("cores").join("fceumm_libretro.so"), b"nes").unwrap();
+        let missing = catalog_from_cfg_text(
+            "video_driver = \"gl\"\n",
+            &flatpak_dir,
+            Some(home),
+            InstallKind::Flatpak,
+        );
+        assert_eq!(missing.directory, flatpak_dir.join("cores"));
+        assert_eq!(missing.cores.len(), 1);
+        assert_eq!(missing.cores[0].name, "fceumm");
+
+        let quoted = catalog_from_cfg_text(
+            "libretro_directory = \":/custom\"\nlibretro_info_path = \":/info\"\n",
+            &flatpak_dir,
+            Some(home),
+            InstallKind::Flatpak,
+        );
+        assert_eq!(quoted.directory, flatpak_dir.join("custom"));
+
+        let native_dir = home.join(".config/retroarch");
+        let native = catalog_from_cfg_text("", &native_dir, Some(home), InstallKind::Native);
+        assert_eq!(native.directory, PathBuf::from(FALLBACK_CORE_DIR));
+        assert_eq!(
+            native.note.as_deref(),
+            Some("No core directory at /usr/lib/libretro.")
+        );
+
+        let empty_dir = home.join("empty-cores");
+        fs::create_dir_all(&empty_dir).unwrap();
+        let empty = catalog_from_cfg_text(
+            &format!("libretro_directory = \"{}\"\n", empty_dir.display()),
+            home,
+            Some(home),
+            InstallKind::Native,
+        );
+        assert_eq!(empty.cores.len(), 0);
+        assert_eq!(
+            empty.note.as_deref(),
+            Some(format!("No cores in {}.", empty_dir.display())).as_deref()
+        );
+    }
+
+    #[test]
+    fn both_installs_keep_their_own_cores_and_repoint_stays_on_the_system() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        let bin = home.join("bin");
+        exec_file(&bin.join("retroarch"));
+        fs::create_dir_all(home.join(".local/share/flatpak/app").join(FLATPAK_ID)).unwrap();
+        let native_cores = home.join("native-cores");
+        let flatpak_cores = home
+            .join(".var/app")
+            .join(FLATPAK_ID)
+            .join("config/retroarch/cores");
+        fs::create_dir_all(&native_cores).unwrap();
+        fs::create_dir_all(&flatpak_cores).unwrap();
+        fs::write(native_cores.join("snes9x_libretro.so"), b"native").unwrap();
+        fs::write(native_cores.join("fceumm_libretro.so"), b"nes").unwrap();
+        fs::write(flatpak_cores.join("snes9x_libretro.so"), b"flatpak").unwrap();
+        let xdg = home.join("xdg");
+        fs::create_dir_all(xdg.join("retroarch")).unwrap();
+        fs::write(
+            xdg.join("retroarch/retroarch.cfg"),
+            format!("libretro_directory = \"{}\"\n", native_cores.display()),
+        )
+        .unwrap();
+        let flatpak_cfg_path = home
+            .join(".var/app")
+            .join(FLATPAK_ID)
+            .join("config/retroarch/retroarch.cfg");
+        fs::create_dir_all(flatpak_cfg_path.parent().unwrap()).unwrap();
+        fs::write(
+            &flatpak_cfg_path,
+            format!("libretro_directory = \"{}\"\n", flatpak_cores.display()),
+        )
+        .unwrap();
+        let env = DetectEnv {
+            path: Some(bin.as_os_str().into()),
+            home: home.to_path_buf(),
+            xdg_config_home: Some(xdg),
+            native_bin: home.join("missing"),
+            system_flatpak: None,
+        };
+        let mut config = Config::default();
+        let mut snes = console(native_cores.join("snes9x_libretro.so"));
+        snes.emulator = Some("retroarch-flatpak".into());
+        let mut nes = console(flatpak_cores.join("fceumm_libretro.so"));
+        nes.id = "nes".into();
+        nes.emulator = Some("retroarch".into());
+        config.consoles.push(snes);
+        config.consoles.push(nes);
+        let prepared = prepare(&mut config, &env);
+        assert!(prepared.changed);
+        assert_eq!(config.emulators.len(), 2);
+        let native = catalog_for_emulator(&config.emulators[0], &env);
+        let flatpak = catalog_for_emulator(&config.emulators[1], &env);
+        assert_eq!(
+            native
+                .cores
+                .iter()
+                .map(|core| core.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fceumm", "snes9x"]
+        );
+        assert!(native
+            .cores
+            .iter()
+            .all(|core| core.path.starts_with(&native_cores)));
+        assert_eq!(flatpak.cores.len(), 1);
+        assert_eq!(
+            flatpak.cores[0].path,
+            flatpak_cores.join("snes9x_libretro.so")
+        );
+        assert_eq!(
+            config.consoles[0].core.as_deref(),
+            Some(flatpak_cores.join("snes9x_libretro.so").as_path())
+        );
+        assert_eq!(
+            config.consoles[1].core.as_deref(),
+            Some(native_cores.join("fceumm_libretro.so").as_path())
+        );
+    }
+
+    #[test]
+    fn flatpak_list_and_info_find_user_and_system_installs() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let log = root.path().join("flatpak.log");
+        let stub = bin.join("flatpak");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = list ]; then\n  echo 'RetroArch {id} 1.22.2 stable user'\n  echo 'RetroArch {id} 1.22.2 stable system'\n  exit 0\nfi\nif [ \"$1\" = info ]; then\n  echo 'ID: {id}'\n  echo 'Installation: user'\n  exit 0\nfi\nexit 1\n",
+                log.display(),
+                id = FLATPAK_ID,
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&stub, perms).unwrap();
+        let env = DetectEnv {
+            path: Some(bin.as_os_str().into()),
+            home: root.path().to_path_buf(),
+            xdg_config_home: None,
+            native_bin: root.path().join("missing"),
+            system_flatpak: None,
+        };
+        let found = find_installs(&env);
+        assert_eq!(found.len(), 2);
+        assert_eq!(
+            found[0].command(),
+            format!("flatpak run --user {FLATPAK_ID}")
+        );
+        assert_eq!(
+            found[1].command(),
+            format!("flatpak run --system {FLATPAK_ID}")
+        );
+        assert_eq!(found[0].cfg(), found[1].cfg());
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("list --app"));
+        assert!(calls.contains(&format!("info {FLATPAK_ID}")));
+
+        let mut emulators = vec![retroarch_emulator("retroarch", FLATPAK_COMMAND)];
+        assert!(ensure_installs(&mut emulators, &found));
+        assert_eq!(emulators.len(), 2);
+        assert_eq!(emulators[0].path, FLATPAK_COMMAND);
+        assert_eq!(emulators[1].name, "RetroArch (Flatpak system)");
+        assert!(!command_present("/usr/bin/retroarch", &env, &found));
+        assert!(command_present(FLATPAK_COMMAND, &env, &found));
+        assert!(command_present(
+            &format!("flatpak run --system {FLATPAK_ID}"),
+            &env,
+            &found
+        ));
     }
 
     #[test]
@@ -896,13 +1495,13 @@ libretro_directory = "local-cores"
             system_flatpak: None,
         };
         assert_eq!(
-            retroarch_cfg(Some(&RetroArchInstall::Flatpak), &env),
+            flatpak_cfg(&env),
             home.join(format!(
                 ".var/app/{FLATPAK_ID}/config/retroarch/retroarch.cfg"
             ))
         );
         assert_eq!(
-            retroarch_cfg(None, &env),
+            native_cfg(&env),
             PathBuf::from("/xdg/retroarch/retroarch.cfg")
         );
         let no_xdg = DetectEnv {
@@ -910,7 +1509,7 @@ libretro_directory = "local-cores"
             ..env
         };
         assert_eq!(
-            retroarch_cfg(None, &no_xdg),
+            native_cfg(&no_xdg),
             home.join(".config/retroarch/retroarch.cfg")
         );
     }

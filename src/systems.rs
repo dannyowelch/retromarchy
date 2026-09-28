@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::cores::Core;
+use crate::cores::{Core, CoreCatalog};
 use crate::game_menu::LineEdit;
 use crate::gamepad::NavDir;
 use crate::split::{Side, Split};
@@ -61,17 +61,19 @@ pub enum Step {
 pub struct Systems {
     emulators: Vec<Emulator>,
     rows: Vec<SystemRow>,
-    cores: Vec<Core>,
+    catalogs: Vec<CoreCatalog>,
     split: Split,
     field: Field,
 }
 
 impl Systems {
-    pub fn open(config: &Config, cores: Vec<Core>) -> Self {
+    pub fn open(config: &Config, catalogs: Vec<CoreCatalog>) -> Self {
+        let mut catalogs = catalogs;
+        catalogs.resize(config.emulators.len(), CoreCatalog::empty());
         Self {
             emulators: config.emulators.clone(),
             rows: config.consoles.iter().map(system_row).collect(),
-            cores,
+            catalogs,
             split: Split::list(),
             field: Field::Emulator,
         }
@@ -118,7 +120,8 @@ impl Systems {
                 args_aimed: false,
             };
         };
-        let (core, missing) = core_label(&self.cores, row.core.as_deref());
+        let row = row.clone();
+        let (core, missing) = core_label(self.cores_for(self.split.index), row.core.as_deref());
         let retroarch = self.retroarch_selected(self.split.index);
         Panel {
             empty: false,
@@ -224,8 +227,8 @@ impl Systems {
         }
     }
 
-    pub fn set_cores(&mut self, cores: Vec<Core>) {
-        self.cores = cores;
+    pub fn set_catalogs(&mut self, catalogs: Vec<CoreCatalog>) {
+        self.catalogs = catalogs;
     }
 
     fn enter_panel(&mut self) {
@@ -336,21 +339,39 @@ impl Systems {
 
     fn core_choices(&self) -> Vec<Option<PathBuf>> {
         let mut choices = vec![None];
+        let cores = self.cores_for(self.split.index).to_vec();
         if let Some(path) = self
             .rows
             .get(self.split.index)
             .and_then(|row| row.core.clone())
         {
-            if !self.cores.iter().any(|core| core.path == path) {
+            if !cores.iter().any(|core| core.path == path) {
                 choices.push(Some(path));
             }
         }
-        for core in &self.cores {
+        for core in cores {
             if !choices.iter().any(|path| path.as_ref() == Some(&core.path)) {
                 choices.push(Some(core.path.clone()));
             }
         }
         choices
+    }
+
+    fn cores_for(&self, index: usize) -> &[Core] {
+        let Some(id) = self
+            .rows
+            .get(index)
+            .and_then(|row| row.emulator_id.as_deref())
+        else {
+            return &[];
+        };
+        let Some(pos) = self.emulators.iter().position(|emulator| emulator.id == id) else {
+            return &[];
+        };
+        self.catalogs
+            .get(pos)
+            .map(|catalog| catalog.cores.as_slice())
+            .unwrap_or(&[])
     }
 
     fn retroarch_selected(&self, index: usize) -> bool {
@@ -448,6 +469,7 @@ mod tests {
             kind: EmulatorKind::RetroArch,
             path: "/usr/bin/retroarch".into(),
             global_args: String::new(),
+            config: None,
         }
     }
 
@@ -461,11 +483,20 @@ mod tests {
         }
     }
 
+    fn catalog() -> CoreCatalog {
+        CoreCatalog {
+            directory: PathBuf::from("/cores"),
+            cores: vec![core()],
+            cfg: PathBuf::from("/cfg/retroarch.cfg"),
+            note: None,
+        }
+    }
+
     fn screen() -> Systems {
         let mut config = Config::default();
         config.emulators.push(retroarch());
         config.consoles.push(snes());
-        Systems::open(&config, vec![core()])
+        Systems::open(&config, vec![catalog()])
     }
 
     #[test]
@@ -485,7 +516,7 @@ mod tests {
         nes.id = "nes".into();
         nes.name = "NES".into();
         config.consoles.push(nes);
-        let mut screen = Systems::open(&config, vec![core()]);
+        let mut screen = Systems::open(&config, vec![catalog()]);
         assert!(screen.list_focused());
         screen.move_dir(NavDir::Down);
         assert_eq!(screen.list_rows()[1].selected, true);
@@ -525,12 +556,66 @@ mod tests {
             kind: EmulatorKind::Standalone,
             path: "dolphin-emu".into(),
             global_args: String::new(),
+            config: None,
         });
         screen.move_dir(NavDir::Right);
         assert_eq!(screen.move_dir(NavDir::Right), Step::Write);
         assert_eq!(screen.rows()[0].emulator_id.as_deref(), Some("dolphin"));
         assert!(screen.rows()[0].core.is_none());
         assert!(!screen.panel().core_enabled);
+    }
+
+    #[test]
+    fn a_systems_core_list_follows_that_systems_emulator() {
+        let mut config = Config::default();
+        config.emulators.push(retroarch());
+        config.emulators.push(Emulator {
+            id: "retroarch-flatpak".into(),
+            name: "RetroArch (Flatpak)".into(),
+            kind: EmulatorKind::RetroArch,
+            path: "flatpak run org.libretro.RetroArch".into(),
+            global_args: String::new(),
+            config: None,
+        });
+        config.consoles.push(snes());
+        let flatpak = CoreCatalog {
+            directory: PathBuf::from("/flatpak"),
+            cores: vec![Core {
+                name: "nestopia".into(),
+                path: PathBuf::from("/flatpak/nestopia_libretro.so"),
+                label: "Nestopia".into(),
+                systemname: String::new(),
+                extensions: Vec::new(),
+            }],
+            cfg: PathBuf::from("/flatpak/retroarch.cfg"),
+            note: None,
+        };
+        let mut screen = Systems::open(&config, vec![catalog(), flatpak]);
+        screen.move_dir(NavDir::Right);
+        screen.move_dir(NavDir::Down);
+        assert_eq!(screen.move_dir(NavDir::Right), Step::Write);
+        assert_eq!(
+            screen.rows()[0].core.as_deref(),
+            Some(Path::new("/cores/snes9x_libretro.so"))
+        );
+        screen.move_dir(NavDir::Up);
+        assert_eq!(screen.move_dir(NavDir::Right), Step::Write);
+        assert_eq!(
+            screen.rows()[0].emulator_id.as_deref(),
+            Some("retroarch-flatpak")
+        );
+        assert_eq!(
+            screen.rows()[0].core.as_deref(),
+            Some(Path::new("/cores/snes9x_libretro.so"))
+        );
+        assert!(screen.panel().core_missing);
+        screen.move_dir(NavDir::Down);
+        assert_eq!(screen.move_dir(NavDir::Right), Step::Write);
+        assert_eq!(
+            screen.rows()[0].core.as_deref(),
+            Some(Path::new("/flatpak/nestopia_libretro.so"))
+        );
+        assert!(!screen.panel().core_missing);
     }
 
     #[test]
