@@ -125,7 +125,7 @@ pub struct Prepared {
 pub fn prepare(config: &mut Config, env: &DetectEnv) -> Prepared {
     let found = find_installs(env);
     let added = ensure_installs(&mut config.emulators, &found);
-    let repointed = repoint_owned(&mut config.consoles, &config.emulators, env);
+    let repointed = repoint_assigned_emulator(&mut config.consoles, &config.emulators, env);
     let catalog = config
         .emulators
         .iter()
@@ -162,7 +162,6 @@ pub fn catalogs_for(config: &Config, env: &DetectEnv) -> Vec<CoreCatalog> {
         .collect()
 }
 
-/// Every install that is present. Native, user Flatpak, and system Flatpak.
 pub fn find_installs(env: &DetectEnv) -> Vec<RetroArchInstall> {
     let mut installs = Vec::new();
     if let Some(path) = native_executable(env) {
@@ -349,8 +348,11 @@ pub fn repoint_consoles(consoles: &mut [Console], catalog: &CoreCatalog) -> bool
     changed
 }
 
-/// Repoint each system using only the emulator that system is assigned to.
-pub fn repoint_owned(consoles: &mut [Console], emulators: &[Emulator], env: &DetectEnv) -> bool {
+pub fn repoint_assigned_emulator(
+    consoles: &mut [Console],
+    emulators: &[Emulator],
+    env: &DetectEnv,
+) -> bool {
     let mut catalogs: Vec<(String, CoreCatalog)> = Vec::new();
     let mut changed = false;
     for console in consoles {
