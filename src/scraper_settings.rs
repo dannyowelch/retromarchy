@@ -98,6 +98,7 @@ struct Stop {
     col: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScraperSettings {
     box_art: bool,
     screenshot: bool,
@@ -490,6 +491,16 @@ impl ScraperSettings {
             row += 1;
         }
         stops
+    }
+
+    pub fn at_text_start(&self) -> bool {
+        let edit = match self.focus {
+            Slot::User => &self.user,
+            Slot::Password => &self.password,
+            Slot::ApiKey => &self.api_key,
+            _ => return false,
+        };
+        !edit.replace && edit.caret == 0
     }
 
     fn edit_mut(&mut self) -> Option<&mut LineEdit> {

@@ -194,6 +194,405 @@ fn set_value(input: &mut InputSettings, slot: Slot, value: u32) {
     }
 }
 
+pub fn options_key(key: &str, key_char: Option<&str>, control: bool) -> bool {
+    if !control {
+        return false;
+    }
+    key.eq_ignore_ascii_case("o") || key_char.is_some_and(|ch| ch.eq_ignore_ascii_case("o"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Input,
+    Theme,
+    Scraper,
+    Grid,
+}
+
+impl Section {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Input => "Input",
+            Self::Theme => "Theme",
+            Self::Scraper => "Scraper",
+            Self::Grid => "Grid",
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Input => "Hold repeat",
+            Self::Theme => "Omarchy or LaunchBox",
+            Self::Scraper => "Artwork and accounts",
+            Self::Grid => "Cover width and order",
+        }
+    }
+}
+
+const SECTIONS: [Section; 4] = [
+    Section::Input,
+    Section::Theme,
+    Section::Scraper,
+    Section::Grid,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridField {
+    Cover,
+    Sort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    None,
+    Close,
+    Input,
+    Theme,
+    Cover,
+    Sort,
+    SaveScraper,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionRow {
+    pub section: Section,
+    pub title: &'static str,
+    pub detail: &'static str,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Options {
+    split: crate::split::Split,
+    input: InputOptions,
+    theme: String,
+    scraper: crate::scraper_settings::ScraperSettings,
+    cover_width: f32,
+    system_sort: crate::config::SystemSort,
+    grid_field: GridField,
+}
+
+impl Options {
+    pub fn open(config: &crate::config::Config, section: Section) -> Self {
+        let index = SECTIONS
+            .iter()
+            .position(|item| *item == section)
+            .unwrap_or(0);
+        Self {
+            split: crate::split::Split::at(index),
+            input: InputOptions::open(config.input),
+            theme: config.theme.clone(),
+            scraper: crate::scraper_settings::ScraperSettings::open(config.scraper.clone()),
+            cover_width: crate::config::clamp_cover_width(config.cover_width),
+            system_sort: config.system_sort,
+            grid_field: GridField::Cover,
+        }
+    }
+
+    pub fn section(&self) -> Section {
+        SECTIONS[self.split.index.min(SECTIONS.len() - 1)]
+    }
+
+    pub fn list_focused(&self) -> bool {
+        self.split.side == crate::split::Side::List
+    }
+
+    pub fn selected_index(&self) -> usize {
+        self.split.index
+    }
+
+    pub fn sections(&self) -> [SectionRow; 4] {
+        SECTIONS.map(|section| SectionRow {
+            section,
+            title: section.label(),
+            detail: section.detail(),
+            selected: section == self.section(),
+        })
+    }
+
+    pub fn input_rows(&self) -> [Row; 4] {
+        let mut rows = self.input.rows();
+        if !self.panel_live(Section::Input) {
+            for row in &mut rows {
+                row.aimed = false;
+            }
+        }
+        rows
+    }
+
+    pub fn input(&self) -> InputSettings {
+        self.input.input()
+    }
+
+    pub fn input_close_aimed(&self) -> bool {
+        self.panel_live(Section::Input) && self.input.close_aimed()
+    }
+
+    pub fn theme(&self) -> &str {
+        &self.theme
+    }
+
+    pub fn theme_launchbox(&self) -> bool {
+        crate::appearance::is_launchbox(&self.theme)
+    }
+
+    pub fn theme_aimed(&self) -> bool {
+        self.panel_live(Section::Theme)
+    }
+
+    pub fn cover_width(&self) -> f32 {
+        self.cover_width
+    }
+
+    pub fn system_sort(&self) -> crate::config::SystemSort {
+        self.system_sort
+    }
+
+    pub fn cover_aimed(&self) -> bool {
+        self.panel_live(Section::Grid) && self.grid_field == GridField::Cover
+    }
+
+    pub fn sort_aimed(&self) -> bool {
+        self.panel_live(Section::Grid) && self.grid_field == GridField::Sort
+    }
+
+    pub fn scraper(&self) -> &crate::scraper_settings::ScraperSettings {
+        &self.scraper
+    }
+
+    pub fn scraper_mut(&mut self) -> &mut crate::scraper_settings::ScraperSettings {
+        &mut self.scraper
+    }
+
+    pub fn select(&mut self, section: Section) {
+        if let Some(index) = SECTIONS.iter().position(|item| *item == section) {
+            self.split.select(index);
+        }
+    }
+
+    pub fn focus_panel(&mut self) {
+        self.split.enter();
+    }
+
+    pub fn choose_theme(&mut self, launchbox: bool) -> bool {
+        self.split.enter();
+        let next = if launchbox {
+            crate::appearance::LAUNCHBOX
+        } else {
+            crate::appearance::SYSTEM
+        };
+        if self.theme == next {
+            return false;
+        }
+        self.theme = next.to_string();
+        true
+    }
+
+    pub fn adjust_cover(&mut self, steps: i32) -> bool {
+        self.split.enter();
+        self.grid_field = GridField::Cover;
+        let next = crate::config::step_cover_width(self.cover_width, steps);
+        if (next - self.cover_width).abs() < 0.5 {
+            return false;
+        }
+        self.cover_width = next;
+        true
+    }
+
+    pub fn set_system_sort(&mut self, sort: crate::config::SystemSort) {
+        self.split.enter();
+        self.grid_field = GridField::Sort;
+        self.system_sort = sort;
+    }
+
+    pub fn aim_input(&mut self, slot: Slot) {
+        self.split.enter();
+        self.input.aim(slot);
+    }
+
+    pub fn step_input(&mut self, slot: Slot, steps: i32) -> bool {
+        self.split.enter();
+        self.input.step(slot, steps)
+    }
+
+    pub fn move_dir(&mut self, dir: NavDir) -> Command {
+        if self.split.side == crate::split::Side::List {
+            match dir {
+                NavDir::Up => self.split.move_list(-1, SECTIONS.len()),
+                NavDir::Down => self.split.move_list(1, SECTIONS.len()),
+                NavDir::Right => self.enter_panel(),
+                NavDir::Left => {}
+            }
+            return Command::None;
+        }
+        match self.section() {
+            Section::Input => self.move_input(dir),
+            Section::Theme => self.move_theme(dir),
+            Section::Scraper => self.move_scraper(dir),
+            Section::Grid => self.move_grid(dir),
+        }
+    }
+
+    pub fn tab(&mut self, backward: bool) {
+        if self.split.side == crate::split::Side::List {
+            if !backward {
+                self.enter_panel();
+            }
+            return;
+        }
+        if backward {
+            self.split.leave();
+            return;
+        }
+        match self.section() {
+            Section::Input => self.input.tab(false),
+            Section::Scraper => self.scraper.tab(false),
+            Section::Grid => {
+                self.grid_field = match self.grid_field {
+                    GridField::Cover => GridField::Sort,
+                    GridField::Sort => GridField::Cover,
+                };
+            }
+            Section::Theme => {}
+        }
+    }
+
+    pub fn confirm(&mut self) -> Command {
+        if self.split.side == crate::split::Side::List {
+            self.enter_panel();
+            return Command::None;
+        }
+        match self.section() {
+            Section::Input => {
+                if self.input.close_aimed() {
+                    Command::Close
+                } else {
+                    Command::None
+                }
+            }
+            Section::Theme => {
+                self.toggle_theme();
+                Command::Theme
+            }
+            Section::Scraper => match self.scraper.confirm() {
+                crate::scraper_settings::Command::Save => Command::SaveScraper,
+                crate::scraper_settings::Command::None => Command::None,
+            },
+            Section::Grid => match self.grid_field {
+                GridField::Cover => Command::None,
+                GridField::Sort => {
+                    self.system_sort = self.system_sort.next();
+                    Command::Sort
+                }
+            },
+        }
+    }
+
+    pub fn accepts_text(&self) -> bool {
+        self.panel_live(Section::Scraper) && self.scraper.accepts_text()
+    }
+
+    pub fn type_text(&mut self, text: &str) {
+        if self.panel_live(Section::Scraper) {
+            self.scraper.type_text(text);
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        if self.panel_live(Section::Scraper) {
+            self.scraper.backspace();
+        }
+    }
+
+    pub fn delete_forward(&mut self) {
+        if self.panel_live(Section::Scraper) {
+            self.scraper.delete_forward();
+        }
+    }
+
+    fn panel_live(&self, section: Section) -> bool {
+        self.split.side == crate::split::Side::Panel && self.section() == section
+    }
+
+    fn enter_panel(&mut self) {
+        self.split.enter();
+        match self.section() {
+            Section::Input => self.input.aim(Slot::Starting),
+            Section::Scraper => {
+                self.scraper.aim(crate::scraper_settings::Slot::BoxArt);
+            }
+            Section::Grid => self.grid_field = GridField::Cover,
+            Section::Theme => {}
+        }
+    }
+
+    fn move_input(&mut self, dir: NavDir) -> Command {
+        if dir == NavDir::Left && self.input.close_aimed() {
+            self.split.leave();
+            return Command::None;
+        }
+        if self.input.move_dir(dir) {
+            Command::Input
+        } else {
+            Command::None
+        }
+    }
+
+    fn move_theme(&mut self, dir: NavDir) -> Command {
+        match dir {
+            NavDir::Left | NavDir::Right => {
+                self.toggle_theme();
+                Command::Theme
+            }
+            NavDir::Up | NavDir::Down => Command::None,
+        }
+    }
+
+    fn toggle_theme(&mut self) {
+        self.theme = crate::appearance::next_theme(&self.theme).to_string();
+    }
+
+    fn move_scraper(&mut self, dir: NavDir) -> Command {
+        if dir == NavDir::Left && self.scraper.at_text_start() {
+            self.split.leave();
+            return Command::None;
+        }
+        let before = self.scraper.focus();
+        self.scraper.move_dir(dir);
+        if dir == NavDir::Left && self.scraper.focus() == before && !self.scraper.accepts_text() {
+            self.split.leave();
+        }
+        Command::None
+    }
+
+    fn move_grid(&mut self, dir: NavDir) -> Command {
+        match dir {
+            NavDir::Up | NavDir::Down => {
+                self.grid_field = match self.grid_field {
+                    GridField::Cover => GridField::Sort,
+                    GridField::Sort => GridField::Cover,
+                };
+                Command::None
+            }
+            NavDir::Left | NavDir::Right => match self.grid_field {
+                GridField::Cover => {
+                    let steps = if dir == NavDir::Left { -1 } else { 1 };
+                    let next = crate::config::step_cover_width(self.cover_width, steps);
+                    if (next - self.cover_width).abs() < 0.5 {
+                        return Command::None;
+                    }
+                    self.cover_width = next;
+                    Command::Cover
+                }
+                GridField::Sort => {
+                    self.system_sort = self.system_sort.next();
+                    Command::Sort
+                }
+            },
+        }
+    }
+}
+
 fn step_ms(value: u32, min: u32, steps: i32) -> u32 {
     let magnitude = steps.unsigned_abs().saturating_mul(STEP_MS);
     let stepped = if steps < 0 {
@@ -282,5 +681,31 @@ mod tests {
         assert_eq!(dialog.focus(), Slot::Close);
         assert!(!dialog.move_dir(NavDir::Left));
         assert_eq!(dialog.focus(), Slot::Close);
+    }
+
+    #[test]
+    fn options_sections_move_on_the_left_and_edit_on_the_right() {
+        let mut options = Options::open(&crate::config::Config::default(), Section::Input);
+        assert!(options.list_focused());
+        assert_eq!(options.section(), Section::Input);
+        assert_eq!(options.move_dir(NavDir::Down), Command::None);
+        assert_eq!(options.section(), Section::Theme);
+        options.move_dir(NavDir::Right);
+        assert!(!options.list_focused());
+        assert_eq!(options.move_dir(NavDir::Left), Command::Theme);
+        assert!(options.theme_launchbox());
+        options.tab(true);
+        assert!(options.list_focused());
+        options.move_dir(NavDir::Down);
+        options.move_dir(NavDir::Down);
+        assert_eq!(options.section(), Section::Grid);
+        options.move_dir(NavDir::Right);
+        assert_eq!(options.move_dir(NavDir::Left), Command::Cover);
+        assert_eq!(
+            options.cover_width(),
+            crate::config::COVER_WIDTH_DEFAULT - 10.0
+        );
+        assert!(options_key("o", None, true));
+        assert!(!options_key("o", None, false));
     }
 }

@@ -94,22 +94,26 @@ pub enum Key {
 
 pub fn open_library() -> Library {
     match config::load_config() {
-        Ok(config) if !config.consoles.is_empty() => match database::init_db() {
-            Ok(conn) => from_config(&config, &conn),
-            Err(err) => demo_library(&format!(
-                "Demo library. Could not open the library database ({err})."
-            )),
-        },
-        // A blank config is an empty library. The demo
-        // stays for a config or database that cannot be opened.
-        Ok(config) => Library {
-            kind: LibraryKind::Disk,
-            note: String::new(),
-            details_open: config.details_visible,
-            system_sort: config.system_sort,
-            shelves: Vec::new(),
-            emulators: config.emulators.clone(),
-        },
+        Ok(mut config) => {
+            crate::cores::bootstrap(&mut config);
+            if !config.consoles.is_empty() {
+                match database::init_db() {
+                    Ok(conn) => from_config(&config, &conn),
+                    Err(err) => demo_library(&format!(
+                        "Demo library. Could not open the library database ({err})."
+                    )),
+                }
+            } else {
+                Library {
+                    kind: LibraryKind::Disk,
+                    note: String::new(),
+                    details_open: config.details_visible,
+                    system_sort: config.system_sort,
+                    shelves: Vec::new(),
+                    emulators: config.emulators.clone(),
+                }
+            }
+        }
         Err(err) => demo_library(&format!("Demo library. Could not read config ({err}).")),
     }
 }

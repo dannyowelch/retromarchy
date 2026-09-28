@@ -18,6 +18,8 @@
 # Emulators are installed programs. RetroArch is one entry. Cores are per system.
 # Launch is: path, global_args, then `-L <core>` for RetroArch, then extra_args, then the ROM.
 # `{rom}` in global_args or extra_args is replaced, and the ROM is not added again.
+# Cores are read from RetroArch's libretro_directory, not from this file's core paths
+# except as the selected core for each system.
 [[emulators]]
 id = "retroarch"
 name = "RetroArch"

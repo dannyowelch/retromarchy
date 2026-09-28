@@ -3,29 +3,26 @@ use anyhow::{anyhow, Result};
 use std::path::Path;
 use std::process::{Child, Command};
 
-/// `program` is the emulator path. Arguments are global args, then `-L <core>`
-/// for RetroArch, then the system's extra args, then the ROM.
-/// `{rom}` inside either argument string is replaced and the ROM is not appended again.
+/// `path` is a command. The first token is the program and the rest lead the
+/// argument list, then global args, then `-L <core>` for RetroArch, then the
+/// system's extra args, then the ROM. `{rom}` inside either argument string is
+/// replaced and the ROM is not appended again.
 pub fn build_launch_command(
     emulator: &Emulator,
     core: Option<&Path>,
     extra_args: &str,
     rom: &Path,
 ) -> Result<(String, Vec<String>)> {
-    let program = emulator.path.trim();
-    if program.is_empty() {
-        return Err(anyhow!(
-            "Emulator \"{}\" has no executable path.",
-            emulator.name
-        ));
-    }
+    let (program, leading) = split_program(&emulator.path)
+        .map_err(|_| anyhow!("Emulator \"{}\" has no executable path.", emulator.name))?;
     let rom_text = rom.to_string_lossy();
     let (global, global_rom) = tokenize(&emulator.global_args, &rom_text)?;
     let (extra, extra_rom) = tokenize(extra_args, &rom_text)?;
-    let mut args = global;
+    let mut args = leading;
+    args.extend(global);
     if emulator.kind == EmulatorKind::RetroArch {
         let core = core.ok_or_else(|| {
-            anyhow!("RetroArch needs a core for this system. Set one in Manage Emulators.")
+            anyhow!("RetroArch needs a core for this system. Set one in Manage Systems.")
         })?;
         args.push("-L".to_string());
         args.push(core.to_string_lossy().into_owned());
@@ -48,6 +45,19 @@ pub fn launch_game_tracked(launch: &ResolvedLaunch, rom: &Path) -> Result<Child>
         .args(&args)
         .spawn()
         .map_err(|err| anyhow!("Failed to launch {program}: {err}"))
+}
+
+fn split_program(path: &str) -> Result<(String, Vec<String>)> {
+    let parts =
+        shell_words::split(path.trim()).map_err(|err| anyhow!("Failed to parse command: {err}"))?;
+    let mut parts = parts.into_iter();
+    let Some(program) = parts.next() else {
+        return Err(anyhow!("empty command"));
+    };
+    if program.is_empty() {
+        return Err(anyhow!("empty command"));
+    }
+    Ok((program, parts.collect()))
 }
 
 fn tokenize(args: &str, rom: &str) -> Result<(Vec<String>, bool)> {
@@ -135,6 +145,31 @@ mod tests {
         let (program, args) = build_launch_command(&emulator, None, "", &rom).unwrap();
         assert_eq!(program, "pcsx2");
         assert_eq!(args, vec!["--fullscreen", "/roms/game with spaces.iso"]);
+    }
+
+    #[test]
+    fn flatpak_retroarch_splits_the_command_and_passes_the_core() {
+        let emulator = Emulator {
+            id: "retroarch".into(),
+            name: "RetroArch".into(),
+            kind: EmulatorKind::RetroArch,
+            path: "flatpak run org.libretro.RetroArch".into(),
+            global_args: String::new(),
+        };
+        let rom = PathBuf::from("/roms/game.sfc");
+        let core = PathBuf::from("/cores/active/snes9x_libretro.so");
+        let (program, args) = build_launch_command(&emulator, Some(&core), "", &rom).unwrap();
+        assert_eq!(program, "flatpak");
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "org.libretro.RetroArch",
+                "-L",
+                "/cores/active/snes9x_libretro.so",
+                "/roms/game.sfc",
+            ]
+        );
     }
 
     #[test]
