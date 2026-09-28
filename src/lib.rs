@@ -12,6 +12,7 @@ pub mod importer;
 pub mod input_repeat;
 pub mod launcher;
 pub mod options;
+pub mod picker;
 pub mod scanner;
 pub mod scraper;
 pub mod scraper_settings;
