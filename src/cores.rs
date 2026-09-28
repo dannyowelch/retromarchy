@@ -815,6 +815,77 @@ libretro_directory = "local-cores"
     }
 
     #[test]
+    fn user_layout_flatpak_cores_survive_a_leftover_native_cfg() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        let native_cfg = home.join(".config/retroarch/retroarch.cfg");
+        fs::create_dir_all(native_cfg.parent().unwrap()).unwrap();
+        fs::write(&native_cfg, "video_driver = \"gl\"\n").unwrap();
+
+        let flatpak_dir = home
+            .join(".var/app")
+            .join(FLATPAK_ID)
+            .join("config/retroarch");
+        let cores = flatpak_dir.join("cores");
+        let info = flatpak_dir.join("info");
+        fs::create_dir_all(&cores).unwrap();
+        fs::create_dir_all(&info).unwrap();
+        for index in 0..91 {
+            fs::write(cores.join(format!("core{index:02}_libretro.so")), b"x").unwrap();
+        }
+        let cores_rel = cores.strip_prefix(home).unwrap().display().to_string();
+        let info_rel = info.strip_prefix(home).unwrap().display().to_string();
+        fs::write(
+            flatpak_dir.join("retroarch.cfg"),
+            format!(
+                "libretro_directory = \"~/{cores_rel}\"\nlibretro_info_path = \"~/{info_rel}\"\n"
+            ),
+        )
+        .unwrap();
+
+        let env = DetectEnv {
+            path: Some(home.join("empty-path").into()),
+            home: home.to_path_buf(),
+            xdg_config_home: None,
+            native_bin: home.join("missing-retroarch"),
+            system_flatpak: None,
+        };
+        let text = fs::read_to_string(flatpak_dir.join("retroarch.cfg")).unwrap();
+        let parsed = parse_cfg(&text, &flatpak_dir, Some(home));
+        assert_eq!(
+            parsed.libretro_directory.as_deref(),
+            Some(cores.as_path()),
+            "tilde expansion"
+        );
+        assert!(
+            !parsed.default_cores,
+            "explicit flatpak cores dir was treated as the native stock default"
+        );
+
+        let flatpak = discover(Some(&RetroArchInstall::Flatpak), &env);
+        assert_eq!(flatpak.directory, cores);
+        assert_eq!(flatpak.cores.len(), 91);
+
+        let native = discover(
+            Some(&RetroArchInstall::Native {
+                path: PathBuf::from("retroarch"),
+            }),
+            &env,
+        );
+        assert!(native.cores.is_empty());
+        assert_eq!(native.directory, PathBuf::from(FALLBACK_CORE_DIR));
+        assert_ne!(
+            retroarch_cfg(Some(&RetroArchInstall::Flatpak), &env),
+            retroarch_cfg(
+                Some(&RetroArchInstall::Native {
+                    path: PathBuf::from("retroarch"),
+                }),
+                &env
+            )
+        );
+    }
+
+    #[test]
     fn flatpak_cfg_is_under_the_var_app_directory() {
         let home = Path::new("/home/player");
         let env = DetectEnv {
