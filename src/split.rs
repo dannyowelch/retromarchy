@@ -59,6 +59,44 @@ impl Split {
 
 pub const HINT: &str = "Up and down move the list. Right, Enter, or Tab edits. Left at the edge, or Shift-Tab, returns. Esc saves and closes.";
 
+/// Shared by the library sidebar and the settings-screen lists.
+pub const LIST_PAD: f32 = 8.;
+pub const LIST_GAP: f32 = 4.;
+pub const ROW_PAD_X: f32 = 8.;
+pub const ROW_PAD_Y: f32 = 6.;
+pub const ROW_GAP: f32 = 1.;
+pub const TITLE_SIZE: f32 = 14.;
+pub const TITLE_LINE: f32 = 18.;
+pub const DETAIL_SIZE: f32 = 12.;
+pub const DETAIL_LINE: f32 = 15.;
+
+pub fn list_metrics<E: Styled>(el: E) -> E {
+    el.p(px(LIST_PAD)).gap(px(LIST_GAP))
+}
+
+pub fn row_metrics<E: Styled>(el: E) -> E {
+    el.flex_shrink_0()
+        .flex()
+        .flex_col()
+        .px(px(ROW_PAD_X))
+        .py(px(ROW_PAD_Y))
+        .gap(px(ROW_GAP))
+}
+
+pub fn title_metrics<E: Styled>(el: E) -> E {
+    el.w_full()
+        .min_w(px(0.))
+        .text_size(px(TITLE_SIZE))
+        .line_height(px(TITLE_LINE))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+}
+
+pub fn detail_metrics<E: Styled>(el: E) -> E {
+    el.text_size(px(DETAIL_SIZE)).line_height(px(DETAIL_LINE))
+}
+
 /// List and panel for one settings screen. The shell places this in the slot
 /// between the menu bar and the status bar, in place of the game grid.
 pub fn screen<R, E>(
@@ -133,17 +171,17 @@ where
                             theme.border
                         })
                         .child(
-                            div()
-                                .id(list_id)
-                                .flex_1()
-                                .min_h(px(0.))
-                                .flex()
-                                .flex_col()
-                                .overflow_y_scroll()
-                                .track_scroll(list_scroll)
-                                .p(px(8.))
-                                .gap(px(4.))
-                                .children(rows),
+                            list_metrics(
+                                div()
+                                    .id(list_id)
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .overflow_y_scroll()
+                                    .track_scroll(list_scroll),
+                            )
+                            .children(rows),
                         ),
                 )
                 .child(

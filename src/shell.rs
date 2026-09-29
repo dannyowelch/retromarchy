@@ -2603,17 +2603,17 @@ fn sidebar(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl 
         .border_color(if focused { theme.accent } else { theme.border })
         .child(sidebar_header(browse, cx))
         .child(
-            div()
-                .id("sidebar-list")
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .overflow_y_scroll()
-                .track_scroll(scroll)
-                .p(px(8.))
-                .gap(px(4.))
-                .children(sidebar_consoles(browse, cx)),
+            split::list_metrics(
+                div()
+                    .id("sidebar-list")
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .track_scroll(scroll),
+            )
+            .children(sidebar_consoles(browse, cx)),
         )
 }
 
@@ -2703,14 +2703,7 @@ fn sidebar_consoles(browse: &Browse, cx: &Context<Shell>) -> Vec<impl IntoElemen
         .enumerate()
         .map(|(index, shelf)| {
             let selected = index == browse.console;
-            div()
-                .id(("console", index))
-                .flex_shrink_0()
-                .flex()
-                .flex_col()
-                .px(px(8.))
-                .py(px(6.))
-                .gap(px(1.))
+            split::row_metrics(div().id(("console", index)))
                 .bg(if selected {
                     theme.selected_fill()
                 } else {
@@ -2727,17 +2720,7 @@ fn sidebar_consoles(browse: &Browse, cx: &Context<Shell>) -> Vec<impl IntoElemen
                         cx.notify();
                     }),
                 )
-                .child(
-                    div()
-                        .w_full()
-                        .min_w(px(0.))
-                        .text_size(px(14.))
-                        .line_height(px(18.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(shelf.console.name.clone()),
-                )
+                .child(split::title_metrics(div()).child(shelf.console.name.clone()))
                 .child(
                     div()
                         .w_full()
@@ -2746,27 +2729,24 @@ fn sidebar_consoles(browse: &Browse, cx: &Context<Shell>) -> Vec<impl IntoElemen
                         .items_center()
                         .justify_between()
                         .gap(px(6.))
-                        .min_h(px(15.))
+                        .min_h(px(split::DETAIL_LINE))
                         .child({
-                            let mut year = div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .text_size(px(12.))
-                                .line_height(px(15.))
-                                .text_color(theme.secondary);
+                            let mut year = split::detail_metrics(
+                                div().flex_1().min_w(px(0.)).text_color(theme.secondary),
+                            );
                             if let Some(launched) = shelf.year {
                                 year = year.child(launched.to_string());
                             }
                             year
                         })
                         .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_size(px(12.))
-                                .line_height(px(15.))
-                                .text_color(theme.secondary)
-                                .whitespace_nowrap()
-                                .child(game_count_label(shelf.games.len())),
+                            split::detail_metrics(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(theme.secondary)
+                                    .whitespace_nowrap(),
+                            )
+                            .child(game_count_label(shelf.games.len())),
                         ),
                 )
         })
@@ -4690,13 +4670,7 @@ fn split_list_row(
     cx: &Context<Shell>,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
     let theme = cx.omarchy();
-    let mut row = div()
-        .id(id)
-        .flex_shrink_0()
-        .flex()
-        .flex_col()
-        .px(px(8.))
-        .py(px(8.))
+    let mut row = split::row_metrics(div().id(id))
         .cursor_pointer()
         .bg(if selected {
             theme.selected_fill()
@@ -4706,15 +4680,20 @@ fn split_list_row(
         .border_1()
         .border_color(if selected { theme.accent } else { theme.border })
         .hover(|style| style.bg(theme.hover_fill()))
-        .child(title);
+        .child(split::title_metrics(div()).child(title));
     if !detail.is_empty() {
         row = row.child(
-            div()
-                .text_size(px(12.))
-                .text_color(theme.secondary)
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .child(detail),
+            split::detail_metrics(
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .min_h(px(split::DETAIL_LINE))
+                    .text_color(theme.secondary)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis(),
+            )
+            .child(detail),
         );
     }
     row
