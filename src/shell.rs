@@ -15,7 +15,7 @@ use crate::emulators::{
 use crate::game_menu::{
     game_menu_key, Aim, DeleteSlot, Overlay, OverlayCommand, RenameSlot, ScrapeSlot,
 };
-use crate::gamepad::{NavDir, PadAction, PadHeld};
+use crate::gamepad::{InputGate, NavDir, PadAction, PadHeld, PadHook};
 use crate::input_repeat::HoldRepeat;
 use crate::launcher;
 use crate::options::{
@@ -62,6 +62,12 @@ pub struct Shell {
     _cover_slider_sub: Subscription,
     gilrs: Option<gilrs::Gilrs>,
     pad: PadHeld,
+    /// Pad and key actions stay off while a game is running, while this window
+    /// is inactive, and until the pad is released after either of those ends.
+    gate: InputGate,
+    /// `RETROMARCHY_PAD_HOOK` lines, on machines with no gamepad device.
+    pad_hook: Option<PadHook>,
+    activation: Option<Subscription>,
     /// Arrow keys and the pad share this clock. Rates come from config `[input]`
     /// and update when Options saves.
     hold: HoldRepeat,
@@ -97,6 +103,11 @@ enum PlayNote {
         last_played: chrono::DateTime<chrono::Utc>,
     },
     Failed(String),
+}
+
+enum PadIn {
+    Device(gilrs::EventType),
+    Hook(gilrs::Button, bool),
 }
 
 enum RescanNote {
@@ -167,6 +178,9 @@ impl Shell {
             _cover_slider_sub: cover_slider_sub,
             gilrs,
             pad: PadHeld::default(),
+            gate: InputGate::default(),
+            pad_hook: PadHook::open(),
+            activation: None,
             hold: HoldRepeat::default(),
             input: load_input(),
             appearance,
@@ -193,10 +207,31 @@ impl Shell {
     /// Face buttons are edges. Held directions step through [`HoldRepeat`].
     /// South enters the grid or launches. East returns to the system list.
     /// North toggles a favorite. Select opens the game menu, and closes it.
+    /// None of that is delivered while [`InputGate`] is closed.
     fn poll_nav(&mut self, cx: &mut Context<Self>) {
         self.pump_thumbs(cx);
         let events = self.drain_pad_events();
+        for event in &events {
+            self.observe_pad(event);
+        }
+        if !self.gate.live() {
+            self.sink_pad(&events);
+            let changed = self.poll_jobs();
+            self.close_pad_poll();
+            if changed {
+                cx.notify();
+            }
+            return;
+        }
         let mut changed = self.poll_jobs();
+        if !self.gate.live() {
+            self.sink_pad(&events);
+            self.close_pad_poll();
+            if changed {
+                cx.notify();
+            }
+            return;
+        }
         if self.options.is_some() {
             changed |= self.poll_options_pad(&events, cx);
             if changed {
@@ -219,7 +254,11 @@ impl Shell {
             return;
         }
         for event in &events {
-            match self.pad.apply(event) {
+            if !self.gate.live() {
+                let _ = self.apply_pad(event);
+                continue;
+            }
+            match self.apply_pad(event) {
                 Some(PadAction::Favorite) if !self.browse.overlay_open() => {
                     changed |= self.toggle_favorite();
                 }
@@ -243,6 +282,13 @@ impl Shell {
                 }
                 Some(PadAction::Favorite | PadAction::Menu) | None => {}
             }
+        }
+        if !self.gate.live() {
+            self.close_pad_poll();
+            if changed {
+                cx.notify();
+            }
+            return;
         }
         let now = monotonic_ms(self.nav_started);
         let (step_x, step_y) =
@@ -283,13 +329,48 @@ impl Shell {
         }
     }
 
-    fn drain_pad_events(&mut self) -> Vec<gilrs::EventType> {
-        let Some(gilrs) = self.gilrs.as_mut() else {
-            return Vec::new();
-        };
+    fn sink_pad(&mut self, events: &[PadIn]) {
+        for event in events {
+            let _ = self.apply_pad(event);
+        }
+    }
+
+    fn observe_pad(&mut self, event: &PadIn) {
+        match event {
+            PadIn::Device(event) => self.gate.observe_gilrs(event),
+            PadIn::Hook(button, down) => self.gate.observe_button(*button as u16, *down),
+        }
+    }
+
+    fn apply_pad(&mut self, event: &PadIn) -> Option<PadAction> {
+        match event {
+            PadIn::Device(event) => self.pad.apply(event),
+            PadIn::Hook(button, down) => self.pad.apply_button(*button, *down),
+        }
+    }
+
+    fn axis_held(&self) -> bool {
+        self.pad.horizontal().is_some() || self.pad.vertical().is_some()
+    }
+
+    fn close_pad_poll(&mut self) {
+        self.gate.end_poll(self.axis_held());
+        if !self.gate.live() {
+            self.hold = HoldRepeat::default();
+        }
+    }
+
+    fn drain_pad_events(&mut self) -> Vec<PadIn> {
         let mut events = Vec::new();
-        while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
-            events.push(event);
+        if let Some(gilrs) = self.gilrs.as_mut() {
+            while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
+                events.push(PadIn::Device(event));
+            }
+        }
+        if let Some(hook) = self.pad_hook.as_mut() {
+            for (button, down) in hook.poll() {
+                events.push(PadIn::Hook(button, down));
+            }
         }
         events
     }
@@ -310,6 +391,10 @@ impl Shell {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.gate.live() {
+            cx.stop_propagation();
+            return;
+        }
         if self.options.is_some() {
             self.on_options_key(&event.keystroke, false, cx);
             return;
@@ -501,7 +586,9 @@ impl Shell {
         };
         let before = self.browse.cover_width;
         if key == Key::Launch {
-            self.launch_selected();
+            if !event.is_held {
+                self.launch_selected();
+            }
         } else if key == Key::ToggleFavorite {
             self.toggle_favorite();
         } else {
@@ -519,6 +606,10 @@ impl Shell {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+        if !self.gate.live() {
+            cx.stop_propagation();
+            return;
+        }
         if self.options.is_some() {
             self.on_options_key(&event.keystroke, true, cx);
             return;
@@ -538,10 +629,10 @@ impl Shell {
         self.on_arrow(&event.keystroke, true, cx);
     }
 
-    fn poll_emulator_pad(&mut self, events: &[gilrs::EventType], cx: &mut Context<Self>) -> bool {
+    fn poll_emulator_pad(&mut self, events: &[PadIn], cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         for event in events {
-            match self.pad.apply(event) {
+            match self.apply_pad(event) {
                 Some(PadAction::Confirm) => {
                     self.confirm_emulators(cx);
                     changed = true;
@@ -728,10 +819,10 @@ impl Shell {
         cx.stop_propagation();
     }
 
-    fn poll_options_pad(&mut self, events: &[gilrs::EventType], cx: &mut Context<Self>) -> bool {
+    fn poll_options_pad(&mut self, events: &[PadIn], cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         for event in events {
-            match self.pad.apply(event) {
+            match self.apply_pad(event) {
                 Some(PadAction::Confirm) => {
                     self.confirm_options(cx);
                     changed = true;
@@ -844,10 +935,10 @@ impl Shell {
         cx.stop_propagation();
     }
 
-    fn poll_systems_pad(&mut self, events: &[gilrs::EventType], cx: &mut Context<Self>) -> bool {
+    fn poll_systems_pad(&mut self, events: &[PadIn], cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         for event in events {
-            match self.pad.apply(event) {
+            match self.apply_pad(event) {
                 Some(PadAction::Confirm) => {
                     self.confirm_systems(cx);
                     changed = true;
@@ -1627,6 +1718,7 @@ impl Shell {
             changed = true;
         }
         while let Ok(note) = self.play_rx.try_recv() {
+            self.gate.end_playing();
             match note {
                 PlayNote::Saved {
                     game_id,
@@ -1885,6 +1977,9 @@ impl Shell {
     }
 
     fn launch_selected(&mut self) {
+        if !self.gate.live() {
+            return;
+        }
         let Some(game) = self.browse.selected_game().cloned() else {
             self.browse.status = "Select a game, then press Enter.".into();
             return;
@@ -1896,7 +1991,8 @@ impl Shell {
             return;
         };
         match launcher::launch_game_tracked(&launch, &game.rom) {
-            Ok(mut child) => {
+            Ok(running) => {
+                self.gate.begin_playing();
                 let tx = self.play_tx.clone();
                 let game_id = game.id.clone();
                 let console_id = game.console.clone();
@@ -1905,7 +2001,7 @@ impl Shell {
                 let base_time = game.play_time;
                 std::thread::spawn(move || {
                     let started = Instant::now();
-                    let _ = child.wait();
+                    running.wait();
                     let elapsed = u32::try_from(started.elapsed().as_secs()).unwrap_or(u32::MAX);
                     let note = if disk {
                         match save_play_session(&game_id, &console_id, elapsed) {
@@ -2183,6 +2279,12 @@ impl Render for Shell {
         if !self.armed {
             self.armed = true;
             self.focus_handle.focus(window, cx);
+        }
+        if self.activation.is_none() {
+            self.gate.set_focused(window.is_window_active());
+            self.activation = Some(cx.observe_window_activation(window, |this, window, _cx| {
+                this.gate.set_focused(window.is_window_active());
+            }));
         }
         if self.refocus {
             self.refocus = false;
