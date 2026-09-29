@@ -36,11 +36,12 @@ use crate::types::{
 use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::base::CheckboxState;
 use gpui_kit::{
-    anchored, deferred, div, img, point, px, rgb, App, AppContext, ClickEvent, Context, Edges,
-    Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke,
-    MouseButton, MouseDownEvent, ObjectFit, ParentElement, PathPromptOptions, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, Window, WindowBounds,
-    WindowDecorations, WindowOptions,
+    anchored, deferred, div, img, point, px, rgb, uniform_list, AnyElement, App, AppContext,
+    ClickEvent, Context, Edges, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, ObjectFit, ParentElement,
+    PathPromptOptions, Render, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage,
+    Subscription, Task, UniformListScrollHandle, Window, WindowBounds, WindowDecorations,
+    WindowOptions,
 };
 use gpui_omarchy::{
     badge, button, checkbox, empty_state, focus_scope, keycap, separator, slider,
@@ -53,7 +54,7 @@ pub struct Shell {
     browse: Browse,
     focus_handle: FocusHandle,
     armed: bool,
-    grid_scroll: ScrollHandle,
+    grid_scroll: UniformListScrollHandle,
     sidebar_scroll: ScrollHandle,
     revealed_console: Option<usize>,
     revealed_game: Option<usize>,
@@ -158,7 +159,7 @@ impl Shell {
             browse,
             focus_handle: cx.focus_handle(),
             armed: false,
-            grid_scroll: ScrollHandle::new(),
+            grid_scroll: UniformListScrollHandle::new(),
             sidebar_scroll: ScrollHandle::new(),
             revealed_console: None,
             revealed_game: None,
@@ -1912,10 +1913,15 @@ impl Shell {
         }
     }
 
+    fn grid_base(&self) -> ScrollHandle {
+        self.grid_scroll.0.borrow().base_handle.clone()
+    }
+
     /// Scroll the selected row into view after the scrollports have a real size.
     /// Remembering the last reveal keeps a wheel gesture from snapping back.
     fn reveal_selection(&mut self) {
-        if self.grid_scroll.bounds().size.height <= px(0.) {
+        let scroll = self.grid_base();
+        if scroll.bounds().size.height <= px(0.) {
             return;
         }
         let columns = self.browse.columns.max(1);
@@ -1928,7 +1934,7 @@ impl Shell {
             return;
         }
         if self.revealed_console != Some(console) {
-            self.grid_scroll.set_offset(point(px(0.), px(0.)));
+            scroll.set_offset(point(px(0.), px(0.)));
             self.scroll_sidebar_to_console(console);
         }
         let revealed = match game {
@@ -1948,10 +1954,9 @@ impl Shell {
         }
     }
 
-    /// Move the selected row into view from the previous frame's child bounds.
-    /// Returns false when those bounds are for a different row count, so the
-    /// next frame can try again. `scroll_to_item` is not used: it aligns the
-    /// row's border box and scrolls the grid's padding off the pane.
+    /// Move the selected row into view from the previous frame's measured row
+    /// height. Returns false until the list has been laid out. Each row owns
+    /// its trailing gap, so the reveal box is the row itself.
     fn reveal_grid_row(&self, row: usize) -> bool {
         let columns = self.browse.columns.max(1);
         let games = self.browse.visible_len();
@@ -1960,20 +1965,21 @@ impl Shell {
         } else {
             games.div_ceil(columns)
         };
-        let scroll = &self.grid_scroll;
-        if rows == 0 || row >= rows || scroll.children_count() != rows {
-            return false;
-        }
-        let Some(bounds) = scroll.bounds_for_item(row) else {
+        let measured = self.grid_scroll.0.borrow().last_item_size;
+        let Some(measured) = measured else {
             return false;
         };
-        let viewport = scroll.bounds();
-        let viewport_height = viewport.size.height.as_f32();
+        if rows == 0 || row >= rows || measured.contents.height <= px(0.) {
+            return false;
+        }
+        let scroll = self.grid_base();
+        let viewport_height = measured.item.height.as_f32();
         if viewport_height <= 0.0 {
             return false;
         }
-        let row_top = (bounds.top() - viewport.top()).as_f32();
-        let row_bottom = (bounds.bottom() - viewport.top()).as_f32();
+        let row_height = measured.contents.height.as_f32() / rows as f32;
+        let row_top = row as f32 * row_height;
+        let row_bottom = row_top + row_height;
         let max_scroll = scroll.max_offset().y.as_f32();
         let (before, after) = row_reveal_insets(
             row,
@@ -1982,7 +1988,7 @@ impl Shell {
             row_bottom,
             viewport_height,
             max_scroll,
-            TILE_GAP,
+            0.0,
         );
         let next = reveal_row_scroll(
             -(scroll.offset().y.as_f32()),
@@ -1996,6 +2002,70 @@ impl Shell {
         let y = if next <= 0.0 { px(0.) } else { px(-next) };
         scroll.set_offset(point(px(0.), y));
         true
+    }
+
+    /// Save and leave whichever settings screen is open. Same writes as Esc
+    /// and as switching screens from the menu. On the library this does nothing.
+    fn go_library(&mut self) {
+        self.save_and_close_settings();
+    }
+
+    /// One grid row per index. The list asks for the visible range only.
+    fn game_rows(
+        &mut self,
+        range: std::ops::Range<usize>,
+        scale: f32,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        let count_tiles = crate::scroll_profile::count_pass();
+        let columns = self.browse.columns.max(1);
+        let cover = self.browse.cover_width;
+        let selected = self.browse.game;
+        let menu_cursor = self.browse.menu_cursor();
+        let demo = self.browse.library.kind == LibraryKind::Demo;
+        let art = self
+            .browse
+            .shelf()
+            .map(|shelf| shelf.console.grid_art)
+            .unwrap_or(GridArt::BoxArt);
+        let console_name = self
+            .browse
+            .shelf()
+            .map(|shelf| shelf.console.name.clone())
+            .unwrap_or_default();
+        let games: Vec<&Game> = self.browse.visible_games().collect();
+        let mut rows = Vec::with_capacity(range.len());
+        for row in range {
+            let start = row * columns;
+            let end = (start + columns).min(games.len());
+            let mut line = div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .flex_shrink_0()
+                .gap(px(TILE_GAP))
+                .pb(px(TILE_GAP));
+            for index in start..end {
+                if count_tiles {
+                    crate::scroll_profile::count_tile();
+                }
+                let menu = (selected == Some(index)).then_some(menu_cursor).flatten();
+                line = line.child(tile(
+                    index,
+                    games[index],
+                    &console_name,
+                    art,
+                    cover,
+                    scale,
+                    selected == Some(index),
+                    menu,
+                    demo,
+                    cx,
+                ));
+            }
+            rows.push(line.into_any_element());
+        }
+        rows
     }
 
     fn reveal_emulators(&mut self) {
@@ -2050,6 +2120,7 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::scroll_profile::begin_frame();
         let width = window.viewport_size().width.as_f32();
         let frame = self.browse.tile_frame();
         self.browse
@@ -2109,7 +2180,7 @@ impl Render for Shell {
             body(&self.browse, &self.grid_scroll, &self.sidebar_scroll, cx).into_any_element()
         };
 
-        focus_scope("retromarchy")
+        let ui = focus_scope("retromarchy")
             .track_focus(&self.focus_handle)
             .size_full()
             .flex()
@@ -2127,8 +2198,25 @@ impl Render for Shell {
             .children(note)
             .child(content)
             .child(status_line(&self.browse, &self.cover_slider, window, cx))
-            .children(game_dialog(&self.browse, &self.scrape_scroll, cx))
+            .children(game_dialog(&self.browse, &self.scrape_scroll, cx));
+        let grid_scroll = self.grid_base();
+        crate::scroll_profile::after_frame(&grid_scroll, window, cx);
+        ui
     }
+}
+
+fn library_title(id: &'static str, cx: &Context<Shell>) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex_none()
+        .font_weight(gpui_kit::FontWeight::BOLD)
+        .cursor_pointer()
+        .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
+            this.go_library();
+            this.focus_handle.focus(window, cx);
+            cx.notify();
+        }))
+        .child("Retromarchy")
 }
 
 fn header(
@@ -2152,11 +2240,7 @@ fn header(
         .bg(theme.surface)
         .border_b_1()
         .border_color(theme.border)
-        .child(
-            div()
-                .font_weight(gpui_kit::FontWeight::BOLD)
-                .child("Retromarchy"),
-        )
+        .child(library_title("library-title", cx))
         .child(keycap(theme_name, cx));
     if browse.library.kind == LibraryKind::Demo {
         row = row.child(badge("Demo library", Status::Warning, cx));
@@ -2417,7 +2501,7 @@ fn note_bar(note: &str, cx: &App) -> Option<impl IntoElement> {
 
 fn body(
     browse: &Browse,
-    grid_scroll: &ScrollHandle,
+    grid_scroll: &UniformListScrollHandle,
     sidebar_scroll: &ScrollHandle,
     cx: &Context<Shell>,
 ) -> impl IntoElement {
@@ -2556,7 +2640,8 @@ fn sidebar_consoles(browse: &Browse, cx: &Context<Shell>) -> Vec<impl IntoElemen
                 .flex()
                 .flex_col()
                 .px(px(8.))
-                .py(px(8.))
+                .py(px(6.))
+                .gap(px(1.))
                 .bg(if selected {
                     theme.selected_fill()
                 } else {
@@ -2573,7 +2658,17 @@ fn sidebar_consoles(browse: &Browse, cx: &Context<Shell>) -> Vec<impl IntoElemen
                         cx.notify();
                     }),
                 )
-                .child(shelf.console.name.clone())
+                .child(
+                    div()
+                        .w_full()
+                        .min_w(px(0.))
+                        .text_size(px(14.))
+                        .line_height(px(18.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(shelf.console.name.clone()),
+                )
                 .child(
                     div()
                         .w_full()
@@ -2581,13 +2676,14 @@ fn sidebar_consoles(browse: &Browse, cx: &Context<Shell>) -> Vec<impl IntoElemen
                         .flex_row()
                         .items_center()
                         .justify_between()
-                        .gap(px(8.))
-                        .min_h(px(16.))
+                        .gap(px(6.))
+                        .min_h(px(15.))
                         .child({
                             let mut year = div()
                                 .flex_1()
                                 .min_w(px(0.))
                                 .text_size(px(12.))
+                                .line_height(px(15.))
                                 .text_color(theme.secondary);
                             if let Some(launched) = shelf.year {
                                 year = year.child(launched.to_string());
@@ -2598,6 +2694,7 @@ fn sidebar_consoles(browse: &Browse, cx: &Context<Shell>) -> Vec<impl IntoElemen
                             div()
                                 .flex_shrink_0()
                                 .text_size(px(12.))
+                                .line_height(px(15.))
                                 .text_color(theme.secondary)
                                 .whitespace_nowrap()
                                 .child(game_count_label(shelf.games.len())),
@@ -2607,11 +2704,15 @@ fn sidebar_consoles(browse: &Browse, cx: &Context<Shell>) -> Vec<impl IntoElemen
         .collect()
 }
 
-fn grid(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl IntoElement {
+fn grid(
+    browse: &Browse,
+    scroll: &UniformListScrollHandle,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
     let theme = cx.omarchy();
     let focused = browse.pane == Pane::Grid;
     let shelf = browse.shelf();
-    let mut pane = div()
+    let pane = div()
         .id("grid")
         .flex_1()
         .h_full()
@@ -2619,10 +2720,7 @@ fn grid(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl Int
         .min_h_0()
         .flex()
         .flex_col()
-        .gap(px(TILE_GAP))
         .overflow_hidden()
-        .overflow_y_scroll()
-        .track_scroll(scroll)
         .p(px(GRID_PAD))
         .border_1()
         .border_color(if focused {
@@ -2633,9 +2731,8 @@ fn grid(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl Int
     let Some(shelf) = shelf else {
         return pane.child(library_empty(cx));
     };
-    let console_name = shelf.console.name.clone();
-    let visible: Vec<&Game> = browse.visible_games().collect();
-    if visible.is_empty() {
+    let visible_count = browse.visible_len();
+    if visible_count == 0 {
         if shelf.games.is_empty() {
             return pane.child(library_empty(cx));
         }
@@ -2653,31 +2750,18 @@ fn grid(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl Int
         ));
     }
     let columns = browse.columns.max(1);
-    let art = shelf.console.grid_art;
-    let demo = browse.library.kind == LibraryKind::Demo;
-    let count = visible.len();
-    for start in (0..count).step_by(columns) {
-        let end = (start + columns).min(count);
-        let mut row = div().flex().flex_row().flex_shrink_0().gap(px(TILE_GAP));
-        for index in start..end {
-            let menu = (browse.game == Some(index))
-                .then(|| browse.menu_cursor())
-                .flatten();
-            row = row.child(tile(
-                index,
-                visible[index],
-                &console_name,
-                art,
-                browse.cover_width,
-                browse.game == Some(index),
-                menu,
-                demo,
-                cx,
-            ));
-        }
-        pane = pane.child(row);
-    }
-    pane
+    let rows = visible_count.div_ceil(columns);
+    let shell = cx.entity();
+    pane.child(
+        uniform_list("game-rows", rows, move |range, window, app| {
+            let scale = window.scale_factor();
+            shell.update(app, |this, cx| this.game_rows(range, scale, cx))
+        })
+        .flex_1()
+        .w_full()
+        .min_h(px(0.))
+        .track_scroll(scroll),
+    )
 }
 
 fn tile(
@@ -2686,6 +2770,7 @@ fn tile(
     console_name: &str,
     art: GridArt,
     cover_width: f32,
+    scale: f32,
     selected: bool,
     menu: Option<usize>,
     demo: bool,
@@ -2702,9 +2787,12 @@ fn tile(
         .flex_shrink_0()
         .overflow_hidden()
         .bg(theme.surface);
-    let image = if let Some(path) = cover {
+    let rendered = cover
+        .as_ref()
+        .and_then(|path| crate::covers::grid_art(path, frame.width, frame.height, scale));
+    let image = if let Some(rendered) = rendered {
         image.child(
-            img(path)
+            img(rendered)
                 .w(px(frame.width))
                 .h(px(frame.height))
                 .aspect_ratio(frame.ratio())
