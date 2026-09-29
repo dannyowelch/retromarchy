@@ -3,8 +3,8 @@ use crate::database::{self, LibraryStats};
 use crate::game_menu::Overlay;
 use crate::gamepad::{grid_step, list_step, NavDir};
 use crate::types::{
-    game_matches, Console, Emulator, EmulatorKind, Game, GridArt, GridFilter, Media, MediaKind,
-    ResolvedLaunch, Source,
+    game_matches, Console, Emulator, EmulatorKind, Game, GameId, GridArt, GridFilter, Media,
+    MediaKind, ResolvedLaunch, Source,
 };
 use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
@@ -750,11 +750,35 @@ impl Browse {
         self.visible_games().count()
     }
 
+    /// Game ids currently loaded for one system. An unknown system is empty.
+    pub fn game_ids(&self, console_id: &str) -> Vec<GameId> {
+        self.library
+            .shelves
+            .iter()
+            .find(|shelf| shelf.console.id == console_id)
+            .map(|shelf| shelf.games.iter().map(|game| game.id.clone()).collect())
+            .unwrap_or_default()
+    }
+
     /// Games sent to the background scraper for the system on screen.
     /// Favorites do not narrow the list. A demo library, an empty shelf, or no system
     /// sets the status and returns none. The selection is left alone.
     pub fn missing_scrape_games(&mut self) -> Option<Vec<Game>> {
-        let Some(shelf) = self.shelf() else {
+        let Some(id) = self.shelf().map(|shelf| shelf.console.id.clone()) else {
+            self.status = "Select a system before scraping missing artwork.".into();
+            return None;
+        };
+        self.missing_scrape_games_for(&id)
+    }
+
+    /// Same rules as [`missing_scrape_games`] for one system, whether or not it is on screen.
+    pub fn missing_scrape_games_for(&mut self, console_id: &str) -> Option<Vec<Game>> {
+        let Some(shelf) = self
+            .library
+            .shelves
+            .iter()
+            .find(|shelf| shelf.console.id == console_id)
+        else {
             self.status = "Select a system before scraping missing artwork.".into();
             return None;
         };
@@ -1857,6 +1881,24 @@ mod tests {
             browse.status,
             "Select a system before scraping missing artwork."
         );
+    }
+
+    #[test]
+    fn missing_scrape_for_a_named_system_leaves_the_open_one_selected() {
+        let mut browse = sample();
+        browse.library.kind = LibraryKind::Disk;
+        browse.select_game(1);
+        let selected = browse.selected_game().unwrap().id.clone();
+        let games = browse.missing_scrape_games_for("genesis").unwrap();
+        assert!(games.iter().all(|game| game.console == "genesis"));
+        assert_eq!(browse.console, 0);
+        assert_eq!(browse.selected_game().unwrap().id, selected);
+        assert!(browse.missing_scrape_games_for("missing").is_none());
+        assert_eq!(
+            browse.status,
+            "Select a system before scraping missing artwork."
+        );
+        assert_eq!(browse.selected_game().unwrap().id, selected);
     }
 
     #[test]

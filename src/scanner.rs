@@ -1,5 +1,6 @@
 use crate::types::{Console, Game, GameId, Media, MediaKind, Source};
 use anyhow::Result;
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,16 @@ pub fn expand_home(path: &Path) -> PathBuf {
 pub fn rescan(console: &Console, conn: &rusqlite::Connection) -> Result<Vec<Game>> {
     let scanned = scan_console(console)?;
     crate::database::replace_scanned_games(conn, &console.id, &scanned)
+}
+
+/// Games in `scanned` whose ids were not in the library before this scan.
+pub fn added_games(previous_ids: &[GameId], scanned: &[Game]) -> Vec<Game> {
+    let known: HashSet<&str> = previous_ids.iter().map(String::as_str).collect();
+    scanned
+        .iter()
+        .filter(|game| !known.contains(game.id.as_str()))
+        .cloned()
+        .collect()
 }
 
 fn scan_directory(dir: &Path, console: &Console, games: &mut Vec<Game>) -> Result<()> {
@@ -412,5 +423,36 @@ mod tests {
         assert_eq!(keep.play_count, 1);
         assert_eq!(keep.play_time, 12);
         Ok(())
+    }
+
+    #[test]
+    fn added_games_are_ids_the_library_did_not_have() {
+        let keep = Game {
+            id: "keep".into(),
+            console: "snes".into(),
+            rom: PathBuf::from("/roms/keep.sfc"),
+            file_title: "keep".into(),
+            user_title: None,
+            metadata: None,
+            crc32: None,
+            profile: None,
+            media: Vec::new(),
+            last_played: None,
+            play_count: 0,
+            play_time: 0,
+            favorite: false,
+        };
+        let mut fresh = keep.clone();
+        fresh.id = "fresh".into();
+        fresh.file_title = "fresh".into();
+        fresh.rom = PathBuf::from("/roms/fresh.sfc");
+        let scanned = vec![keep.clone(), fresh.clone()];
+        assert!(added_games(&["keep".into()], &scanned)
+            .iter()
+            .map(|game| game.id.as_str())
+            .eq(["fresh"]));
+        assert!(added_games(&["keep".into(), "fresh".into()], &scanned).is_empty());
+        assert_eq!(added_games(&[], &scanned).len(), 2);
+        assert!(added_games(&["keep".into()], &[]).is_empty());
     }
 }

@@ -102,6 +102,9 @@ ramp_ms = 2000
 # Artwork scraper. Hand-edit this, or open Options → Scraper (Ctrl+G).
 # Images are cached under ~/.local/share/retromarchy/media/.
 # The scraper never downloads ROMs or BIOS.
+# Shift+S and Manage Systems → Scrape Missing use this section.
+# A ROM scan that finds new games runs that scrape for the new games only.
+# Artwork already stored for a game is not fetched again.
 [scraper]
 box_art = true
 screenshot = true
