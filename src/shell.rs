@@ -4109,9 +4109,12 @@ fn system_list_row(row: crate::systems::ListRow, cx: &Context<Shell>) -> impl In
     let index = row.index;
     split_list_row(("system", index), row.title, row.detail, row.selected, cx).on_click(
         cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
-            if let Some(dialog) = &mut this.systems {
-                dialog.select(index);
-            }
+            let step = this
+                .systems
+                .as_mut()
+                .map(|dialog| dialog.click_row(index))
+                .unwrap_or(SystemStep::Stay);
+            this.apply_system_step(step, cx);
             this.focus_handle.focus(window, cx);
             cx.notify();
         }),
