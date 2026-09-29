@@ -3,7 +3,7 @@ use crate::browse::{
     clamp_cover_width, columns_for, file_for, format_play_time, game_count_label, grid_art_key,
     image_aspect, is_launch_key, key_from_parts, rescan_key, resolve_launch, reveal_row_scroll,
     row_of, row_reveal_insets, scrape_chord, system_sort_key, title_search_key, Browse, Confirm,
-    Key, LibraryKind, Pane, ScrapeChord, TileFrame, COVER_WIDTH_MAX, COVER_WIDTH_MIN,
+    Focus, Key, LibraryKind, MenuItem, ScrapeChord, TileFrame, COVER_WIDTH_MAX, COVER_WIDTH_MIN,
     COVER_WIDTH_STEP, DETAILS_PAD, DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH, TILE_GAP,
 };
 use crate::config::{self, InputSettings, SystemSort};
@@ -325,8 +325,16 @@ impl Shell {
                 true
             }
             Some(Confirm::Entered) => true,
+            Some(Confirm::Menu(item)) => {
+                self.open_menu_item(item);
+                true
+            }
             None => false,
         }
+    }
+
+    fn open_menu_item(&mut self, item: MenuItem) {
+        self.activate_screen(screen_for_menu(item));
     }
 
     fn sink_pad(&mut self, events: &[PadIn]) {
@@ -587,7 +595,11 @@ impl Shell {
         let before = self.browse.cover_width;
         if key == Key::Launch {
             if !event.is_held {
-                self.launch_selected();
+                if let Focus::Menu(item) = self.browse.focus {
+                    self.open_menu_item(item);
+                } else {
+                    self.launch_selected();
+                }
             }
         } else if key == Key::ToggleFavorite {
             self.toggle_favorite();
@@ -2378,9 +2390,27 @@ fn header(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
             .flex_shrink_0()
             .items_center()
             .gap(px(2.))
-            .child(emulators_button(cx))
-            .child(systems_button(cx))
-            .child(options_button(cx)),
+            .child(menu_button(
+                "manage-emulators",
+                "Manage Emulators",
+                MenuItem::Emulators,
+                browse,
+                cx,
+            ))
+            .child(menu_button(
+                "manage-systems",
+                "Manage Systems",
+                MenuItem::Systems,
+                browse,
+                cx,
+            ))
+            .child(menu_button(
+                "options",
+                "Options",
+                MenuItem::Options,
+                browse,
+                cx,
+            )),
     )
     .child(if browse.search_open() {
         search_field(browse.query(), cx).into_any_element()
@@ -2457,47 +2487,32 @@ fn search_field(query: &str, cx: &Context<Shell>) -> impl IntoElement {
         .child(div().w(px(1.)).h(px(14.)).bg(theme.accent))
 }
 
-fn options_button(cx: &Context<Shell>) -> impl IntoElement {
-    button("options", "Options", ButtonVariant::Secondary, cx)
+fn menu_button(
+    id: &'static str,
+    label: &'static str,
+    item: MenuItem,
+    browse: &Browse,
+    cx: &Context<Shell>,
+) -> impl IntoElement {
+    let theme = cx.omarchy();
+    let focused = matches!(browse.focus, Focus::Menu(current) if current == item);
+    let mut control = button(id, label, ButtonVariant::Secondary, cx)
         .px(px(4.))
         .flex_shrink_0()
-        .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-            this.activate_screen(Screen::Options(OptionsSection::Input));
-            this.focus_handle.focus(window, cx);
-            cx.notify();
-        }))
-}
-
-fn systems_button(cx: &Context<Shell>) -> impl IntoElement {
-    button(
-        "manage-systems",
-        "Manage Systems",
-        ButtonVariant::Secondary,
-        cx,
-    )
-    .px(px(4.))
-    .flex_shrink_0()
-    .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-        this.activate_screen(Screen::Systems);
-        this.focus_handle.focus(window, cx);
-        cx.notify();
-    }))
-}
-
-fn emulators_button(cx: &Context<Shell>) -> impl IntoElement {
-    button(
-        "manage-emulators",
-        "Manage Emulators",
-        ButtonVariant::Secondary,
-        cx,
-    )
-    .px(px(4.))
-    .flex_shrink_0()
-    .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-        this.activate_screen(Screen::Emulators);
-        this.focus_handle.focus(window, cx);
-        cx.notify();
-    }))
+        .on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                this.activate_screen(screen_for_menu(item));
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        );
+    if focused {
+        control = control
+            .border_color(theme.accent)
+            .bg(theme.selected_fill())
+            .text_color(theme.accent);
+    }
+    control
 }
 
 fn filter_control(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
@@ -2589,7 +2604,7 @@ fn body(
 
 fn sidebar(browse: &Browse, scroll: &ScrollHandle, cx: &Context<Shell>) -> impl IntoElement {
     let theme = cx.omarchy();
-    let focused = browse.pane == Pane::Sidebar;
+    let focused = browse.focus == Focus::Sidebar;
     div()
         .id("sidebar")
         .w(px(SIDEBAR_WIDTH))
@@ -2779,7 +2794,7 @@ fn grid(
     cx: &Context<Shell>,
 ) -> impl IntoElement {
     let theme = cx.omarchy();
-    let focused = browse.pane == Pane::Grid;
+    let focused = browse.focus == Focus::Grid;
     let shelf = browse.shelf();
     let pane = div()
         .id("grid")
@@ -5351,6 +5366,14 @@ fn scraper_action(
                 cx.notify();
             },
         )))
+}
+
+fn screen_for_menu(item: MenuItem) -> Screen {
+    match item {
+        MenuItem::Emulators => Screen::Emulators,
+        MenuItem::Systems => Screen::Systems,
+        MenuItem::Options => Screen::Options(OptionsSection::Input),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -26,6 +26,42 @@ pub enum Pane {
     Grid,
 }
 
+/// Keyboard and controller focus. The header menu sits above the system list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Sidebar,
+    Grid,
+    Menu(MenuItem),
+}
+
+/// Header row reached with Up from the first system. Left to right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuItem {
+    Emulators,
+    Systems,
+    Options,
+}
+
+impl MenuItem {
+    const ALL: [MenuItem; 3] = [MenuItem::Emulators, MenuItem::Systems, MenuItem::Options];
+
+    fn step(self, delta: i32) -> Self {
+        let index = Self::ALL.iter().position(|item| *item == self).unwrap_or(0) as i32;
+        let next = (index + delta).clamp(0, Self::ALL.len() as i32 - 1);
+        Self::ALL[next as usize]
+    }
+}
+
+impl Focus {
+    /// The header menu keeps the system list as the library pane underneath.
+    pub fn library_pane(self) -> Pane {
+        match self {
+            Focus::Grid => Pane::Grid,
+            Focus::Sidebar | Focus::Menu(_) => Pane::Sidebar,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Shelf {
     pub console: Console,
@@ -51,7 +87,7 @@ pub struct Library {
 #[derive(Debug, Clone)]
 pub struct Browse {
     pub library: Library,
-    pub pane: Pane,
+    pub focus: Focus,
     pub console: usize,
     pub game: Option<usize>,
     pub details_open: bool,
@@ -76,6 +112,8 @@ pub enum Confirm {
     Entered,
     /// The grid is focused and a game is selected. The shell launches it.
     Launch,
+    /// The header menu is focused. The shell opens that screen.
+    Menu(MenuItem),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -657,7 +695,7 @@ impl Browse {
         let details_open = library.details_open;
         Self {
             library,
-            pane: Pane::Sidebar,
+            focus: Focus::Sidebar,
             console: 0,
             game: None,
             details_open,
@@ -727,7 +765,7 @@ impl Browse {
         }
         let keep = self.selected_game().map(|game| game.id.clone());
         let previous = self.game;
-        let pane = self.pane;
+        let pane = self.focus.library_pane();
         self.query = query;
         self.rebind_visible(keep, previous, pane);
     }
@@ -769,29 +807,34 @@ impl Browse {
         Some(shelf.games.clone())
     }
 
-    /// South (A). An empty grid leaves the system list focused.
+    /// South (A) and Enter. An empty grid leaves the system list focused.
     /// On the grid, this does not move; the shell launches when it returns [`Confirm::Launch`].
+    /// On the header menu, the shell opens that screen.
     pub fn confirm(&mut self) -> Option<Confirm> {
-        match self.pane {
-            Pane::Sidebar => {
+        match self.focus {
+            Focus::Menu(item) => Some(Confirm::Menu(item)),
+            Focus::Sidebar => {
                 if self.visible_len() == 0 {
                     return None;
                 }
                 self.enter_grid();
                 Some(Confirm::Entered)
             }
-            Pane::Grid => self.game.map(|_| Confirm::Launch),
+            Focus::Grid => self.game.map(|_| Confirm::Launch),
         }
     }
 
-    /// East (B). Focus returns to the system list. The game index stays,
-    /// so a later South re-enters on the same game. Escape still clears it.
+    /// East (B). From the grid or the header menu, focus returns to the system
+    /// list. The game index stays, so a later South re-enters on the same game.
+    /// Escape still clears it, except on the header menu, where it only leaves.
     pub fn back(&mut self) -> bool {
-        if self.pane != Pane::Grid {
-            return false;
+        match self.focus {
+            Focus::Menu(_) | Focus::Grid => {
+                self.focus = Focus::Sidebar;
+                true
+            }
+            Focus::Sidebar => false,
         }
-        self.pane = Pane::Sidebar;
-        true
     }
 
     pub fn apply(&mut self, key: Key) {
@@ -799,18 +842,34 @@ impl Browse {
             Key::ToggleDetails => self.details_open = !self.details_open,
             Key::CoverSmaller => self.cover_width = step_cover_width(self.cover_width, -1),
             Key::CoverLarger => self.cover_width = step_cover_width(self.cover_width, 1),
-            Key::Clear => {
-                self.game = None;
-                self.pane = Pane::Sidebar;
+            Key::Clear => self.clear_focus(),
+            Key::EnterGrid => {
+                if !matches!(self.focus, Focus::Menu(_)) {
+                    self.enter_grid();
+                }
             }
-            Key::EnterGrid => self.enter_grid(),
             Key::Launch => {}
             Key::ToggleFavorite => {
                 self.toggle_favorite(None);
             }
             Key::Arrow(dir) => self.move_arrow(dir),
-            Key::Grid(dir) => self.step_grid(dir),
+            Key::Grid(dir) => {
+                if !matches!(self.focus, Focus::Menu(_)) {
+                    self.step_grid(dir);
+                }
+            }
         }
+    }
+
+    /// Escape. The header menu returns to the system list and keeps the selection.
+    /// Anywhere else, the selected game is cleared.
+    fn clear_focus(&mut self) {
+        if matches!(self.focus, Focus::Menu(_)) {
+            self.focus = Focus::Sidebar;
+            return;
+        }
+        self.game = None;
+        self.focus = Focus::Sidebar;
     }
 
     /// Grid artwork for the console on screen. Other consoles stay as they are.
@@ -869,7 +928,7 @@ impl Browse {
                 } else {
                     self.console = 0;
                     self.game = None;
-                    self.pane = Pane::Sidebar;
+                    self.focus = Focus::Sidebar;
                 }
             }
             None if self.console >= self.library.shelves.len() => self.console = 0,
@@ -892,7 +951,7 @@ impl Browse {
             .then(|| self.selected_game().map(|game| game.id.clone()))
             .flatten();
         let previous = updating_current.then_some(self.game).flatten();
-        let pane = self.pane;
+        let pane = self.focus.library_pane();
         let Some(shelf) = self
             .library
             .shelves
@@ -1043,7 +1102,7 @@ impl Browse {
         }
         self.console = index;
         self.game = None;
-        self.pane = Pane::Sidebar;
+        self.focus = Focus::Sidebar;
     }
 
     pub fn select_game(&mut self, index: usize) {
@@ -1051,19 +1110,20 @@ impl Browse {
             return;
         }
         self.game = Some(index);
-        self.pane = Pane::Grid;
+        self.focus = Focus::Grid;
     }
 
     fn move_arrow(&mut self, dir: NavDir) {
-        match self.pane {
-            Pane::Sidebar => match dir {
+        match self.focus {
+            Focus::Menu(item) => self.move_menu(item, dir),
+            Focus::Sidebar => match dir {
                 NavDir::Up | NavDir::Down => self.step_sidebar(dir),
                 NavDir::Right => self.enter_grid(),
                 NavDir::Left => {}
             },
-            Pane::Grid => {
+            Focus::Grid => {
                 if dir == NavDir::Left && self.at_row_start() {
-                    self.pane = Pane::Sidebar;
+                    self.focus = Focus::Sidebar;
                     self.game = None;
                     return;
                 }
@@ -1072,7 +1132,35 @@ impl Browse {
         }
     }
 
+    fn move_menu(&mut self, item: MenuItem, dir: NavDir) {
+        match dir {
+            NavDir::Left => self.focus = Focus::Menu(item.step(-1)),
+            NavDir::Right => self.focus = Focus::Menu(item.step(1)),
+            NavDir::Down => self.focus_top_system(),
+            NavDir::Up => {}
+        }
+    }
+
+    /// Down from the header menu. The first system takes focus. A system that
+    /// was already first keeps its game.
+    fn focus_top_system(&mut self) {
+        self.focus = Focus::Sidebar;
+        if self.library.shelves.is_empty() {
+            self.console = 0;
+            return;
+        }
+        if self.console != 0 {
+            self.console = 0;
+            self.game = None;
+        }
+    }
+
     fn step_sidebar(&mut self, dir: NavDir) {
+        let at_top = self.library.shelves.is_empty() || self.console == 0;
+        if dir == NavDir::Up && at_top {
+            self.focus = Focus::Menu(MenuItem::Emulators);
+            return;
+        }
         let len = self.library.shelves.len() as i32;
         let Some(next) = list_step(Some(self.console as i32), dir, len) else {
             return;
@@ -1084,7 +1172,7 @@ impl Browse {
     }
 
     fn enter_grid(&mut self) {
-        self.pane = Pane::Grid;
+        self.focus = Focus::Grid;
         let len = self.visible_len();
         if len == 0 {
             self.game = None;
@@ -1101,7 +1189,7 @@ impl Browse {
         let index = self.game.map(|index| index as i32);
         if let Some(next) = grid_step(index, dir, len, columns) {
             self.game = Some(next as usize);
-            self.pane = Pane::Grid;
+            self.focus = Focus::Grid;
         }
     }
 
@@ -1288,6 +1376,22 @@ mod tests {
         Browse::new(demo_library("Demo library."))
     }
 
+    fn step_pad(
+        browse: &mut Browse,
+        hold: &mut crate::input_repeat::HoldRepeat,
+        pad: &crate::gamepad::PadHeld,
+        settings: &crate::config::InputSettings,
+        now: u64,
+    ) {
+        let (step_x, step_y) = hold.poll(settings, pad.horizontal(), pad.vertical(), now);
+        if let Some(dir) = step_x {
+            browse.apply(Key::Arrow(dir));
+        }
+        if let Some(dir) = step_y {
+            browse.apply(Key::Arrow(dir));
+        }
+    }
+
     #[test]
     fn blank_config_opens_an_empty_disk_library() {
         let root = tempfile::tempdir().unwrap();
@@ -1303,7 +1407,7 @@ mod tests {
         let mut browse = sample();
         assert!(!browse.back());
         assert_eq!(browse.confirm(), Some(Confirm::Entered));
-        assert_eq!(browse.pane, Pane::Grid);
+        assert_eq!(browse.focus, Focus::Grid);
         assert_eq!(
             browse.selected_game().unwrap().display_title(),
             "Super Mario World"
@@ -1311,7 +1415,7 @@ mod tests {
         assert_eq!(browse.confirm(), Some(Confirm::Launch));
         assert_eq!(browse.game, Some(0));
         assert!(browse.back());
-        assert_eq!(browse.pane, Pane::Sidebar);
+        assert_eq!(browse.focus, Focus::Sidebar);
         assert_eq!(
             browse.selected_game().unwrap().display_title(),
             "Super Mario World"
@@ -1320,7 +1424,7 @@ mod tests {
         assert_eq!(browse.game, Some(0));
         browse.apply(Key::Clear);
         assert_eq!(browse.game, None);
-        assert_eq!(browse.pane, Pane::Sidebar);
+        assert_eq!(browse.focus, Focus::Sidebar);
     }
 
     #[test]
@@ -1329,7 +1433,7 @@ mod tests {
         browse.set_filter(GridFilter::Favorites);
         assert_eq!(browse.visible_len(), 0);
         assert_eq!(browse.confirm(), None);
-        assert_eq!(browse.pane, Pane::Sidebar);
+        assert_eq!(browse.focus, Focus::Sidebar);
         assert_eq!(browse.game, None);
     }
 
@@ -1386,7 +1490,7 @@ mod tests {
         assert_eq!(browse.game, None);
 
         browse.apply(Key::Arrow(NavDir::Right));
-        assert_eq!(browse.pane, Pane::Grid);
+        assert_eq!(browse.focus, Focus::Grid);
         assert_eq!(
             browse.selected_game().unwrap().display_title(),
             "Sonic the Hedgehog"
@@ -1404,7 +1508,7 @@ mod tests {
             "Sonic the Hedgehog"
         );
         browse.apply(Key::Arrow(NavDir::Left));
-        assert_eq!(browse.pane, Pane::Sidebar);
+        assert_eq!(browse.focus, Focus::Sidebar);
         assert_eq!(browse.game, None);
 
         browse.apply(Key::Arrow(NavDir::Right));
@@ -1416,16 +1520,192 @@ mod tests {
     }
 
     #[test]
+    fn up_from_the_first_system_focuses_the_header_menu() {
+        let mut browse = sample();
+        browse.confirm();
+        browse.back();
+        assert_eq!(browse.focus, Focus::Sidebar);
+        assert_eq!(browse.game, Some(0));
+
+        browse.apply(Key::Arrow(NavDir::Up));
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Emulators));
+        assert_eq!(browse.console, 0);
+        assert_eq!(browse.game, Some(0));
+
+        browse.apply(Key::Arrow(NavDir::Left));
+        browse.apply(Key::Arrow(NavDir::Up));
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Emulators));
+        browse.apply(Key::Arrow(NavDir::Right));
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Systems));
+        browse.apply(Key::Arrow(NavDir::Right));
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Options));
+        browse.apply(Key::Arrow(NavDir::Right));
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Options));
+        browse.apply(Key::Arrow(NavDir::Left));
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Systems));
+        assert_eq!(browse.console, 0);
+        assert_eq!(browse.game, Some(0));
+
+        assert_eq!(browse.confirm(), Some(Confirm::Menu(MenuItem::Systems)));
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Systems));
+        assert_eq!(browse.game, Some(0));
+
+        browse.apply(Key::Grid(NavDir::Down));
+        browse.apply(Key::EnterGrid);
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Systems));
+        assert_eq!(browse.console, 0);
+        assert_eq!(browse.game, Some(0));
+
+        browse.apply(Key::Arrow(NavDir::Down));
+        assert_eq!(browse.focus, Focus::Sidebar);
+        assert_eq!(browse.console, 0);
+        assert_eq!(browse.game, Some(0));
+    }
+
+    #[test]
+    fn up_moves_the_system_list_until_the_first_row() {
+        let mut browse = sample();
+        browse.apply(Key::Arrow(NavDir::Down));
+        browse.apply(Key::Arrow(NavDir::Down));
+        assert_eq!(browse.console, 2);
+        browse.apply(Key::Arrow(NavDir::Up));
+        assert_eq!(browse.focus, Focus::Sidebar);
+        assert_eq!(browse.console, 1);
+        browse.apply(Key::Arrow(NavDir::Up));
+        assert_eq!(browse.focus, Focus::Sidebar);
+        assert_eq!(browse.console, 0);
+        browse.apply(Key::Arrow(NavDir::Up));
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Emulators));
+    }
+
+    #[test]
+    fn escape_and_back_leave_the_menu_without_moving_the_selection() {
+        let mut browse = sample();
+        browse.confirm();
+        browse.back();
+        browse.apply(Key::Arrow(NavDir::Up));
+        browse.apply(Key::Arrow(NavDir::Right));
+        browse.apply(Key::Clear);
+        assert_eq!(browse.focus, Focus::Sidebar);
+        assert_eq!(browse.console, 0);
+        assert_eq!(browse.game, Some(0));
+
+        browse.apply(Key::Arrow(NavDir::Up));
+        assert!(browse.back());
+        assert_eq!(browse.focus, Focus::Sidebar);
+        assert_eq!(browse.console, 0);
+        assert_eq!(browse.game, Some(0));
+        assert!(!browse.back());
+    }
+
+    #[test]
+    fn down_from_the_menu_lands_on_the_first_system() {
+        let mut browse = sample();
+        browse.focus = Focus::Menu(MenuItem::Options);
+        browse.console = 2;
+        browse.game = Some(1);
+        browse.apply(Key::Arrow(NavDir::Down));
+        assert_eq!(browse.focus, Focus::Sidebar);
+        assert_eq!(browse.console, 0);
+        assert_eq!(browse.game, None);
+
+        browse.focus = Focus::Menu(MenuItem::Emulators);
+        browse.console = 2;
+        browse.game = Some(1);
+        browse.apply(Key::Clear);
+        assert_eq!(browse.focus, Focus::Sidebar);
+        assert_eq!(browse.console, 2);
+        assert_eq!(browse.game, Some(1));
+    }
+
+    #[test]
+    fn up_on_the_top_grid_row_stays_on_that_game() {
+        let mut browse = sample();
+        assert_eq!(browse.confirm(), Some(Confirm::Entered));
+        let game = browse.game;
+        browse.apply(Key::Arrow(NavDir::Up));
+        assert_eq!(browse.focus, Focus::Grid);
+        assert_eq!(browse.game, game);
+
+        browse.set_columns(2);
+        browse.apply(Key::Arrow(NavDir::Down));
+        assert_eq!(browse.game, Some(2));
+        browse.apply(Key::Arrow(NavDir::Up));
+        assert_eq!(browse.focus, Focus::Grid);
+        assert_eq!(browse.game, Some(0));
+    }
+
+    #[test]
+    fn an_empty_system_list_still_reaches_the_menu() {
+        let mut browse = sample();
+        browse.library.shelves.clear();
+        browse.apply(Key::Arrow(NavDir::Up));
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Emulators));
+        browse.apply(Key::Arrow(NavDir::Down));
+        assert_eq!(browse.focus, Focus::Sidebar);
+        assert_eq!(browse.console, 0);
+        assert!(browse.shelf().is_none());
+    }
+
+    #[test]
+    fn held_pad_up_reaches_the_menu_on_the_repeat_clock() {
+        use crate::config::InputSettings;
+        use crate::gamepad::{PadAction, PadHeld};
+        use crate::input_repeat::HoldRepeat;
+        use gilrs::Button;
+
+        let mut browse = sample();
+        browse.apply(Key::Arrow(NavDir::Down));
+        assert_eq!(browse.console, 1);
+
+        let mut pad = PadHeld::default();
+        assert_eq!(pad.apply_button(Button::DPadUp, true), None);
+        let mut hold = HoldRepeat::default();
+        let settings = InputSettings::default();
+
+        step_pad(&mut browse, &mut hold, &pad, &settings, 0);
+        assert_eq!(browse.focus, Focus::Sidebar);
+        assert_eq!(browse.console, 0);
+        step_pad(&mut browse, &mut hold, &pad, &settings, 100);
+        assert_eq!(browse.focus, Focus::Sidebar);
+        assert_eq!(browse.console, 0);
+        step_pad(&mut browse, &mut hold, &pad, &settings, 400);
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Emulators));
+        assert_eq!(browse.console, 0);
+        step_pad(&mut browse, &mut hold, &pad, &settings, 580);
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Emulators));
+        assert_eq!(browse.console, 0);
+
+        assert_eq!(pad.apply_button(Button::DPadUp, false), None);
+        assert_eq!(pad.apply_button(Button::DPadRight, true), None);
+        step_pad(&mut browse, &mut hold, &pad, &settings, 580);
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Systems));
+        assert_eq!(browse.console, 0);
+
+        assert_eq!(
+            pad.apply_button(Button::South, true),
+            Some(PadAction::Confirm)
+        );
+        assert_eq!(browse.confirm(), Some(Confirm::Menu(MenuItem::Systems)));
+        assert_eq!(browse.focus, Focus::Menu(MenuItem::Systems));
+
+        assert_eq!(pad.apply_button(Button::East, true), Some(PadAction::Back));
+        assert!(browse.back());
+        assert_eq!(browse.focus, Focus::Sidebar);
+        assert_eq!(browse.console, 0);
+    }
+
+    #[test]
     fn vim_keys_enter_the_grid_and_escape_clears() {
         let mut browse = sample();
         browse.apply(Key::Grid(NavDir::Down));
-        assert_eq!(browse.pane, Pane::Grid);
+        assert_eq!(browse.focus, Focus::Grid);
         assert_eq!(browse.game, Some(0));
         browse.set_columns(2);
         browse.apply(Key::Grid(NavDir::Down));
         assert_eq!(browse.game, Some(2));
         browse.apply(Key::Clear);
-        assert_eq!(browse.pane, Pane::Sidebar);
+        assert_eq!(browse.focus, Focus::Sidebar);
         assert_eq!(browse.game, None);
         assert!(browse.details_open);
         browse.apply(Key::ToggleDetails);
@@ -1531,10 +1811,10 @@ mod tests {
         assert_eq!(browse.game, None);
         browse.select_console(1);
         assert_eq!(browse.console, 1);
-        assert_eq!(browse.pane, Pane::Sidebar);
+        assert_eq!(browse.focus, Focus::Sidebar);
         assert_eq!(browse.game, None);
         browse.select_game(2);
-        assert_eq!(browse.pane, Pane::Grid);
+        assert_eq!(browse.focus, Focus::Grid);
         assert_eq!(
             browse.selected_game().unwrap().display_title(),
             "Gunstar Heroes"
@@ -1542,7 +1822,7 @@ mod tests {
         browse.select_console(0);
         assert_eq!(browse.console, 0);
         assert_eq!(browse.game, None);
-        assert_eq!(browse.pane, Pane::Sidebar);
+        assert_eq!(browse.focus, Focus::Sidebar);
     }
 
     #[test]
@@ -1686,7 +1966,7 @@ mod tests {
         browse.select_game(1);
         browse.set_filter(GridFilter::Favorites);
         assert!(browse.selected_game().is_none());
-        assert_eq!(browse.pane, Pane::Grid);
+        assert_eq!(browse.focus, Focus::Grid);
     }
 
     #[test]
