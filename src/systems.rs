@@ -1,3 +1,4 @@
+use crate::browse::cmp_system_name;
 use crate::catalog::{self, SystemEntry};
 use crate::config::{self, Config};
 use crate::cores::{Core, CoreCatalog};
@@ -44,6 +45,8 @@ pub struct SystemRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListRow {
+    /// Slot in [`Systems::rows`], or `rows.len()` for Add system.
+    /// The list is drawn in name order; this index is not that position.
     pub index: usize,
     pub title: String,
     pub detail: String,
@@ -144,8 +147,12 @@ impl Systems {
         self.split.side == Side::List
     }
 
+    /// Position of the selection in [`Self::list_rows`], including Add system.
     pub fn selected_index(&self) -> usize {
-        self.split.index
+        self.shown_indexes()
+            .iter()
+            .position(|index| *index == self.split.index)
+            .unwrap_or(0)
     }
 
     pub fn selected_id(&self) -> Option<String> {
@@ -157,26 +164,30 @@ impl Systems {
     }
 
     pub fn list_rows(&self) -> Vec<ListRow> {
-        let mut rows: Vec<_> = self
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(index, row)| ListRow {
-                index,
-                title: row.name.clone(),
-                detail: self.emulator_label(row.emulator_id.as_deref()),
-                selected: index == self.split.index,
-                add: false,
+        let add_at = self.rows.len();
+        self.shown_indexes()
+            .into_iter()
+            .map(|index| {
+                if index == add_at {
+                    ListRow {
+                        index,
+                        title: "Add system".to_string(),
+                        detail: String::new(),
+                        selected: self.split.index == add_at,
+                        add: true,
+                    }
+                } else {
+                    let row = &self.rows[index];
+                    ListRow {
+                        index,
+                        title: row.name.clone(),
+                        detail: self.emulator_label(row.emulator_id.as_deref()),
+                        selected: index == self.split.index,
+                        add: false,
+                    }
+                }
             })
-            .collect();
-        rows.push(ListRow {
-            index: self.rows.len(),
-            title: "Add system".to_string(),
-            detail: String::new(),
-            selected: self.split.index == self.rows.len(),
-            add: true,
-        });
-        rows
+            .collect()
     }
 
     pub fn panel(&self) -> Panel {
@@ -245,6 +256,7 @@ impl Systems {
         }
     }
 
+    /// `index` is [`ListRow::index`]: the config-order slot of the system on that row.
     pub fn select(&mut self, index: usize) {
         if index <= self.rows.len() {
             self.picker.close();
@@ -260,6 +272,7 @@ impl Systems {
     }
 
     /// Add system follows Enter. Other rows only move the selection.
+    /// `index` is [`ListRow::index`], the config-order slot of the row on screen.
     pub fn click_row(&mut self, index: usize) -> Step {
         let add = index == self.rows.len();
         self.select(index);
@@ -388,8 +401,8 @@ impl Systems {
         }
         if self.split.side == Side::List {
             match dir {
-                NavDir::Up => self.split.move_list(-1, self.list_len()),
-                NavDir::Down => self.split.move_list(1, self.list_len()),
+                NavDir::Up => self.move_displayed(-1),
+                NavDir::Down => self.move_displayed(1),
                 NavDir::Right => self.enter_panel(),
                 NavDir::Left => {}
             }
@@ -931,8 +944,34 @@ impl Systems {
         self.split.index >= self.rows.len()
     }
 
-    fn list_len(&self) -> usize {
-        self.rows.len() + 1
+    /// Config-order slots, alphabetical by display name. Add system is not included.
+    /// [`Self::rows`] stays in file order so a save does not reshuffle `config.toml`.
+    fn display_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.rows.len()).collect();
+        order.sort_by(|&left, &right| {
+            let left = &self.rows[left];
+            let right = &self.rows[right];
+            cmp_system_name(&left.name, &left.id, &right.name, &right.id)
+        });
+        order
+    }
+
+    fn shown_indexes(&self) -> Vec<usize> {
+        let mut order = self.display_order();
+        order.push(self.rows.len());
+        order
+    }
+
+    fn move_displayed(&mut self, delta: isize) {
+        let order = self.shown_indexes();
+        let pos = order
+            .iter()
+            .position(|index| *index == self.split.index)
+            .unwrap_or(0);
+        let next = pos as isize + delta;
+        if (0..order.len() as isize).contains(&next) {
+            self.split.index = order[next as usize];
+        }
     }
 
     fn type_choices(&self) -> Vec<&'static SystemEntry> {
@@ -1002,15 +1041,22 @@ impl Systems {
         if self.adding() || self.rows.is_empty() {
             return Step::Stay;
         }
-        let index = self.split.index.min(self.rows.len() - 1);
-        let id = self.rows[index].id.clone();
-        self.rows.remove(index);
+        let order = self.display_order();
+        let visual = order
+            .iter()
+            .position(|index| *index == self.split.index)
+            .unwrap_or(0);
+        let storage = order[visual];
+        let id = self.rows[storage].id.clone();
+        self.rows.remove(storage);
         self.dropped = Some(id);
-        if self.rows.is_empty() {
-            self.split.index = 0;
-        } else if self.split.index >= self.rows.len() {
-            self.split.index = self.rows.len() - 1;
-        }
+        self.split.index = if self.rows.is_empty() {
+            0
+        } else if visual + 1 < order.len() {
+            shift_after_remove(order[visual + 1], storage)
+        } else {
+            shift_after_remove(order[visual - 1], storage)
+        };
         self.picker.close();
         self.split.leave();
         self.field = Field::Emulator;
@@ -1138,6 +1184,14 @@ pub fn apply_systems(config: &mut Config, rows: &[SystemRow]) {
         next.push(console);
     }
     config.consoles = next;
+}
+
+fn shift_after_remove(index: usize, removed: usize) -> usize {
+    if index > removed {
+        index - 1
+    } else {
+        index
+    }
 }
 
 fn system_row(console: &Console) -> SystemRow {
@@ -1418,6 +1472,38 @@ mod tests {
         Systems::open(&config, vec![catalog()])
     }
 
+    fn named(id: &str, name: &str) -> Console {
+        Console {
+            id: id.into(),
+            name: name.into(),
+            rom_dirs: Vec::new(),
+            extensions: Vec::new(),
+            emulator: None,
+            core: None,
+            extra_args: String::new(),
+            grid_art: GridArt::BoxArt,
+            media: MediaToggles::default(),
+        }
+    }
+
+    fn titles(screen: &Systems) -> Vec<String> {
+        screen
+            .list_rows()
+            .into_iter()
+            .map(|row| row.title)
+            .collect()
+    }
+
+    fn stored_ids(screen: &Systems) -> Vec<String> {
+        screen.rows().iter().map(|row| row.id.clone()).collect()
+    }
+
+    fn open_named(consoles: Vec<Console>) -> Systems {
+        let mut config = Config::default();
+        config.consoles = consoles;
+        Systems::open(&config, Vec::new())
+    }
+
     #[test]
     fn ctrl_p_opens_systems() {
         assert!(systems_key("p", None, true));
@@ -1437,14 +1523,22 @@ mod tests {
         config.consoles.push(nes);
         let mut screen = Systems::open(&config, vec![catalog()]);
         assert!(screen.list_focused());
+        assert_eq!(titles(&screen), ["NES", "Super Nintendo", "Add system"]);
+        assert_eq!(screen.selected_id().as_deref(), Some("snes"));
+        assert!(screen.list_rows()[1].selected);
+        screen.move_dir(NavDir::Up);
+        assert!(screen.list_rows()[0].selected);
+        assert_eq!(screen.panel().name, "NES");
         screen.move_dir(NavDir::Down);
-        assert_eq!(screen.list_rows()[1].selected, true);
+        assert!(screen.list_rows()[1].selected);
         screen.move_dir(NavDir::Right);
         assert!(!screen.list_focused());
         assert!(screen.panel().emulator_aimed);
+        assert_eq!(screen.panel().name, "Super Nintendo");
         screen.tab(true);
         assert!(screen.list_focused());
         assert!(screen.list_rows()[1].selected);
+        assert_eq!(stored_ids(&screen), ["snes", "nes"]);
     }
 
     #[test]
@@ -1606,10 +1700,20 @@ mod tests {
         nes.name = "NES".into();
         config.consoles.push(nes);
         let mut screen = Systems::open(&config, vec![catalog()]);
+        assert_eq!(
+            screen
+                .list_rows()
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["NES", "Super Nintendo", "Add system"]
+        );
+        // Storage slot 1 is NES, which the name sort draws first.
         assert_eq!(screen.click_row(1), Step::Stay);
         assert!(screen.list_focused());
-        assert!(screen.list_rows()[1].selected);
-        assert!(!screen.list_rows()[0].selected);
+        assert_eq!(screen.selected_id().as_deref(), Some("nes"));
+        assert!(screen.list_rows()[0].selected);
+        assert!(!screen.list_rows()[1].selected);
         assert!(!screen.panel().adding);
         assert!(screen.panel().type_menu.is_none());
     }
@@ -1857,5 +1961,292 @@ mod tests {
         assert_eq!(screen.panel().core_menu.expect("page").cursor, 8);
         assert!(screen.dismiss());
         assert!(!screen.jump(Jump::Home));
+    }
+
+    #[test]
+    fn the_list_is_alphabetical_and_the_file_order_stays() {
+        let consoles = vec![
+            named("psx", "Sony PlayStation"),
+            named("genesis", "sega genesis"),
+            named("gb", "Nintendo Game Boy"),
+            named("atari2600", "ATARI 2600"),
+            named("arcade-b", "Arcade"),
+            named("arcade-a", "arcade"),
+        ];
+        let screen = open_named(consoles.clone());
+        assert_eq!(
+            titles(&screen),
+            [
+                "arcade",
+                "Arcade",
+                "ATARI 2600",
+                "Nintendo Game Boy",
+                "sega genesis",
+                "Sony PlayStation",
+                "Add system",
+            ]
+        );
+        assert!(screen.list_rows().last().unwrap().add);
+        assert_eq!(
+            stored_ids(&screen),
+            ["psx", "genesis", "gb", "atari2600", "arcade-b", "arcade-a"]
+        );
+        assert_eq!(screen.selected_id().as_deref(), Some("psx"));
+        let shown = screen.selected_index();
+        assert!(screen.list_rows()[shown].selected);
+        assert_eq!(screen.list_rows()[shown].title, "Sony PlayStation");
+
+        let mut shelves: Vec<crate::browse::Shelf> = consoles
+            .iter()
+            .map(|console| crate::browse::Shelf {
+                console: console.clone(),
+                manufacturer: None,
+                year: None,
+                description: None,
+                stats: crate::database::LibraryStats {
+                    total_games: 0,
+                    last_played_date: None,
+                    last_played_game: None,
+                    total_play_count: 0,
+                    total_play_time: 0,
+                    most_played_game: None,
+                    most_played_count: 0,
+                },
+                games: Vec::new(),
+            })
+            .collect();
+        crate::browse::sort_shelves(&mut shelves, crate::config::SystemSort::Name);
+        let sidebar: Vec<_> = shelves
+            .iter()
+            .map(|shelf| shelf.console.id.as_str())
+            .collect();
+        let manage: Vec<_> = screen
+            .list_rows()
+            .into_iter()
+            .filter(|row| !row.add)
+            .map(|row| screen.rows()[row.index].id.clone())
+            .collect();
+        assert_eq!(manage, sidebar);
+
+        let mut config = Config::default();
+        config.consoles = consoles;
+        apply_systems(&mut config, screen.rows());
+        assert_eq!(
+            config
+                .consoles
+                .iter()
+                .map(|console| console.id.as_str())
+                .collect::<Vec<_>>(),
+            ["psx", "genesis", "gb", "atari2600", "arcade-b", "arcade-a"]
+        );
+    }
+
+    #[test]
+    fn adding_a_system_slots_it_in_and_keeps_it_selected() {
+        let mut screen = open_named(vec![
+            named("snes", "Super Nintendo"),
+            named("genesis", "Sega Genesis"),
+            named("atari2600", "Atari 2600"),
+        ]);
+        assert_eq!(screen.selected_id().as_deref(), Some("snes"));
+        assert_eq!(screen.move_dir(NavDir::Down), Step::Stay);
+        assert!(screen.list_rows().last().unwrap().add);
+        screen.move_dir(NavDir::Right);
+        screen.type_text("nes");
+        assert_eq!(screen.confirm(), Step::Write);
+        assert_eq!(screen.selected_id().as_deref(), Some("nes"));
+        assert_eq!(screen.panel().name, "Nintendo Entertainment System");
+        assert!(screen.panel().path_draft_aimed);
+        assert_eq!(
+            titles(&screen),
+            [
+                "Atari 2600",
+                "Nintendo Entertainment System",
+                "Sega Genesis",
+                "Super Nintendo",
+                "Add system",
+            ]
+        );
+        let rows = screen.list_rows();
+        let selected = rows.iter().find(|row| row.selected).unwrap();
+        assert_eq!(selected.title, "Nintendo Entertainment System");
+        assert!(!selected.add);
+        assert_ne!(screen.selected_id().as_deref(), Some("genesis"));
+        assert_eq!(stored_ids(&screen), ["snes", "genesis", "atari2600", "nes"]);
+        let mut config = Config::default();
+        config.consoles = vec![
+            named("snes", "Super Nintendo"),
+            named("genesis", "Sega Genesis"),
+            named("atari2600", "Atari 2600"),
+        ];
+        apply_systems(&mut config, screen.rows());
+        assert_eq!(
+            config
+                .consoles
+                .iter()
+                .map(|console| console.id.as_str())
+                .collect::<Vec<_>>(),
+            ["snes", "genesis", "atari2600", "nes"]
+        );
+    }
+
+    #[test]
+    fn delete_selects_the_next_name_and_keeps_file_order() {
+        let mut screen = open_named(vec![
+            named("genesis", "Sega Genesis"),
+            named("atari2600", "Atari 2600"),
+            named("psx", "Sony PlayStation"),
+        ]);
+        assert_eq!(
+            titles(&screen),
+            [
+                "Atari 2600",
+                "Sega Genesis",
+                "Sony PlayStation",
+                "Add system",
+            ]
+        );
+        let atari = screen
+            .list_rows()
+            .iter()
+            .find(|row| row.title == "Atari 2600")
+            .unwrap()
+            .index;
+        screen.click_row(atari);
+        assert_eq!(screen.selected_id().as_deref(), Some("atari2600"));
+        assert_eq!(screen.selected_index(), 0);
+        screen.aim(Field::Delete);
+        assert_eq!(screen.confirm(), Step::Stay);
+        screen.move_dir(NavDir::Right);
+        assert_eq!(screen.confirm(), Step::Write);
+        assert_eq!(screen.take_dropped().as_deref(), Some("atari2600"));
+        assert_eq!(screen.selected_id().as_deref(), Some("genesis"));
+        assert!(screen.list_rows()[0].selected);
+        assert_eq!(screen.list_rows()[0].title, "Sega Genesis");
+        assert_eq!(stored_ids(&screen), ["genesis", "psx"]);
+
+        let genesis = screen
+            .list_rows()
+            .iter()
+            .find(|row| row.title == "Sega Genesis")
+            .unwrap()
+            .index;
+        screen.click_row(genesis);
+        screen.aim(Field::Delete);
+        assert_eq!(screen.confirm(), Step::Stay);
+        screen.move_dir(NavDir::Right);
+        assert_eq!(screen.confirm(), Step::Write);
+        assert_eq!(screen.selected_id().as_deref(), Some("psx"));
+        assert_eq!(stored_ids(&screen), ["psx"]);
+
+        screen.aim(Field::Delete);
+        assert_eq!(screen.confirm(), Step::Stay);
+        screen.move_dir(NavDir::Right);
+        assert_eq!(screen.confirm(), Step::Write);
+        assert!(screen.rows().is_empty());
+        assert!(screen.list_rows()[0].add);
+        assert!(screen.list_rows()[0].selected);
+
+        let mut screen = open_named(vec![
+            named("genesis", "Sega Genesis"),
+            named("atari2600", "Atari 2600"),
+            named("psx", "Sony PlayStation"),
+        ]);
+        let psx = screen
+            .list_rows()
+            .iter()
+            .find(|row| row.title == "Sony PlayStation")
+            .unwrap()
+            .index;
+        screen.click_row(psx);
+        screen.aim(Field::Delete);
+        assert_eq!(screen.confirm(), Step::Stay);
+        screen.move_dir(NavDir::Right);
+        assert_eq!(screen.confirm(), Step::Write);
+        assert_eq!(screen.selected_id().as_deref(), Some("genesis"));
+        assert_eq!(stored_ids(&screen), ["genesis", "atari2600"]);
+        let mut config = Config::default();
+        config.consoles = vec![
+            named("genesis", "Sega Genesis"),
+            named("atari2600", "Atari 2600"),
+            named("psx", "Sony PlayStation"),
+        ];
+        apply_systems(&mut config, screen.rows());
+        assert_eq!(
+            config
+                .consoles
+                .iter()
+                .map(|console| console.id.as_str())
+                .collect::<Vec<_>>(),
+            ["genesis", "atari2600"]
+        );
+    }
+
+    #[test]
+    fn renaming_keeps_the_selection_on_that_system() {
+        let mut screen = open_named(vec![
+            named("psx", "Sony PlayStation"),
+            named("genesis", "Sega Genesis"),
+            named("gb", "Nintendo Game Boy"),
+        ]);
+        let gb = screen
+            .list_rows()
+            .iter()
+            .find(|row| screen.rows()[row.index].id == "gb")
+            .unwrap()
+            .index;
+        screen.click_row(gb);
+        screen.rows[gb].name = "ZZZ".into();
+        assert_eq!(screen.selected_id().as_deref(), Some("gb"));
+        assert_eq!(
+            titles(&screen),
+            ["Sega Genesis", "Sony PlayStation", "ZZZ", "Add system",]
+        );
+        assert!(screen.list_rows()[2].selected);
+        assert_eq!(screen.panel().name, "ZZZ");
+        screen.rows[gb].name = "aaa".into();
+        assert_eq!(screen.selected_id().as_deref(), Some("gb"));
+        assert_eq!(screen.list_rows()[0].title, "aaa");
+        assert!(screen.list_rows()[0].selected);
+        assert_eq!(stored_ids(&screen), ["psx", "genesis", "gb"]);
+    }
+
+    #[test]
+    fn navigation_rescan_and_scrape_follow_the_sorted_row() {
+        let mut screen = open_named(vec![
+            named("genesis", "Sega Genesis"),
+            named("atari2600", "Atari 2600"),
+            named("psx", "Sony PlayStation"),
+        ]);
+        assert_eq!(screen.selected_id().as_deref(), Some("genesis"));
+        screen.move_dir(NavDir::Up);
+        assert_eq!(screen.selected_id().as_deref(), Some("atari2600"));
+        screen.move_dir(NavDir::Down);
+        assert_eq!(screen.selected_id().as_deref(), Some("genesis"));
+        screen.move_dir(NavDir::Down);
+        assert_eq!(screen.selected_id().as_deref(), Some("psx"));
+        screen.move_dir(NavDir::Down);
+        assert!(screen.list_rows().last().unwrap().add);
+        assert!(screen.selected_id().is_none());
+        screen.move_dir(NavDir::Up);
+        assert_eq!(screen.selected_id().as_deref(), Some("psx"));
+
+        let atari = screen
+            .list_rows()
+            .iter()
+            .find(|row| row.title == "Atari 2600")
+            .unwrap()
+            .index;
+        screen.click_row(atari);
+        assert_eq!(screen.panel().name, "Atari 2600");
+        screen.aim(Field::Rescan);
+        assert_eq!(screen.confirm(), Step::Rescan);
+        assert_eq!(screen.selected_id().as_deref(), Some("atari2600"));
+        screen.aim(Field::ScrapeMissing);
+        assert_eq!(screen.confirm(), Step::ScrapeMissing);
+        assert_eq!(screen.selected_id().as_deref(), Some("atari2600"));
+        screen.aim(Field::Delete);
+        assert_eq!(screen.confirm(), Step::Stay);
+        assert_eq!(screen.panel().confirm.expect("prompt").name, "Atari 2600");
     }
 }

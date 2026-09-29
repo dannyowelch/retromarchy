@@ -660,12 +660,27 @@ pub fn row_reveal_insets(
     (before, after)
 }
 
-fn cmp_name(a: &Shelf, b: &Shelf) -> Ordering {
-    a.console
-        .name
+/// Alphabetical system order: case-insensitive display name, then id.
+/// The sidebar Name sort and Manage Systems both use this.
+pub fn cmp_system_name(
+    left_name: &str,
+    left_id: &str,
+    right_name: &str,
+    right_id: &str,
+) -> Ordering {
+    left_name
         .to_lowercase()
-        .cmp(&b.console.name.to_lowercase())
-        .then_with(|| a.console.id.cmp(&b.console.id))
+        .cmp(&right_name.to_lowercase())
+        .then_with(|| left_id.cmp(right_id))
+}
+
+fn cmp_name(a: &Shelf, b: &Shelf) -> Ordering {
+    cmp_system_name(
+        &a.console.name,
+        &a.console.id,
+        &b.console.name,
+        &b.console.id,
+    )
 }
 
 pub fn sort_shelves(shelves: &mut [Shelf], sort: SystemSort) {
