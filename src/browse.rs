@@ -421,17 +421,44 @@ pub fn cover_path(game: &Game, art: GridArt) -> Option<PathBuf> {
 
 /// Width / height from a png, jpeg, gif, or webp header. Missing and unknown
 /// files return none so the details pane can fall back to a fixed ratio.
-/// Cached because the details pane asks again on every frame.
+/// Cached per path. A changed mtime or length is read again.
 pub fn image_aspect(path: &Path) -> Option<f32> {
-    static CACHE: Mutex<Option<HashMap<PathBuf, Option<f32>>>> = Mutex::new(None);
+    static CACHE: Mutex<Option<HashMap<PathBuf, CachedAspect>>> = Mutex::new(None);
+    let stamp = image_stamp(path);
     let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
     let cache = guard.get_or_insert_with(HashMap::new);
-    if let Some(ratio) = cache.get(path) {
-        return *ratio;
+    if let Some(hit) = cache.get(path) {
+        if hit.stamp == stamp {
+            return hit.ratio;
+        }
     }
     let ratio = read_image_aspect(path);
-    cache.insert(path.to_path_buf(), ratio);
+    cache.insert(path.to_path_buf(), CachedAspect { stamp, ratio });
     ratio
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ImageStamp {
+    modified_ns: u128,
+    len: u64,
+}
+
+struct CachedAspect {
+    stamp: Option<ImageStamp>,
+    ratio: Option<f32>,
+}
+
+fn image_stamp(path: &Path) -> Option<ImageStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let modified_ns = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(ImageStamp {
+        modified_ns,
+        len: meta.len(),
+    })
 }
 
 fn read_image_aspect(path: &Path) -> Option<f32> {
@@ -2102,6 +2129,36 @@ mod tests {
         assert!((image_aspect(&webp).unwrap() - 216.0 / 288.0).abs() < 0.001);
 
         assert!(image_aspect(Path::new("/no/such/image.png")).is_none());
+    }
+
+    #[test]
+    fn image_aspect_follows_a_rewritten_file() {
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("box.png");
+        fs::write(&png, png_header(150, 200)).unwrap();
+        let file = fs::File::options().write(true).open(&png).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000))
+            .unwrap();
+        drop(file);
+        assert!((image_aspect(&png).unwrap() - 0.75).abs() < 0.001);
+        assert!((image_aspect(&png).unwrap() - 0.75).abs() < 0.001);
+
+        fs::write(&png, png_header(320, 160)).unwrap();
+        let file = fs::File::options().write(true).open(&png).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000))
+            .unwrap();
+        drop(file);
+        assert!((image_aspect(&png).unwrap() - 2.0).abs() < 0.001);
+    }
+
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+        ];
+        bytes.extend(width.to_be_bytes());
+        bytes.extend(height.to_be_bytes());
+        bytes
     }
 
     #[test]

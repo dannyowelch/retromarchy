@@ -218,14 +218,14 @@ impl Shell {
         }
         if !self.gate.live() {
             self.sink_pad(&events);
-            let changed = self.poll_jobs();
+            let changed = self.poll_jobs(cx);
             self.close_pad_poll();
             if changed {
                 cx.notify();
             }
             return;
         }
-        let mut changed = self.poll_jobs();
+        let mut changed = self.poll_jobs(cx);
         if !self.gate.live() {
             self.sink_pad(&events);
             self.close_pad_poll();
@@ -1748,7 +1748,7 @@ impl Shell {
         ));
     }
 
-    fn poll_jobs(&mut self) -> bool {
+    fn poll_jobs(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         // One update per tick. A scrape can queue many saves; draining them
         // here would decode images on the UI thread.
@@ -1773,7 +1773,9 @@ impl Shell {
         if let Some(update) = update {
             match update {
                 Ok(ScrapeUpdate::Status(text)) => self.browse.status = text,
-                Ok(ScrapeUpdate::Saved { game_id, media }) => self.store_media(&game_id, &media),
+                Ok(ScrapeUpdate::Saved { game_id, media }) => {
+                    self.store_media(&game_id, &media, cx)
+                }
                 Ok(ScrapeUpdate::Metadata { game_id, metadata }) => {
                     self.store_metadata(&game_id, metadata);
                 }
@@ -1849,7 +1851,7 @@ impl Shell {
         changed
     }
 
-    fn store_media(&mut self, game_id: &str, media: &Media) {
+    fn store_media(&mut self, game_id: &str, media: &Media, cx: &mut Context<Self>) {
         if self.browse.library.kind != LibraryKind::Disk {
             return;
         }
@@ -1869,9 +1871,11 @@ impl Shell {
         {
             if old != media.path {
                 crate::covers::invalidate(&old);
+                release_detail_art(&old, cx);
             }
         }
         crate::covers::invalidate(&media.path);
+        release_detail_art(&media.path, cx);
         self.browse.remember_media(game_id, media);
     }
 
@@ -2326,6 +2330,10 @@ impl Shell {
             self.options_scroll.scroll_to_item(dialog.selected_index());
         }
     }
+}
+
+fn release_detail_art(path: &std::path::Path, cx: &mut Context<Shell>) {
+    gpui_kit::ImageSource::from(path.to_path_buf()).remove_asset(cx);
 }
 
 impl Render for Shell {

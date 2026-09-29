@@ -135,6 +135,7 @@ pub struct JobResult {
 #[derive(Default)]
 struct Cache {
     images: HashMap<ThumbKey, Arc<RenderImage>>,
+    disks: HashMap<PathBuf, Vec<ThumbKey>>,
     stamps: HashMap<PathBuf, SourceStamp>,
     epochs: HashMap<PathBuf, u64>,
     failed: HashSet<WorkId>,
@@ -194,9 +195,11 @@ pub fn complete(result: JobResult) -> bool {
     lock().complete(result)
 }
 
-/// Drop memory entries for `path` so the next view stats the file again.
+/// Drop memory and disk thumbs for `path` so the next view stats the file again.
 pub fn invalidate(path: &Path) {
-    lock().invalidate(path);
+    let mut cache = lock();
+    let dir = thumb_cache_dir();
+    cache.invalidate_at(&dir, path);
 }
 
 /// Drop a memory entry when the file's mtime or length changed. Unchanged files stay put.
@@ -206,7 +209,8 @@ pub fn invalidate_stale(path: &Path) {
     if cache.stamps.get(path).copied() == current {
         return;
     }
-    cache.invalidate(path);
+    let dir = thumb_cache_dir();
+    cache.invalidate_at(&dir, path);
 }
 
 pub fn device_len(rendered: &RenderImage) -> (DevicePixels, DevicePixels) {
@@ -302,6 +306,7 @@ impl Cache {
             self.failed.insert(result.id);
             return false;
         };
+        self.note_disk(&key);
         if let Some((width, height)) = self.live_slot {
             if key.width != width || key.height != height {
                 return false;
@@ -319,10 +324,32 @@ impl Cache {
         true
     }
 
+    fn invalidate_at(&mut self, dir: &Path, path: &Path) {
+        self.forget_disk(dir, path);
+        self.invalidate(path);
+    }
+
+    fn forget_disk(&mut self, dir: &Path, path: &Path) {
+        let Some(keys) = self.disks.remove(path) else {
+            return;
+        };
+        for key in keys {
+            let _ = fs::remove_file(thumb_path(dir, &key));
+        }
+    }
+
+    fn note_disk(&mut self, key: &ThumbKey) {
+        let keys = self.disks.entry(key.source.clone()).or_default();
+        if !keys.iter().any(|have| have == key) {
+            keys.push(key.clone());
+        }
+    }
+
     fn invalidate(&mut self, path: &Path) {
         let epoch = self.epochs.entry(path.to_path_buf()).or_insert(0);
         *epoch = epoch.wrapping_add(1);
         self.stamps.remove(path);
+        self.disks.remove(path);
         self.images.retain(|key, _| key.source != path);
         self.failed.retain(|id| id.path != path);
         self.wanted.retain(|work| work.path != path);
@@ -641,6 +668,120 @@ mod tests {
         assert!(left
             .iter()
             .all(|name| !name.to_string_lossy().contains(".tmp")));
+    }
+
+    #[test]
+    fn overwritten_file_reloads_pixels_and_keeps_the_old_thumb() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("box.png");
+        image::RgbaImage::from_pixel(8, 10, image::Rgba([200, 10, 10, 255]))
+            .save(&src)
+            .unwrap();
+        let file = fs::File::options().write(true).open(&src).unwrap();
+        let early = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        file.set_modified(early).unwrap();
+        drop(file);
+
+        let thumbs = root.path().join("thumbs");
+        let first = produce_in(&thumbs, work(&src, ThumbKind::BoxArt, 8, 10));
+        let old_key = first.outcome.as_ref().unwrap().0.clone();
+        let mut cache = Cache::default();
+        assert!(cache.complete(first));
+        assert_eq!(
+            pixel(
+                cache
+                    .lookup(&src, ThumbKind::BoxArt, 8, 10)
+                    .unwrap()
+                    .as_ref()
+            ),
+            [10, 10, 200, 255]
+        );
+
+        image::RgbaImage::from_pixel(8, 10, image::Rgba([10, 180, 20, 255]))
+            .save(&src)
+            .unwrap();
+        let file = fs::File::options().write(true).open(&src).unwrap();
+        file.set_modified(early + Duration::from_secs(90)).unwrap();
+        drop(file);
+        cache.invalidate_at(&thumbs, &src);
+        assert!(cache.lookup(&src, ThumbKind::BoxArt, 8, 10).is_none());
+
+        let second = produce_in(&thumbs, work_at(&src, &cache));
+        let new_key = second.outcome.as_ref().unwrap().0.clone();
+        assert_ne!(cache_file_name(&new_key), cache_file_name(&old_key));
+        assert!(cache.complete(second));
+        assert_eq!(
+            pixel(
+                cache
+                    .lookup(&src, ThumbKind::BoxArt, 8, 10)
+                    .unwrap()
+                    .as_ref()
+            ),
+            [20, 180, 10, 255]
+        );
+    }
+
+    #[test]
+    fn same_filename_and_stamp_drops_the_disk_thumb() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("box.png");
+        image::RgbaImage::from_pixel(8, 10, image::Rgba([200, 10, 10, 255]))
+            .save(&src)
+            .unwrap();
+        let file = fs::File::options().write(true).open(&src).unwrap();
+        let stamp = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        file.set_modified(stamp).unwrap();
+        drop(file);
+        let len = fs::metadata(&src).unwrap().len();
+
+        let thumbs = root.path().join("thumbs");
+        let first = produce_in(&thumbs, work(&src, ThumbKind::BoxArt, 8, 10));
+        let key = first.outcome.as_ref().unwrap().0.clone();
+        let mut cache = Cache::default();
+        assert!(cache.complete(first));
+
+        image::RgbaImage::from_pixel(8, 10, image::Rgba([10, 180, 20, 255]))
+            .save(&src)
+            .unwrap();
+        let file = fs::File::options().write(true).open(&src).unwrap();
+        file.set_modified(stamp).unwrap();
+        drop(file);
+        assert_eq!(fs::metadata(&src).unwrap().len(), len);
+        assert_eq!(
+            read_stamp(&src).unwrap(),
+            SourceStamp {
+                modified_ns: 10_000 * 1_000_000_000,
+                len,
+            }
+        );
+
+        cache.invalidate_at(&thumbs, &src);
+        assert!(!thumb_path(&thumbs, &key).is_file());
+        let second = produce_in(&thumbs, work_at(&src, &cache));
+        assert_eq!(
+            cache_file_name(&second.outcome.as_ref().unwrap().0),
+            cache_file_name(&key)
+        );
+        assert!(cache.complete(second));
+        assert_eq!(
+            pixel(
+                cache
+                    .lookup(&src, ThumbKind::BoxArt, 8, 10)
+                    .unwrap()
+                    .as_ref()
+            ),
+            [20, 180, 10, 255]
+        );
+    }
+
+    fn pixel(image: &RenderImage) -> [u8; 4] {
+        image.as_bytes(0).unwrap()[0..4].try_into().unwrap()
+    }
+
+    fn work_at(path: &Path, cache: &Cache) -> Work {
+        let mut job = work(path, ThumbKind::BoxArt, 8, 10);
+        job.epoch = cache.epochs.get(path).copied().unwrap_or(0);
+        job
     }
 
     #[test]
