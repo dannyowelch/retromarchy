@@ -1,11 +1,10 @@
 use crate::appearance::{self, launchbox_theme, theme_key};
 use crate::browse::{
-    clamp_cover_width, columns_for, cover_path, file_for, format_play_time, game_count_label,
-    grid_art_key, image_aspect, is_launch_key, key_from_parts, rescan_key, resolve_launch,
-    reveal_row_scroll, row_of, row_reveal_insets, scrape_chord, system_sort_key, title_search_key,
-    Browse, Confirm, Key, LibraryKind, Pane, ScrapeChord, TileFrame, COVER_WIDTH_MAX,
-    COVER_WIDTH_MIN, COVER_WIDTH_STEP, DETAILS_PAD, DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH,
-    TILE_GAP,
+    clamp_cover_width, columns_for, file_for, format_play_time, game_count_label, grid_art_key,
+    image_aspect, is_launch_key, key_from_parts, rescan_key, resolve_launch, reveal_row_scroll,
+    row_of, row_reveal_insets, scrape_chord, system_sort_key, title_search_key, Browse, Confirm,
+    Key, LibraryKind, Pane, ScrapeChord, TileFrame, COVER_WIDTH_MAX, COVER_WIDTH_MIN,
+    COVER_WIDTH_STEP, DETAILS_PAD, DETAILS_WIDTH, GRID_PAD, SIDEBAR_WIDTH, TILE_GAP,
 };
 use crate::config::{self, InputSettings, SystemSort};
 use crate::cores;
@@ -195,6 +194,7 @@ impl Shell {
     /// South enters the grid or launches. East returns to the system list.
     /// North toggles a favorite. Select opens the game menu, and closes it.
     fn poll_nav(&mut self, cx: &mut Context<Self>) {
+        self.pump_thumbs(cx);
         let events = self.drain_pad_events();
         let mut changed = self.poll_jobs();
         if self.options.is_some() {
@@ -1660,6 +1660,11 @@ impl Shell {
                     games,
                     stats,
                 } => {
+                    for game in &games {
+                        for media in &game.media {
+                            crate::covers::invalidate_stale(&media.path);
+                        }
+                    }
                     let count = games.len();
                     if self.browse.replace_console_games(&console_id, games, stats) {
                         self.browse.status = format!("Scanned {count} games in {name}.");
@@ -1687,6 +1692,16 @@ impl Shell {
             self.browse.status = "Could not save artwork.".into();
             return;
         }
+        if let Some(old) = self
+            .browse
+            .game_by_id(game_id)
+            .and_then(|game| file_for(game, media.kind))
+        {
+            if old != media.path {
+                crate::covers::invalidate(&old);
+            }
+        }
+        crate::covers::invalidate(&media.path);
         self.browse.remember_media(game_id, media);
     }
 
@@ -2010,6 +2025,25 @@ impl Shell {
         self.save_and_close_settings();
     }
 
+    /// Start thumbs for cards that are still missing. In-flight work stays capped.
+    fn pump_thumbs(&mut self, cx: &mut Context<Self>) {
+        while let Some(work) = crate::covers::pop_work() {
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { crate::covers::produce(work) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if crate::covers::complete(result) {
+                        cx.notify();
+                    }
+                    this.pump_thumbs(cx);
+                });
+            })
+            .detach();
+        }
+    }
+
     /// One grid row per index. The list asks for the visible range only.
     fn game_rows(
         &mut self,
@@ -2017,6 +2051,7 @@ impl Shell {
         scale: f32,
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
+        crate::covers::begin_visible();
         let count_tiles = crate::scroll_profile::count_pass();
         let columns = self.browse.columns.max(1);
         let cover = self.browse.cover_width;
@@ -2065,6 +2100,7 @@ impl Shell {
             }
             rows.push(line.into_any_element());
         }
+        crate::covers::end_visible();
         rows
     }
 
@@ -2120,6 +2156,7 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.pump_thumbs(cx);
         crate::scroll_profile::begin_frame();
         let width = window.viewport_size().width.as_f32();
         let frame = self.browse.tile_frame();
@@ -2764,6 +2801,14 @@ fn grid(
     )
 }
 
+fn grid_thumb(game: &Game, art: GridArt) -> Option<(crate::covers::ThumbKind, PathBuf)> {
+    art.fallback().into_iter().find_map(|kind| {
+        let path = file_for(game, kind)?;
+        let thumb = crate::covers::ThumbKind::from_media(kind)?;
+        Some((thumb, path))
+    })
+}
+
 fn tile(
     index: usize,
     game: &Game,
@@ -2779,7 +2824,16 @@ fn tile(
     let theme = cx.omarchy();
     let frame = TileFrame::for_art(art, cover_width);
     let title = game.display_title().to_string();
-    let cover = cover_path(game, art);
+    let (slot_w, slot_h) = crate::covers::slot_px(frame.width, frame.height, scale);
+    let thumb = grid_thumb(game, art);
+    let rendered = thumb
+        .as_ref()
+        .and_then(|(kind, path)| crate::covers::lookup(path, *kind, slot_w, slot_h));
+    if rendered.is_none() {
+        if let Some((kind, path)) = &thumb {
+            crate::covers::note_visible(path.clone(), *kind, slot_w, slot_h);
+        }
+    }
     // An explicit ratio stops GPUI from resizing the tile to the file's own ratio.
     let image = div()
         .w(px(frame.width))
@@ -2787,9 +2841,6 @@ fn tile(
         .flex_shrink_0()
         .overflow_hidden()
         .bg(theme.surface);
-    let rendered = cover
-        .as_ref()
-        .and_then(|path| crate::covers::grid_art(path, frame.width, frame.height, scale));
     let image = if let Some(rendered) = rendered {
         image.child(
             img(rendered)
@@ -2798,6 +2849,8 @@ fn tile(
                 .aspect_ratio(frame.ratio())
                 .object_fit(ObjectFit::Contain),
         )
+    } else if thumb.is_some() {
+        image
     } else {
         image
             .flex()
