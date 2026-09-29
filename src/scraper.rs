@@ -2,7 +2,7 @@ use crate::types::{
     GameMetadata, GridArt, Media, MediaKind, ScrapeProvider, ScraperConfig, ScraperCredentials,
     Source,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -1327,6 +1327,16 @@ fn pace(last_http: &mut Option<Instant>) {
     *last_http = Some(Instant::now());
 }
 
+fn log_fixture(query: &ArtworkQuery, kind: &str) {
+    eprintln!(
+        "scrape fixture: title=\"{}\" rom=\"{}\" console={} kind={}",
+        one_line(&query.title),
+        one_line(&query.rom_name),
+        one_line(&query.console_id),
+        kind
+    );
+}
+
 fn fixture_bytes(dir: &Path, kind: MediaKind) -> Result<Vec<u8>, FetchFail> {
     let name = format!("{}.png", kind_file_stem(kind));
     fs::read(dir.join(name)).map_err(|_| {
@@ -2016,6 +2026,117 @@ pub fn spawn_scrape(
     rx
 }
 
+/// Games handed to one background scrape.
+#[derive(Debug)]
+pub struct ScrapeBatch {
+    pub console_id: String,
+    pub games: Vec<crate::types::Game>,
+}
+
+#[derive(Debug)]
+pub enum Admit {
+    /// Nothing else is running. Start this batch now.
+    Start(ScrapeBatch),
+    /// It will run after the scrape already in flight.
+    Queued,
+    /// This system already has a scrape running or waiting.
+    Busy,
+}
+
+/// One artwork scrape at a time. A second Scrape Missing for the same system
+/// waits instead of running beside the first. A scan can still append games
+/// the in-flight scrape did not have.
+#[derive(Debug, Default)]
+pub struct ScrapeRuns {
+    active: Option<String>,
+    queued: VecDeque<ScrapeBatch>,
+}
+
+impl ScrapeRuns {
+    pub fn tracks(&self, console_id: &str) -> bool {
+        self.active.as_deref() == Some(console_id)
+            || self
+                .queued
+                .iter()
+                .any(|batch| batch.console_id == console_id)
+    }
+
+    /// Scrape Missing for one system. A system already running or waiting is [`Admit::Busy`].
+    pub fn request_missing(&mut self, console_id: &str, games: Vec<crate::types::Game>) -> Admit {
+        if self.tracks(console_id) {
+            return Admit::Busy;
+        }
+        self.enqueue(console_id, games)
+    }
+
+    /// Games a scan just added. Merged into a waiting batch for that system,
+    /// or run after the one already scraping it.
+    pub fn request_added(&mut self, console_id: &str, games: Vec<crate::types::Game>) -> Admit {
+        if games.is_empty() {
+            return Admit::Busy;
+        }
+        if let Some(batch) = self
+            .queued
+            .iter_mut()
+            .find(|batch| batch.console_id == console_id)
+        {
+            push_new_games(&mut batch.games, games);
+            return Admit::Queued;
+        }
+        if self.active.as_deref() == Some(console_id) {
+            self.queued.push_back(ScrapeBatch {
+                console_id: console_id.to_string(),
+                games,
+            });
+            return Admit::Queued;
+        }
+        self.enqueue(console_id, games)
+    }
+
+    /// One game from the scrape dialog. Does not queue behind another scrape.
+    pub fn request_one(&mut self, console_id: &str) -> bool {
+        if self.active.is_some() || !self.queued.is_empty() {
+            return false;
+        }
+        self.active = Some(console_id.to_string());
+        true
+    }
+
+    pub fn finish(&mut self) -> Option<ScrapeBatch> {
+        self.active = None;
+        let next = self.queued.pop_front()?;
+        self.active = Some(next.console_id.clone());
+        Some(next)
+    }
+
+    pub fn clear(&mut self) {
+        self.active = None;
+        self.queued.clear();
+    }
+
+    fn enqueue(&mut self, console_id: &str, games: Vec<crate::types::Game>) -> Admit {
+        let batch = ScrapeBatch {
+            console_id: console_id.to_string(),
+            games,
+        };
+        if self.active.is_some() {
+            self.queued.push_back(batch);
+            Admit::Queued
+        } else {
+            self.active = Some(batch.console_id.clone());
+            Admit::Start(batch)
+        }
+    }
+}
+
+fn push_new_games(into: &mut Vec<crate::types::Game>, extra: Vec<crate::types::Game>) {
+    for game in extra {
+        if !into.iter().any(|have| have.id == game.id) {
+            into.push(game);
+        }
+    }
+}
+
 pub fn fixture_dir_from_env() -> Option<PathBuf> {
     std::env::var_os("RETROMARCHY_SCRAPER_FIXTURES")
         .map(PathBuf::from)
@@ -2187,6 +2308,9 @@ fn run_scrape(
         let mut game_failed = false;
         let mut reasons = Vec::new();
         for kind in work.kinds {
+            if fixtures.is_some() {
+                log_fixture(&query, kind_file_stem(kind));
+            }
             let found = first_uncooled(&active, &mut cooled, &mut reasons, "", |provider| {
                 let bytes = if let Some(dir) = &fixtures {
                     fixture_bytes(dir, kind)?
@@ -2220,6 +2344,9 @@ fn run_scrape(
             }
         }
         if work.metadata {
+            if fixtures.is_some() {
+                log_fixture(&query, "metadata");
+            }
             let found = first_uncooled(
                 &active,
                 &mut cooled,
@@ -3126,5 +3253,71 @@ mod tests {
         let metadata = fixture_metadata(dir.path()).unwrap();
         assert_eq!(metadata.title.as_deref(), Some("Tetris"));
         assert!(metadata.publisher.is_none());
+    }
+
+    fn named(id: &str) -> crate::types::Game {
+        let mut game = dummy_game(PathBuf::from(format!("/roms/{id}.sfc")), "snes", 1);
+        game.id = id.into();
+        game.file_title = id.into();
+        game
+    }
+
+    #[test]
+    fn scrape_runs_refuse_a_second_pass_and_keep_games_a_scan_adds() {
+        let mut runs = ScrapeRuns::default();
+        match runs.request_missing("snes", vec![named("a")]) {
+            Admit::Start(batch) => assert_eq!(batch.games[0].id, "a"),
+            other => panic!("expected start, got {other:?}"),
+        }
+        assert!(runs.tracks("snes"));
+        assert!(matches!(
+            runs.request_missing("snes", vec![named("a"), named("b")]),
+            Admit::Busy
+        ));
+        assert!(!runs.request_one("snes"));
+
+        assert!(matches!(
+            runs.request_added("snes", vec![named("b")]),
+            Admit::Queued
+        ));
+        assert!(matches!(
+            runs.request_added("snes", vec![named("b"), named("c")]),
+            Admit::Queued
+        ));
+        assert!(matches!(
+            runs.request_missing("nes", vec![named("d")]),
+            Admit::Queued
+        ));
+
+        let next = runs.finish().unwrap();
+        assert_eq!(next.console_id, "snes");
+        let ids: Vec<_> = next.games.iter().map(|game| game.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c"]);
+
+        let nes = runs.finish().unwrap();
+        assert_eq!(nes.console_id, "nes");
+        assert_eq!(nes.games[0].id, "d");
+        assert!(runs.finish().is_none());
+        assert!(!runs.tracks("snes"));
+        assert!(!runs.tracks("nes"));
+
+        assert!(runs.request_one("genesis"));
+        assert!(matches!(
+            runs.request_missing("genesis", vec![named("e")]),
+            Admit::Busy
+        ));
+        assert!(matches!(
+            runs.request_added("snes", vec![named("f")]),
+            Admit::Queued
+        ));
+        let added = runs.finish().unwrap();
+        assert_eq!(added.console_id, "snes");
+        assert_eq!(added.games[0].id, "f");
+        assert!(runs.finish().is_none());
+
+        match runs.request_added("snes", vec![named("g")]) {
+            Admit::Start(batch) => assert_eq!(batch.games[0].id, "g"),
+            other => panic!("expected an idle scan to start, got {other:?}"),
+        }
     }
 }

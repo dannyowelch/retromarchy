@@ -25,6 +25,7 @@ pub enum Field {
     AddPath,
     Browse,
     Rescan,
+    ScrapeMissing,
     Delete,
     Type,
 }
@@ -86,6 +87,7 @@ pub struct Panel {
     pub path_draft_aimed: bool,
     pub browse_aimed: bool,
     pub rescan_aimed: bool,
+    pub scrape_aimed: bool,
     pub delete_aimed: bool,
     pub adding: bool,
     pub types_available: bool,
@@ -101,6 +103,7 @@ pub enum Step {
     Write,
     Rescan,
     Browse,
+    ScrapeMissing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,6 +234,7 @@ impl Systems {
             path_draft_aimed: editing && self.field == Field::AddPath,
             browse_aimed: editing && self.field == Field::Browse,
             rescan_aimed: editing && self.field == Field::Rescan,
+            scrape_aimed: editing && self.field == Field::ScrapeMissing,
             delete_aimed: editing && self.field == Field::Delete,
             adding: false,
             types_available: false,
@@ -300,6 +304,7 @@ impl Systems {
             | Field::Path(_)
             | Field::Browse
             | Field::Rescan
+            | Field::ScrapeMissing
             | Field::Delete => {
                 self.picker.close();
                 self.split.enter();
@@ -486,6 +491,7 @@ impl Systems {
                 self.commit_draft();
                 Step::Rescan
             }
+            Field::ScrapeMissing => Step::ScrapeMissing,
             Field::Delete => self.ask_delete(),
             Field::Type => Step::Stay,
         }
@@ -586,7 +592,7 @@ impl Systems {
         self.picker.close();
         self.split.enter();
         self.field = Field::AddPath;
-        Step::Write
+        Step::Rescan
     }
 
     pub fn set_catalogs(&mut self, catalogs: Vec<CoreCatalog>) {
@@ -644,6 +650,7 @@ impl Systems {
         fields.push(Field::AddPath);
         fields.push(Field::Browse);
         fields.push(Field::Rescan);
+        fields.push(Field::ScrapeMissing);
         fields.push(Field::Delete);
         fields
     }
@@ -674,7 +681,12 @@ impl Systems {
                 edit.move_caret(delta);
                 Step::Stay
             }
-            Field::Path(_) | Field::Browse | Field::Rescan | Field::Delete | Field::Type => {
+            Field::Path(_)
+            | Field::Browse
+            | Field::Rescan
+            | Field::ScrapeMissing
+            | Field::Delete
+            | Field::Type => {
                 if dir == NavDir::Left {
                     self.split.leave();
                 }
@@ -1012,7 +1024,7 @@ impl Systems {
                 self.field = Field::Path(left - 1);
             }
         }
-        Step::Write
+        Step::Rescan
     }
 
     fn commit_draft(&mut self) -> Step {
@@ -1032,7 +1044,7 @@ impl Systems {
             row.rom_dirs.push(path);
             row.path_draft = LineEdit::plain(String::new());
         }
-        Step::Write
+        Step::Rescan
     }
 
     fn push_type_query(&mut self, text: &str) {
@@ -1152,6 +1164,7 @@ fn empty_panel() -> Panel {
         path_draft_aimed: false,
         browse_aimed: false,
         rescan_aimed: false,
+        scrape_aimed: false,
         delete_aimed: false,
         adding: false,
         types_available: false,
@@ -1582,9 +1595,9 @@ mod tests {
         let mut screen = screen();
         screen.aim(Field::AddPath);
         screen.type_text("/roms/a");
-        assert_eq!(screen.confirm(), Step::Write);
+        assert_eq!(screen.confirm(), Step::Rescan);
         screen.type_text("~/roms/b");
-        assert_eq!(screen.confirm(), Step::Write);
+        assert_eq!(screen.confirm(), Step::Rescan);
         screen.type_text("/roms/a");
         assert_eq!(screen.confirm(), Step::Stay);
         let home = root.path().join("home").join("roms").join("b");
@@ -1597,7 +1610,7 @@ mod tests {
             ]
         );
         screen.aim(Field::Path(1));
-        assert_eq!(screen.confirm(), Step::Write);
+        assert_eq!(screen.confirm(), Step::Rescan);
         assert_eq!(
             screen.rows()[0].rom_dirs,
             vec!["/tmp/roms/snes".to_string(), home.display().to_string()]
@@ -1607,6 +1620,18 @@ mod tests {
         config.consoles.push(snes());
         apply_systems(&mut config, screen.rows());
         assert_eq!(config.consoles[0].rom_dirs[1], home);
+    }
+
+    #[test]
+    fn scrape_missing_sits_between_rescan_and_delete() {
+        let mut screen = screen();
+        screen.aim(Field::Rescan);
+        assert!(screen.panel().rescan_aimed);
+        assert_eq!(screen.move_dir(NavDir::Down), Step::Stay);
+        assert!(screen.panel().scrape_aimed);
+        assert_eq!(screen.confirm(), Step::ScrapeMissing);
+        assert_eq!(screen.move_dir(NavDir::Down), Step::Stay);
+        assert!(screen.panel().delete_aimed);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use crate::options::{
 };
 use crate::picker::{self, Jump};
 use crate::scanner;
-use crate::scraper::{self, NameSearch, ScrapeUpdate};
+use crate::scraper::{self, NameSearch, ScrapeBatch, ScrapeRuns, ScrapeUpdate};
 use crate::scraper_settings::{
     scraper_key, Block as ScraperBlock, Part as ScraperPart, Slot as ScraperSlot,
 };
@@ -78,6 +78,7 @@ pub struct Shell {
     _nav_poll: Task<()>,
     search: Option<std::sync::mpsc::Receiver<NameSearch>>,
     apply: Option<std::sync::mpsc::Receiver<ScrapeUpdate>>,
+    scrape_runs: ScrapeRuns,
     scrape_scroll: ScrollHandle,
     emulators: Option<Emulators>,
     systems: Option<Systems>,
@@ -188,6 +189,7 @@ impl Shell {
             _nav_poll: nav_poll,
             search: None,
             apply: None,
+            scrape_runs: ScrapeRuns::default(),
             scrape_scroll: ScrollHandle::new(),
             emulators: None,
             systems: None,
@@ -1388,6 +1390,16 @@ impl Shell {
                 }
             }
             SystemStep::Browse => self.pick_folder(cx),
+            SystemStep::ScrapeMissing => {
+                if let Some(id) = self
+                    .systems
+                    .as_ref()
+                    .and_then(|dialog| dialog.selected_id())
+                {
+                    let announce = !self.scrape_runs.tracks(&id);
+                    self.scrape_missing_id(&id, announce);
+                }
+            }
         }
     }
 
@@ -1476,14 +1488,14 @@ impl Shell {
                 }
             };
             let _ = this.update(cx, |this, cx| {
-                this.finish_pick(picked);
+                this.finish_pick(picked, cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
-    fn finish_pick(&mut self, picked: Picked) {
+    fn finish_pick(&mut self, picked: Picked, cx: &mut Context<Self>) {
         match picked {
             Picked::Cancel => {}
             Picked::Path(path) => {
@@ -1492,9 +1504,7 @@ impl Shell {
                     .as_mut()
                     .map(|dialog| dialog.add_rom_dir(path))
                     .unwrap_or(SystemStep::Stay);
-                if step == SystemStep::Write {
-                    self.write_systems();
-                }
+                self.apply_system_step(step, cx);
             }
             Picked::Failed(message) => self.browse.status = message,
         }
@@ -1637,34 +1647,79 @@ impl Shell {
     }
 
     fn scrape_missing(&mut self) {
-        let Some(targets) = self.browse.missing_scrape_games() else {
+        let Some(id) = self.browse.shelf().map(|shelf| shelf.console.id.clone()) else {
+            self.browse.status = "Select a system before scraping missing artwork.".into();
             return;
         };
-        if self.apply.is_some() {
-            self.browse.status = "A scrape is already running.".into();
+        self.scrape_missing_id(&id, true);
+    }
+
+    fn scrape_missing_id(&mut self, console_id: &str, announce_busy: bool) {
+        if self.scrape_runs.tracks(console_id) {
+            if announce_busy {
+                self.browse.status = "A scrape is already running.".into();
+            }
             return;
         }
+        let Some(games) = self.browse.missing_scrape_games_for(console_id) else {
+            return;
+        };
+        self.enqueue_missing(console_id, games, announce_busy);
+    }
+
+    fn enqueue_missing(&mut self, console_id: &str, games: Vec<Game>, announce_busy: bool) {
+        match self.scrape_runs.request_missing(console_id, games) {
+            scraper::Admit::Busy => {
+                if announce_busy {
+                    self.browse.status = "A scrape is already running.".into();
+                }
+            }
+            scraper::Admit::Queued => {}
+            scraper::Admit::Start(batch) => self.launch_missing(batch),
+        }
+    }
+
+    fn enqueue_added(&mut self, console_id: &str, games: Vec<Game>) {
+        if let scraper::Admit::Start(batch) = self.scrape_runs.request_added(console_id, games) {
+            self.launch_missing(batch);
+        }
+    }
+
+    fn launch_missing(&mut self, batch: ScrapeBatch) {
         let config = match config::load_config() {
             Ok(config) => config,
             Err(err) => {
+                self.scrape_runs.clear();
+                self.apply = None;
                 self.browse.status = format!("Could not read scraper settings ({err}).");
                 return;
             }
         };
+        let games = self.games_now(batch);
         self.browse.status = "Scraping artwork…".into();
         self.apply = Some(scraper::spawn_scrape(
-            targets,
+            games,
             config.scraper,
             scraper::fixture_dir_from_env(),
         ));
     }
 
+    fn games_now(&self, batch: ScrapeBatch) -> Vec<Game> {
+        batch
+            .games
+            .into_iter()
+            .map(|game| self.browse.game_by_id(&game.id).cloned().unwrap_or(game))
+            .collect()
+    }
+
+    fn promote_scrape(&mut self) {
+        if let Some(batch) = self.scrape_runs.finish() {
+            self.launch_missing(batch);
+        }
+    }
+
     fn start_apply(&mut self, game_id: String, candidate: crate::scraper::ScrapeCandidate) {
         self.search = None;
-        if self.apply.is_some() {
-            self.browse.status = "A scrape is already running.".into();
-            return;
-        }
         let Some(game) = self.browse.game_by_id(&game_id).cloned() else {
             self.browse.status = "Select a game.".into();
             return;
@@ -1680,6 +1735,10 @@ impl Shell {
                 return;
             }
         };
+        if self.apply.is_some() || !self.scrape_runs.request_one(&game.console) {
+            self.browse.status = "A scrape is already running.".into();
+            return;
+        }
         self.browse.status = "Scraping artwork…".into();
         self.apply = Some(scraper::spawn_apply_candidate(
             game,
@@ -1721,10 +1780,12 @@ impl Shell {
                 Ok(ScrapeUpdate::Done(text)) => {
                     self.apply = None;
                     self.browse.status = text;
+                    self.promote_scrape();
                 }
                 Err(()) => {
                     self.apply = None;
                     self.browse.status = "Scrape stopped.".into();
+                    self.promote_scrape();
                 }
             }
             changed = true;
@@ -1764,6 +1825,8 @@ impl Shell {
                     games,
                     stats,
                 } => {
+                    let previous = self.browse.game_ids(&console_id);
+                    let added = scanner::added_games(&previous, &games);
                     for game in &games {
                         for media in &game.media {
                             crate::covers::invalidate_stale(&media.path);
@@ -1772,6 +1835,9 @@ impl Shell {
                     let count = games.len();
                     if self.browse.replace_console_games(&console_id, games, stats) {
                         self.browse.status = format!("Scanned {count} games in {name}.");
+                        if !added.is_empty() {
+                            self.enqueue_added(&console_id, added);
+                        }
                     }
                 }
                 RescanNote::Failed(message) => {
@@ -2320,6 +2386,10 @@ impl Render for Shell {
             self.systems.as_ref(),
             &self.systems_scroll,
             &self.picker_scroll,
+            self.systems
+                .as_ref()
+                .and_then(|dialog| dialog.selected_id())
+                .is_some_and(|id| self.scrape_runs.tracks(&id)),
             cx,
         ) {
             screen
@@ -4104,6 +4174,7 @@ fn systems_screen(
     dialog: Option<&Systems>,
     scroll: &ScrollHandle,
     picker_scroll: &ScrollHandle,
+    scraping: bool,
     cx: &Context<Shell>,
 ) -> Option<gpui_kit::AnyElement> {
     let dialog = dialog?;
@@ -4114,7 +4185,7 @@ fn systems_screen(
         .into_iter()
         .map(|row| system_list_row(row, cx).into_any_element())
         .collect::<Vec<_>>();
-    let panel = systems_panel(&panel_view, picker_scroll, cx);
+    let panel = systems_panel(&panel_view, picker_scroll, scraping, cx);
     let screen = split::screen(
         "systems-list",
         "Manage Systems",
@@ -4156,6 +4227,7 @@ fn system_list_row(row: crate::systems::ListRow, cx: &Context<Shell>) -> impl In
 fn systems_panel(
     panel: &crate::systems::Panel,
     scroll: &ScrollHandle,
+    scraping: bool,
     cx: &Context<Shell>,
 ) -> impl IntoElement {
     if panel.adding {
@@ -4271,6 +4343,7 @@ fn systems_panel(
                     ButtonVariant::Secondary,
                     panel.path_draft_aimed,
                     SystemField::AddPath,
+                    true,
                     cx,
                 ))
                 .child(system_action(
@@ -4279,25 +4352,47 @@ fn systems_panel(
                     ButtonVariant::Secondary,
                     panel.browse_aimed,
                     SystemField::Browse,
+                    true,
                     cx,
                 )),
         )
-        .child(system_action(
-            "system-rescan".to_string(),
-            "Rescan".to_string(),
-            ButtonVariant::Primary,
-            panel.rescan_aimed,
-            SystemField::Rescan,
-            cx,
-        ))
-        .child(system_action(
-            "system-delete".to_string(),
-            "Delete system".to_string(),
-            ButtonVariant::Danger,
-            panel.delete_aimed,
-            SystemField::Delete,
-            cx,
-        ));
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(8.))
+                .child(system_action(
+                    "system-rescan".to_string(),
+                    "Rescan".to_string(),
+                    ButtonVariant::Primary,
+                    panel.rescan_aimed,
+                    SystemField::Rescan,
+                    true,
+                    cx,
+                ))
+                .child(system_action(
+                    "system-scrape".to_string(),
+                    if scraping {
+                        "Scraping…".to_string()
+                    } else {
+                        "Scrape Missing".to_string()
+                    },
+                    ButtonVariant::Secondary,
+                    panel.scrape_aimed,
+                    SystemField::ScrapeMissing,
+                    !scraping,
+                    cx,
+                ))
+                .child(system_action(
+                    "system-delete".to_string(),
+                    "Delete system".to_string(),
+                    ButtonVariant::Danger,
+                    panel.delete_aimed,
+                    SystemField::Delete,
+                    true,
+                    cx,
+                )),
+        );
     page.into_any_element()
 }
 
@@ -4332,6 +4427,7 @@ fn system_path_row(path: &crate::systems::PathLine, cx: &Context<Shell>) -> impl
             ButtonVariant::Secondary,
             path.aimed,
             SystemField::Path(index),
+            true,
             cx,
         ))
 }
@@ -5052,9 +5148,25 @@ fn system_action(
     variant: ButtonVariant,
     aimed: bool,
     field: SystemField,
+    enabled: bool,
     cx: &Context<Shell>,
 ) -> impl IntoElement {
     let theme = cx.omarchy();
+    let control = button(id, label, variant, cx);
+    let control = if enabled {
+        control.on_click(
+            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+                if let Some(dialog) = &mut this.systems {
+                    dialog.aim(field);
+                }
+                this.confirm_systems(cx);
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }),
+        )
+    } else {
+        control.disabled(true)
+    };
     div()
         .border_1()
         .border_color(if aimed {
@@ -5062,16 +5174,7 @@ fn system_action(
         } else {
             theme.background
         })
-        .child(button(id, label, variant, cx).on_click(cx.listener(
-            move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                if let Some(dialog) = &mut this.systems {
-                    dialog.aim(field);
-                }
-                this.confirm_systems(cx);
-                this.focus_handle.focus(window, cx);
-                cx.notify();
-            },
-        )))
+        .child(control)
 }
 
 fn system_press(
