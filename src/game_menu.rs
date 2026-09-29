@@ -253,7 +253,7 @@ impl Browse {
 
     /// Right-click, Menu, Shift+F10, or Select. The games pane must be focused.
     pub fn open_game_menu(&mut self) -> bool {
-        if self.pane != crate::browse::Pane::Grid || self.selected_game().is_none() {
+        if self.focus != crate::browse::Focus::Grid || self.selected_game().is_none() {
             self.status = "Select a game.".into();
             return false;
         }
@@ -470,7 +470,7 @@ impl Browse {
     pub fn remember_metadata(&mut self, game_id: &str, metadata: GameMetadata) {
         let keep = self.selected_game().map(|game| game.id.clone());
         let previous = self.game;
-        let pane = self.pane;
+        let pane = self.focus.library_pane();
         for shelf in &mut self.library.shelves {
             if let Some(game) = shelf.games.iter_mut().find(|game| game.id == game_id) {
                 game.metadata = Some(metadata);
@@ -668,7 +668,7 @@ impl Browse {
     fn set_user_title(&mut self, id: &str, user_title: Option<String>) {
         let keep = self.selected_game().map(|game| game.id.clone());
         let previous = self.game;
-        let pane = self.pane;
+        let pane = self.focus.library_pane();
         for shelf in &mut self.library.shelves {
             if let Some(game) = shelf.games.iter_mut().find(|game| game.id == id) {
                 game.user_title = user_title;
@@ -696,7 +696,7 @@ impl Browse {
             self.game = None;
         }
         if self.visible_len() == 0 {
-            self.pane = crate::browse::Pane::Sidebar;
+            self.focus = crate::browse::Focus::Sidebar;
         }
         Some(game)
     }
@@ -813,7 +813,7 @@ fn byte_index(text: &str, caret: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browse::{demo_library, Browse, Pane};
+    use crate::browse::{demo_library, Browse, Focus};
     use crate::types::{GameMetadata, ScrapeProvider, Source};
 
     fn entered() -> Browse {
@@ -837,7 +837,7 @@ mod tests {
 
         browse.confirm();
         browse.back();
-        assert_eq!(browse.pane, Pane::Sidebar);
+        assert_eq!(browse.focus, Focus::Sidebar);
         assert!(browse.selected_game().is_some());
         assert!(!browse.open_game_menu());
 
@@ -1121,7 +1121,7 @@ mod tests {
 
         browse.close_overlay();
         browse.back();
-        assert_eq!(browse.pane, Pane::Sidebar);
+        assert_eq!(browse.focus, Focus::Sidebar);
         assert!(matches!(
             browse.scrape_selected(),
             OverlayCommand::Search { .. }
