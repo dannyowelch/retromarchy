@@ -2,7 +2,7 @@
 # Copy this to ~/.config/retromarchy/config.toml and adjust paths
 
 # theme = "system" follows the Omarchy theme. "launchbox" is the built-in dark theme.
-# The header Theme button and the t key toggle it.
+# Options → Theme and the t key toggle it.
 # theme = "system"
 
 # Sidebar order. "name" (the default) is alphabetical by display name.
@@ -99,7 +99,7 @@ slow_interval_ms = 180
 fast_interval_ms = 50
 ramp_ms = 2000
 
-# Artwork scraper. Hand-edit this, or use the Scraper button (Ctrl+G).
+# Artwork scraper. Hand-edit this, or open Options → Scraper (Ctrl+G).
 # Images are cached under ~/.local/share/retromarchy/media/.
 # The scraper never downloads ROMs or BIOS.
 [scraper]

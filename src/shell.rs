@@ -2189,7 +2189,6 @@ impl Render for Shell {
             self.focus_handle.focus(window, cx);
         }
 
-        let theme_name = cx.omarchy().name.to_string();
         let background = cx.omarchy().background;
         let foreground = cx.omarchy().foreground;
         let font = cx.omarchy().font.clone();
@@ -2231,7 +2230,7 @@ impl Render for Shell {
             .capture_key_up(cx.listener(|this, event: &KeyUpEvent, _window, cx| {
                 this.on_key_up(event, cx);
             }))
-            .child(header(&self.browse, &self.appearance, &theme_name, cx))
+            .child(header(&self.browse, cx))
             .children(note)
             .child(content)
             .child(status_line(&self.browse, &self.cover_slider, window, cx))
@@ -2256,18 +2255,8 @@ fn library_title(id: &'static str, cx: &Context<Shell>) -> impl IntoElement {
         .child("Retromarchy")
 }
 
-fn header(
-    browse: &Browse,
-    appearance: &str,
-    omarchy_name: &str,
-    cx: &Context<Shell>,
-) -> impl IntoElement {
+fn header(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
     let theme = cx.omarchy();
-    let theme_name = if appearance::is_launchbox(appearance) {
-        "LaunchBox"
-    } else {
-        omarchy_name
-    };
     let mut row = div()
         .flex()
         .items_center()
@@ -2277,8 +2266,7 @@ fn header(
         .bg(theme.surface)
         .border_b_1()
         .border_color(theme.border)
-        .child(library_title("library-title", cx))
-        .child(keycap(theme_name, cx));
+        .child(library_title("library-title", cx));
     if browse.library.kind == LibraryKind::Demo {
         row = row.child(badge("Demo library", Status::Warning, cx));
     }
@@ -2290,10 +2278,7 @@ fn header(
             .gap(px(2.))
             .child(emulators_button(cx))
             .child(systems_button(cx))
-            .child(scraper_button(cx))
-            .child(options_button(cx))
-            .child(scrape_button(false, cx))
-            .child(scrape_button(true, cx)),
+            .child(options_button(cx)),
     )
     .child(if browse.search_open() {
         search_field(browse.query(), cx).into_any_element()
@@ -2301,7 +2286,6 @@ fn header(
         div().flex_1().into_any_element()
     })
     .child(filter_control(browse, cx))
-    .child(theme_button(appearance, cx))
     .children((!browse.search_open()).then(|| {
         div()
             .flex()
@@ -2371,20 +2355,6 @@ fn search_field(query: &str, cx: &Context<Shell>) -> impl IntoElement {
         .child(div().w(px(1.)).h(px(14.)).bg(theme.accent))
 }
 
-fn scraper_button(cx: &Context<Shell>) -> impl IntoElement {
-    with_tooltip(
-        button("scraper-settings", "Scraper", ButtonVariant::Secondary, cx)
-            .px(px(4.))
-            .flex_shrink_0()
-            .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-                this.activate_screen(Screen::Options(OptionsSection::Scraper));
-                this.focus_handle.focus(window, cx);
-                cx.notify();
-            })),
-        "Scraper settings (Ctrl+G)",
-    )
-}
-
 fn options_button(cx: &Context<Shell>) -> impl IntoElement {
     button("options", "Options", ButtonVariant::Secondary, cx)
         .px(px(4.))
@@ -2394,24 +2364,6 @@ fn options_button(cx: &Context<Shell>) -> impl IntoElement {
             this.focus_handle.focus(window, cx);
             cx.notify();
         }))
-}
-
-fn theme_button(appearance: &str, cx: &Context<Shell>) -> impl IntoElement {
-    let theme = cx.omarchy();
-    let on = appearance::is_launchbox(appearance);
-    div()
-        .flex_shrink_0()
-        .border_1()
-        .border_color(if on { theme.accent } else { theme.background })
-        .child(
-            button("theme-toggle", "Theme", ButtonVariant::Secondary, cx)
-                .px(px(4.))
-                .on_click(cx.listener(|this: &mut Shell, _: &ClickEvent, window, cx| {
-                    this.toggle_appearance(cx);
-                    this.focus_handle.focus(window, cx);
-                    cx.notify();
-                })),
-        )
 }
 
 fn systems_button(cx: &Context<Shell>) -> impl IntoElement {
@@ -2444,28 +2396,6 @@ fn emulators_button(cx: &Context<Shell>) -> impl IntoElement {
         this.focus_handle.focus(window, cx);
         cx.notify();
     }))
-}
-
-fn scrape_button(missing: bool, cx: &Context<Shell>) -> impl IntoElement {
-    let (id, label) = if missing {
-        ("scrape-missing", "Scrape Missing")
-    } else {
-        ("scrape-selected", "Scrape")
-    };
-    button(id, label, ButtonVariant::Secondary, cx)
-        .px(px(4.))
-        .flex_shrink_0()
-        .on_click(
-            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
-                if missing {
-                    this.scrape_missing();
-                } else {
-                    this.scrape_selected();
-                }
-                this.focus_handle.focus(window, cx);
-                cx.notify();
-            }),
-        )
 }
 
 fn filter_control(browse: &Browse, cx: &Context<Shell>) -> impl IntoElement {
@@ -3219,7 +3149,7 @@ fn status_line(
 ) -> impl IntoElement {
     let theme = cx.omarchy();
     let text = if browse.status.is_empty() {
-        "Ctrl+E emulators. Ctrl+P systems. Ctrl+O options. Ctrl+G scraper."
+        "Ctrl+E emulators. Ctrl+P systems. Ctrl+O options."
     } else {
         browse.status.as_str()
     };
