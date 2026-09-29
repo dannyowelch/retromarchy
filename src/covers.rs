@@ -671,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn overwritten_file_reloads_pixels_and_keeps_the_old_thumb() {
+    fn overwritten_file_reloads_thumb_pixels() {
         let root = tempfile::tempdir().unwrap();
         let src = root.path().join("box.png");
         image::RgbaImage::from_pixel(8, 10, image::Rgba([200, 10, 10, 255]))
