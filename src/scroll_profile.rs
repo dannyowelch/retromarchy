@@ -1,6 +1,6 @@
 //! Scroll-cost probe. Enabled with `RETROMARCHY_PROFILE=1`.
-//! Prints CPU time from `/proc/self/stat` for a stationary redraw and for
-//! scripted fast and slow grid scrolls, then quits.
+//! After the grid can scroll, walks the list once from the top and then
+//! again, printing CPU time and frame time for each pass, then quits.
 
 use gpui_kit::{point, px, App, ScrollHandle, Window};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,13 +48,15 @@ struct Probe {
     cpu_started: u64,
     last_frame: Instant,
     frame_ms: f64,
+    max_frame_ms: f64,
+    traveled: f32,
 }
 
+#[derive(Clone, Copy)]
 enum Stage {
     Warmup,
-    Still,
-    Fast,
-    Slow,
+    First,
+    Second,
 }
 
 pub fn after_frame(scroll: &ScrollHandle, window: &mut Window, cx: &mut App) {
@@ -63,52 +65,56 @@ pub fn after_frame(scroll: &ScrollHandle, window: &mut Window, cx: &mut App) {
     }
     static PROBE: std::sync::Mutex<Option<Probe>> = std::sync::Mutex::new(None);
     let mut guard = PROBE.lock().unwrap_or_else(|err| err.into_inner());
-    let probe = guard.get_or_insert_with(|| Probe {
-        stage: Stage::Warmup,
-        stage_frames: 0,
-        stage_started: Instant::now(),
-        cpu_started: cpu_ms(),
-        last_frame: Instant::now(),
-        frame_ms: 0.0,
+    let probe = guard.get_or_insert_with(|| {
+        crate::covers::reset_profile();
+        Probe {
+            stage: Stage::Warmup,
+            stage_frames: 0,
+            stage_started: Instant::now(),
+            cpu_started: cpu_ms(),
+            last_frame: Instant::now(),
+            frame_ms: 0.0,
+            max_frame_ms: 0.0,
+            traveled: 0.0,
+        }
     });
     let now = Instant::now();
     if probe.stage_frames > 0 {
-        probe.frame_ms += now.duration_since(probe.last_frame).as_secs_f64() * 1000.0;
+        let dt = now.duration_since(probe.last_frame).as_secs_f64() * 1000.0;
+        probe.frame_ms += dt;
+        if dt > probe.max_frame_ms {
+            probe.max_frame_ms = dt;
+        }
     }
     probe.last_frame = now;
     probe.stage_frames += 1;
     let tiles = shown_tiles();
 
-    let advance = match probe.stage {
-        Stage::Warmup => probe.stage_started.elapsed().as_secs_f32() >= warmup_secs(),
-        Stage::Still => probe.stage_frames > 60,
-        Stage::Fast | Stage::Slow => probe.stage_frames > 120,
+    let stage = probe.stage;
+    let advance = if matches!(stage, Stage::First | Stage::Second) {
+        step_scroll(scroll, &mut probe.traveled) || probe.stage_frames > 2000
+    } else {
+        warmup_ready(probe, scroll)
     };
     if advance {
         report(probe, tiles, scroll);
         probe.stage = match probe.stage {
-            Stage::Warmup => Stage::Still,
-            Stage::Still => Stage::Fast,
-            Stage::Fast => Stage::Slow,
-            Stage::Slow => {
+            Stage::Warmup => Stage::First,
+            Stage::First => Stage::Second,
+            Stage::Second => {
                 eprintln!("PROFILE done");
                 cx.quit();
                 return;
             }
         };
+        scroll.set_offset(point(px(0.), px(0.)));
         probe.stage_frames = 0;
         probe.stage_started = Instant::now();
         probe.cpu_started = cpu_ms();
         probe.frame_ms = 0.0;
-    }
-
-    if matches!(probe.stage, Stage::Fast | Stage::Slow) {
-        let step = match probe.stage {
-            Stage::Fast => 48.0,
-            Stage::Slow => 2.0,
-            _ => 0.0,
-        };
-        nudge(scroll, step);
+        probe.max_frame_ms = 0.0;
+        probe.traveled = 0.0;
+        crate::covers::reset_profile();
     }
     window.request_animation_frame();
 }
@@ -117,7 +123,20 @@ fn warmup_secs() -> f32 {
     std::env::var("RETROMARCHY_PROFILE_WARMUP_SECS")
         .ok()
         .and_then(|text| text.parse().ok())
-        .unwrap_or(12.0)
+        .unwrap_or(8.0)
+}
+
+fn scroll_step() -> f32 {
+    std::env::var("RETROMARCHY_PROFILE_STEP")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .filter(|step: &f32| step.is_finite() && *step > 0.0)
+        .unwrap_or(320.0)
+}
+
+fn warmup_ready(probe: &Probe, scroll: &ScrollHandle) -> bool {
+    let laid_out = scroll.max_offset().y.as_f32() > 50.0 && probe.stage_frames >= 8;
+    laid_out || probe.stage_started.elapsed().as_secs_f32() >= warmup_secs()
 }
 
 fn report(probe: &Probe, tiles: usize, scroll: &ScrollHandle) {
@@ -126,33 +145,40 @@ fn report(probe: &Probe, tiles: usize, scroll: &ScrollHandle) {
     let frames = probe.stage_frames.max(1);
     let name = match probe.stage {
         Stage::Warmup => "warmup",
-        Stage::Still => "still",
-        Stage::Fast => "scroll_fast",
-        Stage::Slow => "scroll_slow",
+        Stage::First => "scroll_first",
+        Stage::Second => "scroll_second",
     };
+    let stats = crate::covers::profile_stats();
     eprintln!(
-        "PROFILE phase={name} frames={frames} elapsed_ms={elapsed:.0} cpu_ms={cpu} cpu_per_frame_ms={:.2} avg_frame_ms={:.2} tiles={tiles} rss_kb={} offset={:.0} max_scroll={:.0}",
+        "PROFILE phase={name} frames={frames} elapsed_ms={elapsed:.0} cpu_ms={cpu} cpu_per_frame_ms={:.2} avg_frame_ms={:.2} max_frame_ms={:.2} tiles={tiles} rss_kb={} traveled={:.0} offset={:.0} max_scroll={:.0} ui_decode_ms={:.1} bg_decode_ms={:.1} mem_hits={} disk_hits={} generated={}",
         cpu as f64 / frames as f64,
         probe.frame_ms / frames.saturating_sub(1).max(1) as f64,
+        probe.max_frame_ms,
         rss_kb(),
+        probe.traveled,
         -scroll.offset().y.as_f32(),
         scroll.max_offset().y.as_f32(),
+        stats.ui_decode_ns as f64 / 1_000_000.0,
+        stats.bg_decode_ns as f64 / 1_000_000.0,
+        stats.mem_hits,
+        stats.disk_hits,
+        stats.generated,
     );
     let _ = std::io::Write::flush(&mut std::io::stderr());
 }
 
-fn nudge(scroll: &ScrollHandle, step: f32) {
+/// Move down by one step. Returns true once the walk has reached the bottom.
+fn step_scroll(scroll: &ScrollHandle, traveled: &mut f32) -> bool {
     let max = scroll.max_offset().y.as_f32();
     if max <= 1.0 {
-        return;
+        return false;
     }
     let current = -scroll.offset().y.as_f32();
-    let mut next = current + step;
-    if next >= max {
-        next = 0.0;
-    }
+    let next = (current + scroll_step()).min(max);
+    *traveled += next - current;
     let y = if next <= 0.0 { px(0.) } else { px(-next) };
     scroll.set_offset(point(px(0.), y));
+    *traveled >= max - 1.0
 }
 
 fn cpu_ms() -> u64 {
