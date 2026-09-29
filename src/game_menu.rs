@@ -1,6 +1,6 @@
 //! Per-game menu. A right-click, the Menu key, Shift+F10,
 //! or Select (Back / View) opens it. Scrape, rename, and delete then follow.
-//! The header Scrape button and `s` open this same scrape dialog.
+//! `s` opens this same scrape dialog.
 
 use crate::browse::{stats_of, Browse, LibraryKind};
 use crate::database;
@@ -570,7 +570,7 @@ impl Browse {
         });
     }
 
-    /// Header Scrape button and the `s` key. Same dialog as the menu's Scrape row.
+    /// The `s` key. Same dialog as the menu's Scrape row.
     pub fn scrape_selected(&mut self) -> OverlayCommand {
         let Some(game) = self.selected_game().cloned() else {
             self.status = "Select a game to scrape.".into();
