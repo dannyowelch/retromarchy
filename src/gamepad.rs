@@ -7,6 +7,7 @@
 
 use crate::input_repeat::{AxisHold, AxisSide};
 use gilrs::{Axis, Button, EventType};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavDir {
@@ -172,6 +173,181 @@ impl PadHeld {
             None => self.stick.vertical(),
         }
     }
+}
+
+/// When pad and key actions are delivered.
+///
+/// `playing` is the launched game's process lifetime. `focused` is the OS
+/// window; losing it is the backstop when that process has already exited and
+/// the game is still up. After either block ends, actions stay dropped through
+/// the next poll and until every button is up and the sticks are centered, so
+/// a Select press still held from quitting the emulator cannot open the menu.
+#[derive(Debug, Clone)]
+pub struct InputGate {
+    playing: bool,
+    focused: bool,
+    quarantine: bool,
+    /// The poll that ends a block only arms the latch. The following poll can open it.
+    settle: bool,
+    down: BTreeSet<u16>,
+}
+
+impl Default for InputGate {
+    fn default() -> Self {
+        Self {
+            playing: false,
+            focused: true,
+            quarantine: false,
+            settle: false,
+            down: BTreeSet::new(),
+        }
+    }
+}
+
+impl InputGate {
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    /// A press or a direction step may be applied.
+    pub fn live(&self) -> bool {
+        !self.playing && self.focused && !self.quarantine
+    }
+
+    pub fn begin_playing(&mut self) {
+        self.playing = true;
+        self.quarantine = true;
+    }
+
+    pub fn end_playing(&mut self) {
+        if !self.playing {
+            return;
+        }
+        self.playing = false;
+        self.quarantine = true;
+        self.settle = true;
+    }
+
+    pub fn set_focused(&mut self, focused: bool) {
+        if self.focused == focused {
+            return;
+        }
+        self.focused = focused;
+        self.quarantine = true;
+        if focused {
+            self.settle = true;
+        }
+    }
+
+    /// `down` is a press. Repeats of a button that is already down do not stick the latch.
+    pub fn observe_button(&mut self, button: u16, down: bool) {
+        if down {
+            self.down.insert(button);
+        } else {
+            self.down.remove(&button);
+        }
+    }
+
+    pub fn observe_gilrs(&mut self, event: &EventType) {
+        match event {
+            EventType::ButtonPressed(button, _) | EventType::ButtonRepeated(button, _) => {
+                self.observe_button(*button as u16, true);
+            }
+            EventType::ButtonReleased(button, _) => self.observe_button(*button as u16, false),
+            EventType::ButtonChanged(button, value, _) => {
+                self.observe_button(*button as u16, *value >= 0.5);
+            }
+            _ => {}
+        }
+    }
+
+    /// Call once after this poll's pad events have been observed.
+    /// `axis_held` is a stick that is still away from center.
+    pub fn end_poll(&mut self, axis_held: bool) {
+        if self.playing || !self.focused {
+            self.quarantine = true;
+            return;
+        }
+        if self.settle {
+            self.settle = false;
+            self.quarantine = true;
+            return;
+        }
+        if self.quarantine && self.down.is_empty() && !axis_held {
+            self.quarantine = false;
+        }
+    }
+}
+
+/// `$RETROMARCHY_PAD_HOOK` is a file of `press select` / `release south` lines.
+/// Appended lines are read on the pad poll. Absent or unreadable, this stays idle.
+pub struct PadHook {
+    file: std::fs::File,
+    pending: String,
+}
+
+impl PadHook {
+    pub fn open() -> Option<Self> {
+        let path = std::env::var_os("RETROMARCHY_PAD_HOOK")?;
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!("Pad hook {}: {err}", std::path::Path::new(&path).display());
+                return None;
+            }
+        };
+        Some(Self {
+            file,
+            pending: String::new(),
+        })
+    }
+
+    pub fn poll(&mut self) -> Vec<(Button, bool)> {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        loop {
+            match self.file.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => self.pending.push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+        let mut edges = Vec::new();
+        while let Some(index) = self.pending.find('\n') {
+            let line: String = self.pending.drain(..=index).collect();
+            if let Some(edge) = parse_pad_hook_line(line.trim()) {
+                edges.push(edge);
+            }
+        }
+        edges
+    }
+}
+
+pub fn parse_pad_hook_line(line: &str) -> Option<(Button, bool)> {
+    let mut parts = line.split_whitespace();
+    let edge = parts.next()?;
+    let name = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let down = match edge {
+        "press" => true,
+        "release" => false,
+        _ => return None,
+    };
+    let button = match name {
+        "south" => Button::South,
+        "east" => Button::East,
+        "north" => Button::North,
+        "west" => Button::West,
+        "select" => Button::Select,
+        "start" => Button::Start,
+        "left" => Button::DPadLeft,
+        "right" => Button::DPadRight,
+        "up" => Button::DPadUp,
+        "down" => Button::DPadDown,
+        _ => return None,
+    };
+    Some((button, down))
 }
 
 /// One FlowBox child's allocation, in sibling order.
@@ -394,5 +570,185 @@ mod tests {
         assert_eq!(line_columns(&six, 6), 6);
         assert_eq!(line_columns(&[], 6), 6);
         assert_eq!(line_columns(&[FlowTile { y: 0, height: 0 }], 6), 6);
+    }
+
+    const SELECT: u16 = Button::Select as u16;
+    const SOUTH: u16 = Button::South as u16;
+
+    /// Observe one edge the way the shell does, and report whether that edge may act.
+    fn act(gate: &mut InputGate, button: u16, down: bool) -> bool {
+        gate.observe_button(button, down);
+        gate.live()
+    }
+
+    #[test]
+    fn playing_drops_pad_actions() {
+        let mut gate = InputGate::default();
+        assert!(gate.live());
+        gate.begin_playing();
+        assert!(gate.is_playing());
+        assert!(!act(&mut gate, SOUTH, true));
+        assert!(!act(&mut gate, SOUTH, false));
+        assert!(!gate.live());
+    }
+
+    #[test]
+    fn select_held_across_exit_cannot_open_the_menu() {
+        let mut gate = InputGate::default();
+        gate.begin_playing();
+        assert!(!act(&mut gate, SELECT, true));
+        gate.end_playing();
+        assert!(!gate.is_playing());
+        gate.end_poll(false);
+        assert!(!gate.live());
+        gate.end_poll(false);
+        assert!(!gate.live());
+        assert!(!act(&mut gate, SELECT, false));
+        gate.end_poll(false);
+        assert!(gate.live());
+        assert!(act(&mut gate, SELECT, true));
+    }
+
+    #[test]
+    fn a_press_queued_after_exit_is_dropped_until_that_button_is_released() {
+        let mut gate = InputGate::default();
+        gate.begin_playing();
+        gate.end_playing();
+        gate.end_poll(false);
+        assert!(!gate.live());
+        assert!(!act(&mut gate, SELECT, true));
+        gate.end_poll(false);
+        assert!(!gate.live());
+        assert!(!act(&mut gate, SELECT, false));
+        gate.end_poll(false);
+        assert!(gate.live());
+    }
+
+    #[test]
+    fn a_fresh_press_after_the_pad_is_clear_is_delivered() {
+        let mut gate = InputGate::default();
+        gate.begin_playing();
+        assert!(!act(&mut gate, SOUTH, true));
+        assert!(!act(&mut gate, SOUTH, false));
+        gate.end_playing();
+        gate.end_poll(false);
+        assert!(!gate.live());
+        gate.end_poll(false);
+        assert!(gate.live());
+        assert!(act(&mut gate, SOUTH, true));
+    }
+
+    #[test]
+    fn an_unfocused_window_drops_pad_actions_until_buttons_are_up() {
+        let mut gate = InputGate::default();
+        gate.set_focused(false);
+        assert!(!act(&mut gate, SELECT, true));
+        gate.set_focused(true);
+        assert!(!gate.live());
+        gate.end_poll(false);
+        assert!(!gate.live());
+        assert!(!act(&mut gate, SELECT, false));
+        gate.end_poll(false);
+        assert!(gate.live());
+    }
+
+    #[test]
+    fn focus_returning_during_play_stays_closed_until_the_game_and_the_pad_are_done() {
+        let mut gate = InputGate::default();
+        gate.begin_playing();
+        gate.set_focused(false);
+        gate.set_focused(true);
+        gate.end_poll(false);
+        assert!(!gate.live());
+        assert!(!act(&mut gate, SELECT, true));
+        gate.end_playing();
+        gate.end_poll(false);
+        assert!(!gate.live());
+        assert!(!act(&mut gate, SELECT, false));
+        gate.end_poll(false);
+        assert!(gate.live());
+    }
+
+    #[test]
+    fn a_held_stick_keeps_the_gate_closed_after_exit() {
+        let mut gate = InputGate::default();
+        gate.begin_playing();
+        gate.end_playing();
+        gate.end_poll(false);
+        gate.end_poll(true);
+        assert!(!gate.live());
+        gate.end_poll(false);
+        assert!(gate.live());
+    }
+
+    #[test]
+    fn a_repeated_press_does_not_stick_the_latch() {
+        let mut gate = InputGate::default();
+        gate.begin_playing();
+        gate.observe_button(SELECT, true);
+        gate.observe_button(SELECT, true);
+        gate.observe_button(SELECT, false);
+        gate.end_playing();
+        gate.end_poll(false);
+        gate.end_poll(false);
+        assert!(gate.live());
+    }
+
+    #[test]
+    fn ending_a_session_that_is_not_playing_does_not_latch() {
+        let mut gate = InputGate::default();
+        gate.end_playing();
+        gate.end_poll(false);
+        assert!(gate.live());
+        gate.set_focused(true);
+        assert!(gate.live());
+    }
+
+    #[test]
+    fn pad_hook_lines_are_presses_and_releases() {
+        assert_eq!(
+            parse_pad_hook_line("press select"),
+            Some((Button::Select, true))
+        );
+        assert_eq!(
+            parse_pad_hook_line("release south"),
+            Some((Button::South, false))
+        );
+        assert_eq!(
+            parse_pad_hook_line("press right"),
+            Some((Button::DPadRight, true))
+        );
+        assert_eq!(parse_pad_hook_line("press select extra"), None);
+        assert_eq!(parse_pad_hook_line(""), None);
+        assert_eq!(parse_pad_hook_line("hold select"), None);
+    }
+
+    #[test]
+    fn pad_hook_reads_lines_appended_after_open() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pad");
+        std::fs::write(&path, "").unwrap();
+        let mut hook = PadHook {
+            file: std::fs::File::open(&path).unwrap(),
+            pending: String::new(),
+        };
+        assert!(hook.poll().is_empty());
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(writer, "press select").unwrap();
+        writeln!(writer, "release select").unwrap();
+        writeln!(writer, "bogus").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(
+            hook.poll(),
+            vec![(Button::Select, true), (Button::Select, false)]
+        );
+        assert!(hook.poll().is_empty());
+        writeln!(writer, "press south").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(hook.poll(), vec![(Button::South, true)]);
     }
 }
