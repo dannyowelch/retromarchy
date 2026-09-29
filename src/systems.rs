@@ -259,6 +259,17 @@ impl Systems {
         }
     }
 
+    /// Add system follows Enter. Other rows only move the selection.
+    pub fn click_row(&mut self, index: usize) -> Step {
+        let add = index == self.rows.len();
+        self.select(index);
+        if add && self.adding() {
+            self.confirm()
+        } else {
+            Step::Stay
+        }
+    }
+
     pub fn aim(&mut self, field: Field) {
         if self.adding() || self.rows.is_empty() || self.confirm.is_some() {
             return;
@@ -1563,6 +1574,44 @@ mod tests {
         );
         assert_eq!(config.consoles[0].grid_art, GridArt::Screenshot);
         assert!(config.consoles[0].media.manual);
+    }
+
+    #[test]
+    fn clicking_add_system_opens_the_type_list_like_enter() {
+        let mut clicked = screen();
+        let index = clicked.rows().len();
+        assert!(clicked.list_rows()[index].add);
+        assert_eq!(clicked.click_row(index), Step::Stay);
+        assert!(clicked.panel().adding);
+        assert!(!clicked.list_focused());
+        let menu = clicked.panel().type_menu.expect("type list");
+        assert_eq!(menu.cursor, 0);
+
+        let mut keyed = screen();
+        keyed.move_dir(NavDir::Down);
+        assert_eq!(keyed.confirm(), Step::Stay);
+        assert_eq!(
+            clicked.panel().type_menu.unwrap().items.len(),
+            keyed.panel().type_menu.unwrap().items.len()
+        );
+    }
+
+    #[test]
+    fn clicking_a_system_row_selects_it_and_stays_on_the_list() {
+        let mut config = Config::default();
+        config.emulators.push(retroarch());
+        config.consoles.push(snes());
+        let mut nes = snes();
+        nes.id = "nes".into();
+        nes.name = "NES".into();
+        config.consoles.push(nes);
+        let mut screen = Systems::open(&config, vec![catalog()]);
+        assert_eq!(screen.click_row(1), Step::Stay);
+        assert!(screen.list_focused());
+        assert!(screen.list_rows()[1].selected);
+        assert!(!screen.list_rows()[0].selected);
+        assert!(!screen.panel().adding);
+        assert!(screen.panel().type_menu.is_none());
     }
 
     #[test]
