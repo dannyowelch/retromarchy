@@ -217,4 +217,4 @@ Cut a release by bumping the version, tagging that same number, and pushing the 
 3. Tag it `vX.Y.Z` (`v0.1.0` for version `0.1.0`).
 4. Push the tag. The Release workflow runs `cargo build --release --locked` in an Arch Linux container (`archlinux:base-devel`), so the system libraries match Omarchy, then publishes the package, the tarball, and `SHA256SUMS`.
 
-The workflow refuses a tag that does not match `Cargo.toml`. Actions → Release → Run workflow builds the same artifacts and uploads them without publishing a GitHub Release.
+The workflow refuses a tag that does not match `Cargo.toml`. Actions → Release → Run workflow builds the same artifacts and uploads them without publishing a GitHub Release when `tag` is empty. Set `tag` to an existing tag, for example `v0.1.0`, to check out that tag, check it against `Cargo.toml`, and publish the same three assets. Running the workflow again for that tag replaces the assets.
