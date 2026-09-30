@@ -59,9 +59,9 @@ if command -v makepkg >/dev/null 2>&1; then
       useradd --create-home --user-group builder
     fi
     chown -R builder "$arch_dir"
-    (cd "$arch_dir" && runuser -u builder -- makepkg -f --noconfirm --nosign)
+    (cd "$arch_dir" && runuser -u builder -- makepkg -f --noconfirm --nosign --nodeps)
   else
-    (cd "$arch_dir" && makepkg -f --noconfirm --nosign)
+    (cd "$arch_dir" && makepkg -f --noconfirm --nosign --nodeps)
   fi
   if [[ ! -f "${arch_dir}/${pkgfile}" ]]; then
     printf 'makepkg did not produce %s\n' "$pkgfile" >&2
