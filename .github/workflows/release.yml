@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build x86_64 Linux
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --needed --noconfirm \
+            clang \
+            desktop-file-utils \
+            fontconfig \
+            freetype2 \
+            git \
+            libxcb \
+            libxkbcommon \
+            libxkbcommon-x11 \
+            pkgconf \
+            rust \
+            systemd-libs \
+            wayland
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require the tag to match Cargo.toml
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          version="${version%%$'\n'*}"
+          if [[ "$tag" != "$version" ]]; then
+            printf 'tag v%s does not match Cargo.toml version %s\n' "$tag" "$version" >&2
+            exit 1
+          fi
+
+      - name: Build
+        env:
+          LIBCLANG_PATH: /usr/lib
+        run: cargo build --release --locked
+
+      - name: Package
+        run: packaging/build-release-assets.sh
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          if-no-files-found: error
+          path: |
+            dist/*.pkg.tar.zst
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.pkg.tar.zst
+            dist/*.tar.gz
+            dist/SHA256SUMS

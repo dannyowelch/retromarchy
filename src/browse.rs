@@ -184,11 +184,46 @@ fn shelf_from_disk(
     shelf(console.clone(), metadata, games, stats)
 }
 
+const DEMO_BOX_PNG: &[u8] = include_bytes!("../resources/demo/snes-box.png");
+const DEMO_SHOT_PNG: &[u8] = include_bytes!("../resources/demo/snes-shot.png");
+
+fn demo_art_dirs() -> Vec<PathBuf> {
+    // Tests swap XDG_* for the process. A cache path would be deleted under them.
+    #[cfg(test)]
+    {
+        return vec![std::env::temp_dir().join("retromarchy-demo-test")];
+    }
+    #[cfg(not(test))]
+    {
+        let mut dirs = Vec::new();
+        if let Some(dir) = xdg::BaseDirectories::with_prefix("retromarchy")
+            .ok()
+            .and_then(|base| base.create_cache_directory("demo").ok())
+        {
+            dirs.push(dir);
+        }
+        dirs.push(std::env::temp_dir().join("retromarchy-demo"));
+        dirs
+    }
+}
+
+fn bundled_demo_art(name: &str, bytes: &[u8]) -> PathBuf {
+    for dir in demo_art_dirs() {
+        let path = dir.join(name);
+        if std::fs::read(&path).ok().as_deref() == Some(bytes) {
+            return path;
+        }
+        if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&path, bytes).is_ok() {
+            return path;
+        }
+    }
+    std::env::temp_dir().join("retromarchy-demo").join(name)
+}
+
 pub fn demo_library(note: &str) -> Library {
     let metadata = config::load_console_metadata().unwrap_or_default();
-    let demo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/demo");
-    let box_art = demo_dir.join("snes-box.png");
-    let shot = demo_dir.join("snes-shot.png");
+    let box_art = bundled_demo_art("snes-box.png", DEMO_BOX_PNG);
+    let shot = bundled_demo_art("snes-shot.png", DEMO_SHOT_PNG);
     let mario = with_art(
         demo_game("snes", "Super Mario World", 12, 5400, Some(demo_played())),
         &box_art,
@@ -1776,6 +1811,21 @@ mod tests {
         assert!(browse.details_open);
         browse.apply(Key::ToggleDetails);
         assert!(!browse.details_open);
+    }
+
+    #[test]
+    fn demo_placeholder_art_is_bundled_outside_the_source_tree() {
+        let library = demo_library("Demo library.");
+        let mario = library.shelves[0]
+            .games
+            .iter()
+            .find(|game| game.display_title() == "Super Mario World")
+            .unwrap();
+        let box_art = file_for(mario, MediaKind::BoxArt).expect("box art file");
+        let shot = file_for(mario, MediaKind::Screenshot).expect("screenshot file");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(!box_art.starts_with(root), "{}", box_art.display());
+        assert!(!shot.starts_with(root), "{}", shot.display());
     }
 
     #[test]

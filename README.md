@@ -2,6 +2,55 @@
 
 A LaunchBox-style retro game launcher for Omarchy (Arch + Hyprland). The window is a GPUI shell built on [gpui-omarchy](https://github.com/huacnlee/gpui-omarchy).
 
+## Install
+
+Arch Linux, including Omarchy:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dannyowelch/retromarchy/main/install.sh | bash
+```
+
+That downloads the latest GitHub release and installs `retromarchy-<version>-1-x86_64.pkg.tar.zst` with `sudo pacman -U`. RetroArch is optional. A Vulkan driver is still required: `vulkan-radeon`, `vulkan-intel`, or the NVIDIA Vulkan package.
+
+The same command on another distro installs the tarball under `~/.local` (`bin`, `applications`, and `icons`). It rewrites `Exec` to `~/.local/bin/retromarchy`, so the desktop entry does not depend on the working directory or on `~/.local/bin` being on `PATH`.
+
+Manual package install, after checking `SHA256SUMS` from the same release:
+
+```bash
+ver=0.1.0
+curl -fLO "https://github.com/dannyowelch/retromarchy/releases/download/v${ver}/retromarchy-${ver}-1-x86_64.pkg.tar.zst"
+curl -fLO "https://github.com/dannyowelch/retromarchy/releases/download/v${ver}/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS
+sudo pacman -U "retromarchy-${ver}-1-x86_64.pkg.tar.zst"
+```
+
+Manual tarball install. This copy of the desktop file keeps `Exec=retromarchy`, so `~/.local/bin` has to be on `PATH`:
+
+```bash
+ver=0.1.0
+curl -fLO "https://github.com/dannyowelch/retromarchy/releases/download/v${ver}/retromarchy-${ver}-x86_64-linux.tar.gz"
+tar -xzf "retromarchy-${ver}-x86_64-linux.tar.gz"
+install -Dm755 "retromarchy-${ver}-x86_64-linux/retromarchy" ~/.local/bin/retromarchy
+install -Dm644 "retromarchy-${ver}-x86_64-linux/retromarchy.desktop" ~/.local/share/applications/retromarchy.desktop
+install -Dm644 "retromarchy-${ver}-x86_64-linux/retromarchy.png" ~/.local/share/icons/hicolor/256x256/apps/retromarchy.png
+```
+
+Uninstall removes the pacman package when it is installed, and removes the `~/.local` files either way:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dannyowelch/retromarchy/main/install.sh | bash -s -- uninstall
+```
+
+### Config and data
+
+The first launch creates a default config when the file is missing. Paths come from the XDG base directories, not from the directory the app was started in. `~` in a ROM folder expands with `HOME`.
+
+- Config: `~/.config/retromarchy/config.toml` (`$XDG_CONFIG_HOME/retromarchy/config.toml`)
+- Library: `~/.local/share/retromarchy/library.db` (`$XDG_DATA_HOME/retromarchy/library.db`)
+- Scraped artwork: `~/.local/share/retromarchy/media/`
+
+The file format is in [Data](#data). `config.example.toml` is a commented sample.
+
 ## Prerequisites
 
 Install Rust, a C compiler, and pkg-config (`base-devel` on Arch). Then install the libraries the GPUI shell links or loads:
@@ -32,7 +81,7 @@ The window has three panes.
 2. The center pane is a game grid for the selected console. The status-bar **Art** control (or `1` / `2`) picks that console's `grid_art`: box art or screenshot. A tile uses that file when it exists, then the other image. Otherwise it shows initials. Card height follows the slot (3:4 box, 4:3 screenshot). The console name sits under the title.
 3. The right pane shows console stats when no game is selected. Select a game and it shows the title, console, play stats, ROM path, CRC32, box art, and screenshot.
 
-If the config has no consoles, the center pane is empty and offers **Manage Systems**. That is the first-run screen. The in-memory demo still appears when the config file or the library database cannot be opened, and it is labeled **Demo library**. The demo does not write games into your library. Placeholder art for one Super Nintendo row lives in `resources/demo/`. Those files are not ROMs.
+If the config has no consoles, the center pane is empty and offers **Manage Systems**. That is the first-run screen. The in-memory demo still appears when the config file or the library database cannot be opened, and it is labeled **Demo library**. The demo does not write games into your library. Placeholder art for one Super Nintendo row is compiled in from `resources/demo/` and written to `~/.cache/retromarchy/demo/` (`$XDG_CACHE_HOME/retromarchy/demo/`) when that library is shown. Those files are not ROMs.
 
 ## Keys
 
@@ -73,3 +122,20 @@ An emulator is `id`, `name`, `kind` (`RetroArch` or `Standalone`), `path`, `glob
 `config.example.toml` is a commented sample of the config file. The first run still creates a default config when the file is missing.
 
 This repository does not include a `LICENSE` file. `resources/systems.json` is derived from EmulationStation Desktop Edition. See `ATTRIBUTION.md`.
+
+## Release
+
+Published file names use the `name` and `version` fields in `Cargo.toml`. For `0.1.0` the release contains:
+
+- `retromarchy-0.1.0-1-x86_64.pkg.tar.zst`
+- `retromarchy-0.1.0-x86_64-linux.tar.gz`
+- `SHA256SUMS`
+
+Cut a release by bumping the version, tagging that same number, and pushing the tag:
+
+1. Set `version` in `Cargo.toml` to `X.Y.Z`.
+2. Commit the change.
+3. Tag it `vX.Y.Z` (`v0.1.0` for version `0.1.0`).
+4. Push the tag. The Release workflow runs `cargo build --release --locked` in an Arch Linux container, so the system libraries match Omarchy, then publishes the package, the tarball, and `SHA256SUMS`.
+
+The workflow refuses a tag that does not match `Cargo.toml`. Actions → Release → Run workflow builds the same artifacts and uploads them without publishing a GitHub Release.
