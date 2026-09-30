@@ -2,6 +2,21 @@
 
 A LaunchBox-style retro game launcher for Omarchy (Arch + Hyprland). The window is a GPUI shell built on [gpui-omarchy](https://github.com/huacnlee/gpui-omarchy).
 
+![Main screen: Sony PlayStation selected, 3x3 game grid, Ape Escape in the details pane](docs/screenshots/main-screen.png)
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="docs/screenshots/manage-systems.png" alt="Manage Systems: Sony PlayStation configuration" width="100%"><br>
+      Manage Systems
+    </td>
+    <td width="50%" align="center">
+      <img src="docs/screenshots/manage-emulators.png" alt="Manage Emulators: RetroArch configuration and core list" width="100%"><br>
+      Manage Emulators
+    </td>
+  </tr>
+</table>
+
 ## Install
 
 Releases are x86_64. When `/etc/os-release` has `ID=arch` or `ID_LIKE` contains `arch`, and `pacman` is installed, the installer downloads the latest GitHub Release, checks `SHA256SUMS`, and runs `pacman -U`. Anywhere else it checks the same sums and unpacks the tarball under `~/.local`. It rewrites `Exec` to `~/.local/bin/retromarchy`, so the desktop entry does not depend on the working directory or on `~/.local/bin` being on `PATH`.
