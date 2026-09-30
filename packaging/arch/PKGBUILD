@@ -1,0 +1,43 @@
+# Maintainer: Danny Welch <https://github.com/dannyowelch>
+_manifest="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/Cargo.toml"
+pkgname="$(sed -n 's/^name = "\([^"]*\)"/\1/p' "$_manifest")"
+pkgver="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$_manifest")"
+pkgname="${pkgname%%$'\n'*}"
+pkgver="${pkgver%%$'\n'*}"
+pkgrel=1
+pkgdesc='LaunchBox-style retro game launcher for Omarchy'
+arch=('x86_64')
+url='https://github.com/dannyowelch/retromarchy'
+license=('unknown')
+depends=(
+  'ca-certificates'
+  'fontconfig'
+  'freetype2'
+  'libglvnd'
+  'libxcb'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'systemd-libs'
+  'vulkan-icd-loader'
+  'wayland'
+)
+optdepends=(
+  'retroarch: play ROMs through RetroArch'
+  'vulkan-radeon: Vulkan driver for AMD GPUs'
+  'vulkan-intel: Vulkan driver for Intel GPUs'
+  'nvidia-utils: Vulkan driver for NVIDIA GPUs'
+)
+options=('!debug')
+source=("$pkgname" "$pkgname.desktop" "$pkgname.png")
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+if [[ -z "${pkgname}" || -z "${pkgver}" ]]; then
+  printf 'PKGBUILD: Cargo.toml is missing name or version\n' >&2
+  exit 1
+fi
+
+package() {
+  install -Dm755 "${srcdir}/${pkgname}" "${pkgdir}/usr/bin/${pkgname}"
+  install -Dm644 "${srcdir}/${pkgname}.desktop" "${pkgdir}/usr/share/applications/${pkgname}.desktop"
+  install -Dm644 "${srcdir}/${pkgname}.png" "${pkgdir}/usr/share/icons/hicolor/256x256/apps/${pkgname}.png"
+}

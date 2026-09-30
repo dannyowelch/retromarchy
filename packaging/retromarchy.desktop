@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Retromarchy
+Comment=Retro game launcher for Omarchy
+Exec=retromarchy
+Icon=retromarchy
+Terminal=false
+Categories=Game;Emulator;
+StartupWMClass=org.omarchy.Retromarchy
