@@ -1,0 +1,58 @@
+# Maintainer: Danny Welch <https://github.com/dannyowelch>
+pkgname=retromarchy
+pkgver=0.1.1
+pkgrel=1
+pkgdesc='LaunchBox-style retro game launcher for Omarchy'
+arch=('x86_64')
+url='https://github.com/dannyowelch/retromarchy'
+license=('unknown')
+conflicts=('retromarchy-bin')
+depends=(
+  'ca-certificates'
+  'fontconfig'
+  'freetype2'
+  'libglvnd'
+  'libxcb'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'systemd-libs'
+  'vulkan-icd-loader'
+  'wayland'
+)
+makedepends=(
+  'cargo'
+  'clang'
+  'git'
+  'pkgconf'
+)
+optdepends=(
+  'retroarch: play ROMs through RetroArch'
+  'vulkan-radeon: Vulkan driver for AMD GPUs'
+  'vulkan-intel: Vulkan driver for Intel GPUs'
+  'nvidia-utils: Vulkan driver for NVIDIA GPUs'
+)
+options=('!debug' '!lto')
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/dannyowelch/retromarchy/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('da756506bcee37733b2680e6ca7cb1ade03216a515e39d324626a62387e8c90e')
+
+prepare() {
+  export RUSTUP_TOOLCHAIN=stable
+  cd "${pkgname}-${pkgver}"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # bindgen (pulled in by gpui) needs libclang. The release workflow sets this too.
+  export LIBCLANG_PATH=/usr/lib
+  cd "${pkgname}-${pkgver}"
+  cargo build --release --locked
+}
+
+package() {
+  cd "${pkgname}-${pkgver}"
+  install -Dm755 "target/release/${pkgname}" "${pkgdir}/usr/bin/${pkgname}"
+  install -Dm644 "packaging/${pkgname}.desktop" "${pkgdir}/usr/share/applications/${pkgname}.desktop"
+  install -Dm644 "packaging/${pkgname}.png" "${pkgdir}/usr/share/icons/hicolor/256x256/apps/${pkgname}.png"
+}

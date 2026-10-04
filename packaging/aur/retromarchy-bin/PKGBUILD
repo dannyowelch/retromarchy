@@ -1,0 +1,38 @@
+# Maintainer: Danny Welch <https://github.com/dannyowelch>
+pkgname=retromarchy-bin
+pkgver=0.1.1
+pkgrel=1
+pkgdesc='LaunchBox-style retro game launcher for Omarchy'
+arch=('x86_64')
+url='https://github.com/dannyowelch/retromarchy'
+license=('unknown')
+provides=('retromarchy')
+conflicts=('retromarchy')
+depends=(
+  'ca-certificates'
+  'fontconfig'
+  'freetype2'
+  'libglvnd'
+  'libxcb'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'systemd-libs'
+  'vulkan-icd-loader'
+  'wayland'
+)
+optdepends=(
+  'retroarch: play ROMs through RetroArch'
+  'vulkan-radeon: Vulkan driver for AMD GPUs'
+  'vulkan-intel: Vulkan driver for Intel GPUs'
+  'nvidia-utils: Vulkan driver for NVIDIA GPUs'
+)
+options=('!debug')
+source=("https://github.com/dannyowelch/retromarchy/releases/download/v${pkgver}/retromarchy-${pkgver}-x86_64-linux.tar.gz")
+sha256sums=('008785fb492084b545db4379dc19125e9bfb09bc3a42ffe810376bccd32dc538')
+
+package() {
+  cd "retromarchy-${pkgver}-x86_64-linux"
+  install -Dm755 retromarchy "${pkgdir}/usr/bin/retromarchy"
+  install -Dm644 retromarchy.desktop "${pkgdir}/usr/share/applications/retromarchy.desktop"
+  install -Dm644 retromarchy.png "${pkgdir}/usr/share/icons/hicolor/256x256/apps/retromarchy.png"
+}

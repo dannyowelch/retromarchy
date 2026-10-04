@@ -43,6 +43,17 @@ sudo pacman -U "retromarchy-${ver}-1-x86_64.pkg.tar.zst"
 
 The package installs `/usr/bin/retromarchy`, the desktop file, and the icon.
 
+### AUR
+
+Available once the packages have been published to the AUR. `retromarchy-bin` installs the GitHub release tarball. `retromarchy` builds the tagged source. Installing one removes the other.
+
+```bash
+yay -S retromarchy-bin
+yay -S retromarchy
+```
+
+Publishing steps are in `packaging/aur/README.md`.
+
 ### Tarball
 
 This copy of the desktop file keeps `Exec=retromarchy`, so `~/.local/bin` has to be on `PATH`:
@@ -234,3 +245,5 @@ Cut a release by bumping the version, tagging that same number, and pushing the 
 4. Push the tag. The Release workflow runs `cargo build --release --locked` in an Arch Linux container (`archlinux:base-devel`), so the system libraries match Omarchy, then publishes the package, the tarball, and `SHA256SUMS`.
 
 The workflow refuses a tag that does not match `Cargo.toml`. Actions → Release → Run workflow builds the same artifacts and uploads them without publishing a GitHub Release when `tag` is empty. Set `tag` to an existing tag, for example `v0.1.1`, to check out that tag, check it against `Cargo.toml`, and publish the same three assets. Running the workflow again for that tag replaces the assets.
+
+When that workflow finishes publishing a release, `.github/workflows/aur.yml` updates the AUR packages. It skips if the `AUR_SSH_PRIVATE_KEY` secret is not set. See `packaging/aur/README.md`.
