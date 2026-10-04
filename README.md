@@ -31,10 +31,10 @@ The Arch package also depends on `ca-certificates`, `fontconfig`, `freetype2`, `
 
 ### Arch package
 
-From the [Releases](https://github.com/dannyowelch/retromarchy/releases) page, after checking `SHA256SUMS` from the same release. `0.1.0` is the version in `Cargo.toml`:
+From the [Releases](https://github.com/dannyowelch/retromarchy/releases) page, after checking `SHA256SUMS` from the same release. `0.1.1` is the version in `Cargo.toml`:
 
 ```bash
-ver=0.1.0
+ver=0.1.1
 curl -fLO "https://github.com/dannyowelch/retromarchy/releases/download/v${ver}/retromarchy-${ver}-1-x86_64.pkg.tar.zst"
 curl -fLO "https://github.com/dannyowelch/retromarchy/releases/download/v${ver}/SHA256SUMS"
 sha256sum -c --ignore-missing SHA256SUMS
@@ -48,7 +48,7 @@ The package installs `/usr/bin/retromarchy`, the desktop file, and the icon.
 This copy of the desktop file keeps `Exec=retromarchy`, so `~/.local/bin` has to be on `PATH`:
 
 ```bash
-ver=0.1.0
+ver=0.1.1
 curl -fLO "https://github.com/dannyowelch/retromarchy/releases/download/v${ver}/retromarchy-${ver}-x86_64-linux.tar.gz"
 curl -fLO "https://github.com/dannyowelch/retromarchy/releases/download/v${ver}/SHA256SUMS"
 sha256sum -c --ignore-missing SHA256SUMS
@@ -217,10 +217,10 @@ This repository does not include a `LICENSE` file. `resources/systems.json` is d
 
 ## Release
 
-Published file names use the `name` and `version` fields in `Cargo.toml`. A published `vX.Y.Z` release contains, for version `0.1.0`:
+Published file names use the `name` and `version` fields in `Cargo.toml`. A published `vX.Y.Z` release contains, for version `0.1.1`:
 
-- `retromarchy-0.1.0-1-x86_64.pkg.tar.zst`
-- `retromarchy-0.1.0-x86_64-linux.tar.gz`
+- `retromarchy-0.1.1-1-x86_64.pkg.tar.zst`
+- `retromarchy-0.1.1-x86_64-linux.tar.gz`
 - `SHA256SUMS`
 
 `install.sh` reads the latest release tag from the GitHub API. The tag has to start with `v`.
@@ -229,7 +229,7 @@ Cut a release by bumping the version, tagging that same number, and pushing the 
 
 1. Set `version` in `Cargo.toml` to `X.Y.Z`.
 2. Commit the change.
-3. Tag it `vX.Y.Z` (`v0.1.0` for version `0.1.0`).
+3. Tag it `vX.Y.Z` (`v0.1.1` for version `0.1.1`).
 4. Push the tag. The Release workflow runs `cargo build --release --locked` in an Arch Linux container (`archlinux:base-devel`), so the system libraries match Omarchy, then publishes the package, the tarball, and `SHA256SUMS`.
 
-The workflow refuses a tag that does not match `Cargo.toml`. Actions → Release → Run workflow builds the same artifacts and uploads them without publishing a GitHub Release when `tag` is empty. Set `tag` to an existing tag, for example `v0.1.0`, to check out that tag, check it against `Cargo.toml`, and publish the same three assets. Running the workflow again for that tag replaces the assets.
+The workflow refuses a tag that does not match `Cargo.toml`. Actions → Release → Run workflow builds the same artifacts and uploads them without publishing a GitHub Release when `tag` is empty. Set `tag` to an existing tag, for example `v0.1.1`, to check out that tag, check it against `Cargo.toml`, and publish the same three assets. Running the workflow again for that tag replaces the assets.
