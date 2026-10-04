@@ -106,3 +106,15 @@ jobs:
             dist/*.pkg.tar.zst
             dist/*.tar.gz
             dist/SHA256SUMS
+
+      - name: Record the published tag
+        env:
+          RELEASE_TAG: ${{ (github.event_name == 'workflow_dispatch' && inputs.tag != '') && inputs.tag || github.ref_name }}
+        run: printf '%s\n' "$RELEASE_TAG" > "${RUNNER_TEMP}/RELEASE_TAG"
+
+      - name: Upload the published tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: aur-release-tag
+          if-no-files-found: error
+          path: ${{ runner.temp }}/RELEASE_TAG

@@ -1,0 +1,99 @@
+name: AUR
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: aur-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish AUR packages
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Skip when AUR_SSH_PRIVATE_KEY is unset
+        id: secret
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${AUR_SSH_PRIVATE_KEY}" ]]; then
+            printf 'AUR_SSH_PRIVATE_KEY is not set; skipping AUR publish.\n'
+            echo "::notice::AUR_SSH_PRIVATE_KEY is not set; skipping AUR publish."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install tools
+        if: steps.secret.outputs.skip != 'true'
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --needed --noconfirm ca-certificates curl git jq openssh
+
+      - name: Decide whether this release should publish
+        id: qualify
+        if: steps.secret.outputs.skip != 'true'
+        env:
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$RUN_CONCLUSION" != "success" ]]; then
+            printf 'Release workflow conclusion is %s; skipping AUR publish.\n' "$RUN_CONCLUSION"
+            echo "::notice::Release workflow conclusion is ${RUN_CONCLUSION}; skipping AUR publish."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          jobs_json=$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100")
+          conclusion=$(printf '%s' "$jobs_json" | jq -r '.jobs[] | select(.name=="Publish GitHub Release") | .conclusion')
+          if [[ "$conclusion" != "success" ]]; then
+            printf 'Release publish job is %s; skipping AUR publish.\n' "${conclusion:-absent}"
+            echo "::notice::Release publish job is ${conclusion:-absent}; skipping AUR publish."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.secret.outputs.skip != 'true' && steps.qualify.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download the published tag
+        if: steps.secret.outputs.skip != 'true' && steps.qualify.outputs.skip != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: aur-release-tag
+          path: aur-tag
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Publish to the AUR
+        if: steps.secret.outputs.skip != 'true' && steps.qualify.outputs.skip != 'true'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_GIT_NAME: ${{ vars.AUR_GIT_NAME }}
+          AUR_GIT_EMAIL: ${{ vars.AUR_GIT_EMAIL }}
+        run: |
+          set -euo pipefail
+          tag=$(tr -d '[:space:]' < aur-tag/RELEASE_TAG)
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'published tag %s is not vX.Y.Z\n' "$tag" >&2
+            exit 1
+          fi
+          packaging/aur/publish.sh "$tag"

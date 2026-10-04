@@ -9,3 +9,11 @@ test-screenshot-*.png
 /packaging/arch/retromarchy
 /packaging/arch/retromarchy.desktop
 /packaging/arch/retromarchy.png
+/packaging/aur/retromarchy/src/
+/packaging/aur/retromarchy/pkg/
+/packaging/aur/retromarchy/*.tar.gz
+/packaging/aur/retromarchy/*.pkg.tar.*
+/packaging/aur/retromarchy-bin/src/
+/packaging/aur/retromarchy-bin/pkg/
+/packaging/aur/retromarchy-bin/*.tar.gz
+/packaging/aur/retromarchy-bin/*.pkg.tar.*
