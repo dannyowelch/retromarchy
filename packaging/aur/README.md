@@ -2,7 +2,9 @@
 
 `retromarchy-bin` installs the GitHub release tarball. `retromarchy` builds the tagged source. They are not on the AUR until the first push below.
 
-This repository has no `LICENSE` file. Both packages set `license=('unknown')`, the same placeholder as `packaging/arch/PKGBUILD`. Nothing is installed under `/usr/share/licenses`.
+This repository has no `LICENSE` file. `packaging/arch/PKGBUILD` uses `license=('unknown')`. Current namcap rejects that string, so these packages use `license=('LicenseRef-unknown')`. Nothing is installed under `/usr/share/licenses`.
+
+Runtime dependencies match `packaging/arch/PKGBUILD`, plus `hicolor-icon-theme` because the icon is installed into the hicolor theme.
 
 ## One-time setup
 
@@ -54,7 +56,7 @@ The AUR allows automated PKGBUILD updates at the maintainer's risk. A release th
 - Rust edition is 2021. `rust-toolchain.toml` sets `channel = "stable"`. `Cargo.toml` has no `rust-version`. The PKGBUILD exports `RUSTUP_TOOLCHAIN=stable`, which is a no-op on Arch's `cargo` package and selects stable when rustup is installed.
 - `gpui-omarchy` 0.1.2 and every other entry in `Cargo.lock` come from crates.io. There are no git dependencies. `prepare()` runs `cargo fetch --locked` (with the host target) so the download happens before `build()`. A git dependency added later is fetched in that same step. `build()` runs `cargo build --release --locked` with `CARGO_TARGET_DIR=target`, matching the release workflow.
 - `makedepends` are the release workflow's compile tools that are not already runtime dependencies: `cargo`, `clang`, `git`, and `pkgconf`. `desktop-file-utils` is only used to validate the desktop file while packing GitHub release assets. `LIBCLANG_PATH=/usr/lib` matches the release workflow because gpui's bindgen needs libclang.
-- Runtime `depends` and `optdepends` match `packaging/arch/PKGBUILD`.
+- Runtime `depends` and `optdepends` match `packaging/arch/PKGBUILD`, plus `hicolor-icon-theme`.
 
 Refresh the committed files locally from Arch, or from `archlinux:base-devel`:
 

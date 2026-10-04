@@ -5,13 +5,14 @@ pkgrel=1
 pkgdesc='LaunchBox-style retro game launcher for Omarchy'
 arch=('x86_64')
 url='https://github.com/dannyowelch/retromarchy'
-license=('unknown')
+license=('LicenseRef-unknown')
 provides=('retromarchy')
 conflicts=('retromarchy')
 depends=(
   'ca-certificates'
   'fontconfig'
   'freetype2'
+  'hicolor-icon-theme'
   'libglvnd'
   'libxcb'
   'libxkbcommon'
