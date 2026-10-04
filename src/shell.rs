@@ -84,10 +84,13 @@ pub struct Shell {
     systems: Option<Systems>,
     options: Option<Options>,
     emulator_scroll: ScrollHandle,
+    emulator_revealed: split::RevealedList,
     systems_scroll: ScrollHandle,
+    systems_revealed: split::RevealedList,
     picker_scroll: ScrollHandle,
     picker_mark: Option<(SystemField, usize)>,
     options_scroll: ScrollHandle,
+    options_revealed: split::RevealedList,
     /// Closing the dialog drops whatever control had focus. The next frame
     /// puts the keyboard back on the shell.
     refocus: bool,
@@ -195,10 +198,13 @@ impl Shell {
             systems: None,
             options: None,
             emulator_scroll: ScrollHandle::new(),
+            emulator_revealed: split::RevealedList::default(),
             systems_scroll: ScrollHandle::new(),
+            systems_revealed: split::RevealedList::default(),
             picker_scroll: ScrollHandle::new(),
             picker_mark: None,
             options_scroll: ScrollHandle::new(),
+            options_revealed: split::RevealedList::default(),
             refocus: false,
             play_tx,
             play_rx,
@@ -2282,20 +2288,33 @@ impl Shell {
         rows
     }
 
-    fn reveal_emulators(&mut self) {
-        let Some(dialog) = &self.emulators else {
+    fn reveal_emulators(&mut self, window: &mut Window) {
+        let Some(index) = self
+            .emulators
+            .as_ref()
+            .map(|dialog| dialog.selected_index())
+        else {
+            self.emulator_revealed.clear();
             return;
         };
-        if self.emulator_scroll.bounds().size.height > px(0.) {
-            self.emulator_scroll.scroll_to_item(dialog.selected_index());
-        }
+        reveal_split_list(
+            &self.emulator_scroll,
+            index,
+            &mut self.emulator_revealed,
+            window,
+        );
     }
 
     fn reveal_systems(&mut self, window: &mut Window) {
-        if let Some(dialog) = &self.systems {
-            if self.systems_scroll.bounds().size.height > px(0.) {
-                self.systems_scroll.scroll_to_item(dialog.selected_index());
-            }
+        if let Some(index) = self.systems.as_ref().map(|dialog| dialog.selected_index()) {
+            reveal_split_list(
+                &self.systems_scroll,
+                index,
+                &mut self.systems_revealed,
+                window,
+            );
+        } else {
+            self.systems_revealed.clear();
         }
         if self.reveal_system_picker() {
             window.request_animation_frame();
@@ -2322,13 +2341,32 @@ impl Shell {
         }
     }
 
-    fn reveal_options(&mut self) {
-        let Some(dialog) = &self.options else {
+    fn reveal_options(&mut self, window: &mut Window) {
+        let Some(index) = self.options.as_ref().map(|dialog| dialog.selected_index()) else {
+            self.options_revealed.clear();
             return;
         };
-        if self.options_scroll.bounds().size.height > px(0.) {
-            self.options_scroll.scroll_to_item(dialog.selected_index());
-        }
+        reveal_split_list(
+            &self.options_scroll,
+            index,
+            &mut self.options_revealed,
+            window,
+        );
+    }
+}
+
+/// Scroll a settings-list row into view when the selection changes.
+/// The same index on a later render leaves the wheel offset alone.
+fn reveal_split_list(
+    scroll: &ScrollHandle,
+    index: usize,
+    revealed: &mut split::RevealedList,
+    window: &mut Window,
+) {
+    match revealed.reveal(index, scroll.bounds().size.height > px(0.)) {
+        split::ListReveal::Scroll(index) => scroll.scroll_to_item(index),
+        split::ListReveal::Wait => window.request_animation_frame(),
+        split::ListReveal::Keep => {}
     }
 }
 
@@ -2345,9 +2383,9 @@ impl Render for Shell {
         self.browse
             .set_columns(columns_for(width, self.browse.details_open, frame.width));
         self.reveal_selection();
-        self.reveal_emulators();
+        self.reveal_emulators(window);
         self.reveal_systems(window);
-        self.reveal_options();
+        self.reveal_options(window);
         if let Some(options) = &self.options {
             let width = options.cover_width();
             if (self.browse.cover_width - width).abs() >= 0.5 {
@@ -3014,10 +3052,13 @@ fn tile(
         .border_color(if selected { theme.accent } else { theme.border })
         .hover(|style| style.border_color(theme.accent))
         .on_click(
-            cx.listener(move |this: &mut Shell, _: &ClickEvent, window, cx| {
+            cx.listener(move |this: &mut Shell, event: &ClickEvent, window, cx| {
                 this.revealed_game = None;
                 this.browse.select_game(index);
                 this.focus_handle.focus(window, cx);
+                if event.click_count() >= 2 {
+                    this.launch_selected();
+                }
                 cx.notify();
             }),
         )

@@ -206,3 +206,70 @@ where
                 ),
         )
 }
+
+/// Last index scrolled into view. The same index does not scroll again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RevealedList {
+    index: Option<usize>,
+}
+
+/// Whether this frame should move a settings list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListReveal {
+    Scroll(usize),
+    Wait,
+    Keep,
+}
+
+impl RevealedList {
+    /// `ready` means the scrollport already has a height.
+    /// The stored index wins over `ready`, so a later zero-height frame does not wait again.
+    pub fn reveal(&mut self, index: usize, ready: bool) -> ListReveal {
+        if self.index == Some(index) {
+            return ListReveal::Keep;
+        }
+        if !ready {
+            return ListReveal::Wait;
+        }
+        self.index = Some(index);
+        ListReveal::Scroll(index)
+    }
+
+    pub fn clear(&mut self) {
+        self.index = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wheel_keeps_the_offset_while_the_selection_stays() {
+        let mut revealed = RevealedList::default();
+        assert_eq!(revealed.reveal(0, false), ListReveal::Wait);
+        assert_eq!(revealed.reveal(0, true), ListReveal::Scroll(0));
+        assert_eq!(revealed.reveal(0, true), ListReveal::Keep);
+        assert_eq!(revealed.reveal(0, true), ListReveal::Keep);
+        assert_eq!(revealed.reveal(0, false), ListReveal::Keep);
+    }
+
+    #[test]
+    fn selection_change_scrolls_once_after_the_list_is_ready() {
+        let mut revealed = RevealedList::default();
+        assert_eq!(revealed.reveal(0, true), ListReveal::Scroll(0));
+        assert_eq!(revealed.reveal(4, false), ListReveal::Wait);
+        assert_eq!(revealed.reveal(4, false), ListReveal::Wait);
+        assert_eq!(revealed.reveal(4, true), ListReveal::Scroll(4));
+        assert_eq!(revealed.reveal(4, true), ListReveal::Keep);
+    }
+
+    #[test]
+    fn closing_the_list_reveals_that_index_again() {
+        let mut revealed = RevealedList::default();
+        assert_eq!(revealed.reveal(2, true), ListReveal::Scroll(2));
+        revealed.clear();
+        assert_eq!(revealed.reveal(2, false), ListReveal::Wait);
+        assert_eq!(revealed.reveal(2, true), ListReveal::Scroll(2));
+    }
+}
